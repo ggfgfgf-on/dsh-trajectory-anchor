@@ -1,14 +1,14 @@
 {
   "name": "@dsh-ext/trajectory-anchor",
-  "version": "0.3.1",
-  "description": "Self-contained DeepSeek Harness bundle: first-round trajectory anchoring, EWMA trajectory scoring, adaptive drift rollback, anchorGate promotion gating, bootstrap context suppression, and trajectory-log export. Zero community-plugin dependencies.",
+  "version": "0.4.0",
+  "description": "Self-contained DeepSeek Harness bundle: first-round trajectory anchoring, EWMA trajectory scoring, adaptive drift rollback, anchorGate promotion gating, bootstrap context suppression, trajectory-log export, and Layer-4 training-data aggregation. Zero community-plugin dependencies.",
   "type": "module",
   "main": "index.js",
-  "types": "index.d.ts",
   "files": [
     "index.js",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "tools"
   ],
   "dsh": {
     "bundle": {

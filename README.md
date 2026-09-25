@@ -10,6 +10,17 @@ bootstrap 上下文抑制、轨迹日志导出与过程奖励标注。**零社�
 
 ## 安装
 
+**npm（发布后推荐）：**
+
+```powershell
+dsh plugin add @dsh-ext/trajectory-anchor
+```
+
+`dsh plugin` 是 pnpm 转发器：安装后自动检查包的 `dsh.bundle.patch` 声明并把本包
+接入 profile 层栈（`dsh.profile.bundles`），无需手改配置。
+
+**本地 file: 依赖（未发布时）：**
+
 ```powershell
 # profile 的 package.json dependencies 加入:
 #   "@dsh-ext/trajectory-anchor": "file:D:/DSHwork/trajectory-anchor-bundle"
