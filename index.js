@@ -689,19 +689,20 @@ function closeRec(rec, reason) {
 
 /** True when the session already contains real work (assistant messages or
  * tool calls) that predates this process — i.e. a resumed/forked session.
- * Fresh sessions at agent/created carry only ~5 seed events; resumed sessions
+ * Fresh sessions at agent/created carry only seed events; resumed sessions
  * (restart, fork children) carry history — anchoring those would re-bootstrap
  * a mid-flight session, so they are adopted audit-only.
  * 权威判据 = session.firstLiveSeq：本进程构造时种子之外第一个 live 事件的 seq
- * ——新鲜会话构造种子只有 ~5 个 seed 事件（firstLiveSeq ≤ 8），恢复/分叉会话
- * 的构造种子是整份存储日志（firstLiveSeq 很大）。该值是构造时刻固化的「本进程
- * 事实」，不随事件派发时序变化，天然免疫 agent/created 晚到竞态（旧 60 秒
- * 时间启发式有慢派发漏判/恢复会话误判两个边界，已废弃）。 */
+ * ——新鲜会话构造种子实测约 9-10 个事件（session/descriptor/sandbox/approval/
+ * permission/spliced/turn-start/step-start/user-message，阈值 ≤24 兜住），
+ * 恢复/分叉会话的构造种子是整份存储日志（firstLiveSeq 数百+）。该值是构造
+ * 时刻固化的「本进程事实」，不随事件派发时序变化，天然免疫 agent/created
+ * 晚到竞态（旧 60 秒时间启发式与 8 的过紧阈值均已废弃）。 */
 function sessionHasWork(agent) {
   try {
     const session = agent && agent.session
     if (!session) return false
-    if (typeof session.firstLiveSeq === 'number' && session.firstLiveSeq <= 8) return false
+    if (typeof session.firstLiveSeq === 'number' && session.firstLiveSeq <= 24) return false
     const events = session.events
     if (!events) return true
     const list = Array.isArray(events) ? events : Array.from(events)
