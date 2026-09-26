@@ -202,9 +202,13 @@ model tomorrow), so recognition, selection, accumulation and merging are all dri
      The oracle premise is sanity-checked per session (`oracle-unvalidated` audit): if the
      model's bootstrap phase is systematically shallower than its post-lift output (fewer
      reasoning blocks per message — an independent, lexicon-free structural signal), the
-     oracle is refused for that model and percentile labels are used instead. Note this is a
-     premise check, not full per-block quality validation — the latter would need outcome
-     signals (task scores), which general sessions do not carry.
+     oracle is refused for that model and percentile labels are used instead. A second,
+     outcome-side check compares operational error rates (non-zero exit codes / sandbox
+     denials / structured ok:false|error fields) of bootstrap-phase vs post-lift tool calls —
+     an anchored phase that behaves operationally worse than natural output fails the premise.
+     These are premise checks on sparse real signals, not full per-block quality validation —
+     output *quality* validation would need task scores (available in benchmark runs like
+     Project2, absent in general sessions).
    - **Low-frequency markers**: terms with total frequency below `minFreq` are only admitted
      when they pass a two-sided Fisher exact test (p<0.05) on the 2×2 frequency table —
      "1 hit in anchored, 0 in drifted" artifacts are rejected (p≈0.5), while genuinely rare

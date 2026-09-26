@@ -651,6 +651,23 @@ function maybeAutoCalibrate(rec) {
         hint: 'bootstrap phase not planning-rich; polarity oracle premise fails for this model, falling back to percentile labels',
       })
     }
+    // 结果侧验证（稀疏但真实）：bootstrap 期工具操作的错误率不得明显高于晋升后。
+    // 信号来源：非零退出码 / 沙箱拒绝 / 结构化 ok:false|error 字段。
+    if (useOracle) {
+      const bOut = rec.bootstrapOutcomes || { ok: 0, err: 0 }
+      const pOut = rec.postLiftOutcomes || { ok: 0, err: 0 }
+      const bErr = bOut.err > 0 ? bOut.err / (bOut.err + bOut.ok) : 0
+      const pErr = pOut.err > 0 ? pOut.err / (pOut.err + pOut.ok) : 0
+      if (bOut.err >= 2 && bErr > pErr + 0.15) {
+        useOracle = false
+        logAudit(rec, 'oracle-unvalidated', {
+          reason: 'bootstrap operational error rate worse than post-lift',
+          bootstrapOutcomes: bOut,
+          postLiftOutcomes: pOut,
+          hint: 'anchored phase behaves operationally worse than natural output; polarity oracle premise fails, falling back to percentile labels',
+        })
+      }
+    }
   }
   const posSet = useOracle ? anchoredRef : high
   const negSet = useOracle ? postLift : low
@@ -1194,6 +1211,7 @@ function lift(rec, reason) {
   rec.lifted = true
   rec.liftReason = reason
   rec.liftedAt = Date.now()
+  rec.liftedAtTurnStep = { turn: rec.lastTurn, step: rec.lastStep } // bootstrap 分界线
   if (typeof rec.restrictLift === 'function') {
     try {
       rec.restrictLift()
@@ -1378,6 +1396,32 @@ function adopt(agent, doAnchor, channel) {
 
 // ---------- shared session-event feed ----------
 
+/** 工具结果 → 操作成败分类（保守：只认明确的信号，其余返回 null 不参与统计）。
+ *  err：非零退出码 / 沙箱拒绝 / 结构化 ok:false|success:false|error 字段；
+ *  ok：退出码 0 / ok:true|success:true。 */
+function classifyToolResult(event) {
+  try {
+    const d = event.data || {}
+    const r = d.result
+    let text = ''
+    if (typeof r === 'string') {
+      text = r
+    } else if (r && typeof r === 'object') {
+      if (r.ok === false || r.success === false || r.error !== undefined && r.error !== null) return 'err'
+      if (r.ok === true || r.success === true) return 'ok'
+      text = JSON.stringify(r)
+    } else {
+      return null
+    }
+    if (/\[exit code:\s*[1-9]\d*\]/.test(text)) return 'err'
+    if (/\[exit code:\s*0\]/.test(text)) return 'ok'
+    if (/\[sandbox: file access denied/.test(text)) return 'err'
+    return null
+  } catch (e) {
+    return null
+  }
+}
+
 function feedSessionEvent(session, event) {
   let rec = null
   try {
@@ -1434,6 +1478,29 @@ function feedSessionEvent(session, event) {
         }
       } else {
         lift(rec, 'first-tool-call')
+      }
+    }
+  } else if (event.type === 'tool/result') {
+    // 操作结果信号（稀疏但真实）：退出码 / 沙箱拒绝 / 结构化 ok:false|error。
+    // 按 bootstrap 分界线归入各自阶段的 ok/err 计数，供神谕前提验证用。
+    const outcome = classifyToolResult(event)
+    if (outcome) {
+      const turn = event.data && event.data.turn
+      const step = event.data && event.data.step
+      let phase = 'post'
+      if (rec.liftedAtTurnStep && typeof turn === 'number' && typeof step === 'number') {
+        const at = turn * 100000 + step
+        const liftAt = (rec.liftedAtTurnStep.turn || 0) * 100000 + (rec.liftedAtTurnStep.step || 0)
+        if (at < liftAt) phase = 'bootstrap'
+      } else if (rec.anchored && !rec.lifted) {
+        phase = 'bootstrap'
+      }
+      if (phase === 'bootstrap') {
+        rec.bootstrapOutcomes = rec.bootstrapOutcomes || { ok: 0, err: 0 }
+        rec.bootstrapOutcomes[outcome] += 1
+      } else if (rec.anchored && rec.lifted) {
+        rec.postLiftOutcomes = rec.postLiftOutcomes || { ok: 0, err: 0 }
+        rec.postLiftOutcomes[outcome] += 1
       }
     }
   } else if (event.type === 'assistant/message') {
