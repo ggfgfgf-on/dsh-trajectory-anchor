@@ -45,13 +45,13 @@ Restart DSH. The plugin mounts on the host plane: it adopts all live agents at s
 
 装完即用，零手动配置：`dsh plugin add github:ggfgfgf-on/dsh-trajectory-anchor` 之后重启 DSH 即可。
 
-- **每个模型独立判断**（按模型名，不是供应商——同一供应商会代售多个厂商的模型）：
-  每个会话开头插件先用默认 DS 词典，并自动探测**这个词典读不读得懂该模型**——
-  读得懂就一直用，什么都不发生；读不懂（标记命中率低 / 比率分不开）才在后台攒样本，
-  攒够后**自动生成该模型的专属词典并立即生效**，之后所有会话自动沿用
-  （跨重启持久化，无需任何操作）。
-- **看状态**：随时调用 `anchor_status` 工具，`lexicon` 块里有每个模型的
-  拟合探测结果与标定进度。
+- **只看输出，不看名字**：model/provider 名字只是标签（别名、网关转发都会让名字
+  对不上号），词典的识别、选择、积累、合并全部由**输出文本的风格**决定。
+  每个会话开头插件自动探测哪个候选词典读得懂这段输出——读得懂就一直用；
+  读不懂才在后台攒样本，攒够后自动标定出这个输出风格的专属词典并立即生效，
+  之后同样风格的会话自动沿用（跨重启持久化，无需任何操作）。
+- **看状态**：随时调用 `anchor_status` 工具，`lexicon` 块里有风格桶
+  （标定进度、签名、命中检测结果）。
 
 ## Lifecycle
 
@@ -86,8 +86,8 @@ agent/disposed: RewardAnnotator process reward + trajectory JSONL final archive
 | `maxBootstrapSteps` | `5` | gate fallback |
 | `suppressContextOnBootstrap` | `true` | agent-scope context suppression during bootstrap |
 | `lexicon` / `ratioWeights` | monitor-calibrated | weighted lexicon scoring (we/let's/we'll/"we need"/our vs "let me"; neutral i will/i'll/i need/check/verify) |
-| `lexiconProfiles` | `{}` | per-model built-in dictionaries, keyed by model name (not provider); pre-seed a known model to skip the auto-calibration wait |
-| `lexiconAuto` | enabled; probe at session start; floor 3 sessions / 40k chars, cap 160k, stability 0.6 | fit probe → (mismatch only) sample → adaptive target → stability-gated calibrate → apply; see "Lexicon calibration" below |
+| `lexiconProfiles` | `{}` | optional name-hinted dictionaries (keyed by any model/provider name); candidates must still pass the output fit probe — names never override the output |
+| `lexiconAuto` | enabled; probe at session start; floor 3 sessions / 40k chars, cap 160k, stability 0.6 | output fit probe → (mismatch only) sample → signature-matched style buckets → adaptive target → stability-gated calibrate → apply; see "Lexicon calibration" below |
 | `specMax` / `reactMin` | `0.2` / `0.5` | persona_ratio band boundaries (spec/mixed/react) |
 | `baselineMinSamples` / `rollbackPercentile` | `10` / `25` | **baseline-relative drift**: rollback only fires when the current ratio's percentile within the session's own history is < 25 |
 | `rollbackEnabled` | `true` | calibrated rollback switch (safe to enable under baseline-relative semantics) |
@@ -146,36 +146,40 @@ natural baseline style is let-me).
 | recency-position bias correction + per-round throttling | `@max-null/dsh-allostasis` |
 | decision-round / execution-round decoupling | `we-need-ds` |
 
-## Lexicon calibration (per-model dictionaries, automatic)
+## Lexicon calibration (output-fingerprinted style buckets, automatic)
 
 The default lexicon (we/let's/"we need"/our vs "let me") is calibrated on DeepSeek-style
-reasoning; other models need their own marker words. The plugin handles this **without any
-manual steps**:
+reasoning; other outputs need their own marker words. The plugin handles this **without any
+manual steps**, and — crucially — **names never decide anything**: model/provider strings are
+aliases and gateway labels that drift over time (`ark-code-latest` may point to a different
+model tomorrow), so recognition, selection, accumulation and merging are all driven by the
+**output text itself**. Names are recorded as human-readable labels only.
 
-1. **Detect** — every session reports its model name (request/header events), so the plugin
-   knows which *model* is talking. Dictionaries are keyed by model name, never by provider:
-   one provider (e.g. Huoshan/Volcano) resells many vendors' models, and their styles cannot
-   share a lexicon. The provider is only used as a fallback identifier when the model name is
-   missing.
-2. **Resolve** — per-model dictionaries resolve in order: auto-calibrated override >
-   built-in profile (`lexiconProfiles`, keyed by model name) > default DS lexicon.
-3. **Probe fit at session start** — before doing anything, the plugin checks whether the
-   active lexicon can actually read this model: it scores the first few natural reasoning
-   blocks (post-lift for anchored sessions — the bootstrap phase is persona-primed, not the
-   model's own style) and measures **marker hit rate** (do the lexicon's terms appear at all?)
-   plus **ratio spread** (can the lexicon separate planning-style from reactive-style blocks?).
-   - Fits (e.g. DS lexicon on a DeepSeek model: hit rate ≈1, ratio CV ≈0.8) → keep using it,
-     nothing else happens.
-   - Does not fit (e.g. DS lexicon on Doubao-style Chinese reasoning: hit rate ≈0) →
+1. **Probe fit at session start** — the plugin scores the first few natural reasoning blocks
+   (post-lift for anchored sessions — the bootstrap phase is persona-primed, not the model's
+   own style) against every candidate lexicon: the default DS lexicon, all calibrated style
+   buckets, and any name-hinted profiles. Fit = **marker hit rate** (do the lexicon's terms
+   appear at all?) + **ratio spread** (can the lexicon separate planning-style from
+   reactive-style blocks?). The best-fitting candidate wins; the output alone decides.
+   - Fits (e.g. DS lexicon on DeepSeek-style output: hit rate ≈1, ratio CV ≈0.8) → keep using
+     it, nothing else happens.
+   - Nothing fits (e.g. DS lexicon on Doubao-style Chinese reasoning: hit rate ≈0) →
      `lexicon-mismatch` is logged and the auto-calibration flow below kicks in.
-4. **Sample** — only for a mismatched model, the plugin quietly accumulates style samples:
+2. **Sample** — only for mismatched output, the plugin quietly accumulates style samples:
    reasoning text + the session's own baseline percentile (a model-agnostic quality signal —
    not DS-lexicon scores, so no circular bias).
-5. **Calibrate** — "how much corpus is enough" is not a fixed number and not "the more the
-   better"; it is decided per model in three steps:
+3. **Match by style signature** — at session close, the session's own contrast terms
+   (high-percentile vs low-percentile n-grams) form its style signature, which is matched
+   against every bucket's signature (term-set Jaccard ≥ `bucketMatchThreshold`, default 0.25).
+   Same style → merge into that bucket; new style → a new bucket. Consequences, all verified
+   on synthetic corpora: same-style sessions merge (Jaccard ≈1), cross-style sessions split
+   (Jaccard ≈0); a model that silently changes style under the same name opens a new bucket
+   instead of poisoning the old one.
+4. **Calibrate** — "how much corpus is enough" is not a fixed number and not "the more the
+   better"; it is decided per bucket in three steps:
    - **Floor** (`minSessions` + `minChars`): enough sessions/tasks that task vocabulary cannot
      dominate the contrast (the known single-session contamination trap).
-   - **Adaptive target**: the char target scales with the model's own n-gram concentration —
+   - **Adaptive target**: the char target scales with the bucket's own n-gram concentration —
      concentrated style markers (like ark's 终验/终验证) converge fast, so the target shrinks
      toward `minChars`; diffuse vocabulary gets up to 1.5× more text (formula below).
    - **Stability acceptance**: at the target the plugin runs the shared contrast engine
@@ -186,8 +190,10 @@ manual steps**:
      `maxChars` cap, after which every new session re-tests stability. Measured on synthetic
      corpora: thin (10+10) splits agree at ~0.6, thick (200+200) at ~0.9 — the gate fires where
      it should.
-6. **Apply** — the derived lexicon is active immediately for that model and persisted to
-   `<logDir>/lexicon-state.json` (survives restarts; the ledger keeps accumulating).
+5. **Apply** — the derived lexicon is attached to its bucket and persisted to
+   `<logDir>/lexicon-state.json` (survives restarts; buckets keep accumulating). From then on
+   the bucket is a candidate in step 1 and any session whose output fits it uses it
+   automatically.
 
 Adaptive target formula: `target = minChars × (1 + (1 − C) × concentrationScale)`, clamped to
 `[minChars, maxChars]`, where `C` = frequency share of the top-50 n-grams (vocabulary
@@ -195,16 +201,17 @@ concentration). Defaults: 3 sessions / 40k chars floor, 160k cap, scale 0.5, sta
 
 Auto-calibration knobs (all under `lexiconAuto`, patchable in cordis.patch.yml): `enabled`
 (default `true`), fit probe (`probeMaxBlocks` 8 / `probeMinChars` 2500 / `probeMinBlocks` 3 /
-`probeMinHitRate` 0.25 / `probeMinSignalBlocks` 3 / `probeMinRatioSpread` 0.15), `minSessions`
-(3), `minChars` (40000), `maxChars` (160000), `concentrationScale` (0.5), `minStability`
-(0.6), `percentileHigh` / `percentileLow` (75/25), `minFreq` (5), `top` (60). Progress is
-audited per model (`lexicon-resolved` / `lexicon-fit` / `lexicon-mismatch` /
-`lexicon-auto-progress` / `lexicon-auto-target` / `lexicon-auto-pending` /
+`probeMinHitRate` 0.25 / `probeMinSignalBlocks` 3 / `probeMinRatioSpread` 0.15),
+`bucketMatchThreshold` (0.25), `minSessions` (3), `minChars` (40000), `maxChars` (160000),
+`concentrationScale` (0.5), `minStability` (0.6), `percentileHigh` / `percentileLow` (75/25),
+`minFreq` (5), `top` (60). Progress is audited (`lexicon-names` / `lexicon-fit` /
+`lexicon-mismatch` / `lexicon-auto-progress` / `lexicon-auto-target` / `lexicon-auto-pending` /
 `lexicon-calibrated` events) and visible in the `anchor_status` tool's `lexicon` block
-(target chars, concentration, last split-half stability per model).
+(style buckets with names, calibration state, target chars, concentration, last split-half
+stability).
 
-**Pre-seed a known dictionary** (skip the probe waiting period) via `lexiconProfiles` in the
-patch — keyed by model name:
+**Pre-seed a known dictionary** (optional, name-hinted) via `lexiconProfiles` in the patch —
+the candidate is still validated against the actual output and dropped if it does not fit:
 
 ```yaml
 config:

@@ -55,26 +55,26 @@ const DEFAULTS = {
     negative: { 'let me': 3 },
     neutral: { 'i will': 1, "i'll": 1, 'i need': 0.8, check: 0.4, verify: 0.4 },
   },
-  // 每-模型 内置词典，键 = 模型名（不是供应商：同一供应商会代售多个厂商的模型，
-  // 风格各不相同）。用户可在 patch 里预置已知模型的词典，例如
-  // { 'ark-code-latest': { positive: { '终验': 2 }, negative: {...}, neutral: {...} } }。
+  // 名字提示的内置词典（可选）：model/provider 名字只是提示，候选词典照样要
+  // 过输出拟合检测——输出对不上就弃用。键可以是模型名或供应商名。
   lexiconProfiles: {},
-  // 未知模型自动标定：按模型（model，缺失时退 provider）积累风格样本
-  // （文本 + 会话内基准百分位）。「攒够多少」不是固定值，而是四段式：
-  //   下限 minSessions/minChars（保障跨任务覆盖）→
-  //   自适应目标（按该模型词表集中度放大/缩小）→
-  //   稳定性验收（split-half 词典一致才算够，不够自动加量）→
-  //   上限 maxChars（封顶后等新会话复检，保证总会收敛）。
+  // 词典的识别、选择、积累、合并全部针对输出文本：
+  //   开头探测：拿候选词典（默认 + 已标定桶 + 名字提示的 profile）对会话开头
+  //     的输出做拟合检测（标记命中率 + 比率离散度）——输出说话，名字不说话；
+  //   自动标定桶：按「输出风格签名」（本会话高分/低分样本的 contrast 词条）匹配
+  //     或新建桶，名字只是桶上的标签。同名模型换了风格→自动开新桶；
+  //     不同名模型风格相同→自动合并进同一个桶。
   lexiconAuto: {
     enabled: true,
-    // 开头适配探测：每个会话开头用当前词典对该模型前几段推理做拟合检测
-    // （标记命中率 + 比率离散度）。读得懂就沿用，读不懂才攒样本自动标定。
+    // 开头适配探测：候选词典对该会话前几段输出做拟合检测。
     probeMaxBlocks: 8,
     probeMinChars: 2500,
     probeMinBlocks: 3,
     probeMinHitRate: 0.25,
     probeMinSignalBlocks: 3,
     probeMinRatioSpread: 0.15,
+    // 风格签名匹配阈值：会话签名与桶签名的词条 Jaccard ≥ 该值才并入该桶。
+    bucketMatchThreshold: 0.25,
     minSessions: 3,
     minChars: 40000,
     maxChars: 160000,
@@ -146,8 +146,11 @@ let waterfallPreStep = 0
 let listAtApply = { length: -1, error: null }
 let initiatorSessionId = null
 const lateLookupDenied = new Set()
-const lexiconOverrides = {} // model -> { positive, negative, neutral }（自动标定产物，跨重启持久化）
-const lexiconLedger = {} // model -> { sessions, chars, samples: [{text, percentile}] }
+// 输出风格桶（跨重启持久化）：识别与积累都靠输出签名，名字只是标签。
+// 每个桶: { id, names: [model/provider 标签], sessions, chars, samples: [{text,percentile}],
+//           signature: [contrast 词条], lexicon: {positive,negative,neutral}|null,
+//           targetChars, concentration, lastStability, calibratedAt }
+const lexiconBuckets = []
 
 function msg(error) {
   try {
@@ -299,23 +302,11 @@ function flagsOf(texts, lexicon) {
   return flags
 }
 
-/** 按模型选词典：自动标定产物 > 内置/patch profile > 默认 DS 词典。
- *  键 = 模型名（供应商只是网关，不同模型风格各异，不能混在一个词典里）。 */
-function resolveLexicon(modelKey) {
-  if (typeof modelKey === 'string' && modelKey.length > 0) {
-    if (lexiconOverrides[modelKey]) return { lexicon: lexiconOverrides[modelKey], source: 'auto' }
-    if (CONFIG.lexiconProfiles && CONFIG.lexiconProfiles[modelKey]) return { lexicon: CONFIG.lexiconProfiles[modelKey], source: 'profile' }
-  }
-  return { lexicon: CONFIG.lexicon, source: 'default' }
-}
-
-/** 风格样本积累：探测未判「匹配」且非 auto 词典的模型都先攒着
- *  （探测期样本在判定为匹配时丢弃，判定为不匹配时保留进账本）。 */
+/** 风格样本积累：探测未判「匹配」的都先攒着（探测期样本在判定匹配时丢弃，
+ *  判定不匹配时留作自动标定语料）。收集不依赖任何名字——只看输出。 */
 function sampleStyle(rec, texts) {
   const auto = CONFIG.lexiconAuto
   if (!auto || auto.enabled === false) return
-  if (typeof rec.modelKey !== 'string' || rec.modelKey.length === 0) return
-  if (rec.lexiconSource === 'auto') return
   if (rec.lexiconMismatch === false) return
   const joined = texts.join('\n')
   if (joined.length < 40) return
@@ -323,10 +314,10 @@ function sampleStyle(rec, texts) {
   if (rec.styleSamples.length > 400) rec.styleSamples.shift()
 }
 
-// ---------- 开头适配探测：当前词典读得懂这个模型吗？ ----------
+// ---------- 开头适配探测：哪个候选词典读得懂这段输出？ ----------
 
 function newProbe() {
-  return { blocks: 0, chars: 0, signalBlocks: 0, ratios: [] }
+  return { blocks: 0, chars: 0, texts: [] }
 }
 
 /** 探测只吃「自然风格」：锚定会话在 lift 之后才开始，因为 bootstrap 期
@@ -335,8 +326,6 @@ function probeFeed(rec, texts, flags) {
   const auto = CONFIG.lexiconAuto
   if (!auto || auto.enabled === false) return
   if (rec.lexiconMismatch !== null) return
-  if (typeof rec.modelKey !== 'string' || rec.modelKey.length === 0) return
-  if (rec.lexiconSource === 'auto') return
   if (rec.anchored && !rec.lifted) return
   if (!Array.isArray(flags) || flags.length === 0) return
   const p = rec.probe
@@ -344,49 +333,94 @@ function probeFeed(rec, texts, flags) {
   const minChars = typeof auto.probeMinChars === 'number' ? auto.probeMinChars : 2500
   for (let i = 0; i < flags.length; i++) {
     if (p.blocks >= maxBlocks || p.chars >= minChars) break
-    const f = flags[i]
     p.blocks += 1
     p.chars += (texts[i] || '').length
-    const signal = f.positive + f.neutral + f.negative
-    if (signal > 0) {
-      p.signalBlocks += 1
-      p.ratios.push(weightedRatio(f))
-    }
+    p.texts.push(texts[i] || '')
   }
-  if (p.blocks >= maxBlocks || p.chars >= minChars) evaluateProbe(rec)
+  if (p.blocks >= maxBlocks || p.chars >= minChars) selectLexicon(rec)
 }
 
-/** 拟合判定：标记命中率（词典词条在推理里出现得多不多）× 比率离散度
- *  （词典能否把不同推理块区分开——ark 那种窄比率就是读不懂的信号）。
- *  不匹配才进自动标定账本；匹配则一直用当前词典。 */
-function evaluateProbe(rec) {
+/** 单个词典对一段输出的拟合指标：标记命中率（词条出现得多不多）
+ *  × 比率离散度（词典能否把不同推理块区分开）。 */
+function probeFit(lexicon, texts) {
+  let signalBlocks = 0
+  const ratios = []
+  for (const t of texts) {
+    const f = measureText(t, lexicon)
+    const signal = f.positive + f.neutral + f.negative
+    if (signal > 0) {
+      signalBlocks += 1
+      ratios.push(weightedRatio(f))
+    }
+  }
+  const hitRate = texts.length === 0 ? 0 : signalBlocks / texts.length
+  let cv = 0
+  if (ratios.length >= 2) {
+    const mean = ratios.reduce((a, b) => a + b, 0) / ratios.length
+    const variance = ratios.reduce((a, b) => a + (b - mean) * (b - mean), 0) / ratios.length
+    cv = mean === 0 ? 0 : Math.sqrt(variance) / mean
+  }
+  return { hitRate, signalBlocks, cv }
+}
+
+function probeFits(p, auto) {
+  const minHitRate = typeof auto.probeMinHitRate === 'number' ? auto.probeMinHitRate : 0.25
+  const minSignalBlocks = typeof auto.probeMinSignalBlocks === 'number' ? auto.probeMinSignalBlocks : 3
+  const minRatioSpread = typeof auto.probeMinRatioSpread === 'number' ? auto.probeMinRatioSpread : 0.15
+  return p.hitRate >= minHitRate && p.signalBlocks >= minSignalBlocks && p.cv >= minRatioSpread
+}
+
+/** 输出说话，名字不说话：候选词典 = 名字提示的 profile（可选）→ 已标定桶 → 默认 DS。
+ *  逐个对探测文本做拟合检测，取拟合最好（命中率最高）的那个。
+ *  一个都不拟合 → 判 mismatch，攒样本走自动标定。 */
+function selectLexicon(rec) {
   if (rec.lexiconMismatch !== null) return
   const p = rec.probe
   const auto = CONFIG.lexiconAuto
   const minBlocks = typeof auto.probeMinBlocks === 'number' ? auto.probeMinBlocks : 3
   if (!p || p.blocks < minBlocks) return
-  const hitRate = p.signalBlocks / p.blocks
-  const minHitRate = typeof auto.probeMinHitRate === 'number' ? auto.probeMinHitRate : 0.25
-  const minSignalBlocks = typeof auto.probeMinSignalBlocks === 'number' ? auto.probeMinSignalBlocks : 3
-  const minRatioSpread = typeof auto.probeMinRatioSpread === 'number' ? auto.probeMinRatioSpread : 0.15
-  let cv = 0
-  if (p.ratios.length >= 2) {
-    const mean = p.ratios.reduce((a, b) => a + b, 0) / p.ratios.length
-    const variance = p.ratios.reduce((a, b) => a + (b - mean) * (b - mean), 0) / p.ratios.length
-    cv = mean === 0 ? 0 : Math.sqrt(variance) / mean
+  const texts = p.texts
+  const names = { model: rec.model, provider: rec.provider }
+  const candidates = []
+  const seen = new Set()
+  if (typeof rec.model === 'string' && rec.model.length > 0) seen.add(rec.model)
+  if (typeof rec.provider === 'string' && rec.provider.length > 0) seen.add(rec.provider)
+  for (const n of seen) {
+    const lp = CONFIG.lexiconProfiles && CONFIG.lexiconProfiles[n]
+    if (lp) candidates.push({ lexicon: lp, label: 'profile:' + n })
   }
-  rec.lexiconMismatch = hitRate < minHitRate || p.signalBlocks < minSignalBlocks || cv < minRatioSpread
-  const probe = { model: rec.model, provider: rec.provider, key: rec.modelKey, blocks: p.blocks, hitRate: Math.round(hitRate * 1000) / 1000, signalBlocks: p.signalBlocks, ratioCV: Math.round(cv * 1000) / 1000 }
-  if (rec.lexiconMismatch) {
-    rec.lexiconSource = 'mismatch'
-    logAudit(rec, 'lexicon-mismatch', { ...probe, hint: 'active lexicon cannot read this model style; collecting samples for auto-calibration' })
-  } else {
-    rec.styleSamples = [] // 词典匹配：探测期样本作废，不进账本
-    logAudit(rec, 'lexicon-fit', { ...probe, hint: 'active lexicon fits this model; no auto-calibration' })
+  for (const b of lexiconBuckets) {
+    if (b && b.lexicon) candidates.push({ lexicon: b.lexicon, label: 'bucket:' + b.id })
   }
+  candidates.push({ lexicon: CONFIG.lexicon, label: 'default' })
+  let best = null
+  for (const c of candidates) {
+    const fit = probeFit(c.lexicon, texts)
+    if (probeFits(fit, auto) && (!best || fit.hitRate > best.hitRate)) {
+      best = { ...c, hitRate: Math.round(fit.hitRate * 1000) / 1000, signalBlocks: fit.signalBlocks, ratioCV: Math.round(fit.cv * 1000) / 1000 }
+    }
+  }
+  if (best) {
+    rec.lexiconMismatch = false
+    rec.lexiconSource = best.label
+    if (best.lexicon !== rec.lexicon) {
+      // 换词典 → 旧计分基线作废：窗口、历史、样本全部重置
+      rec.lexicon = best.lexicon
+      rec.lastMessages = []
+      rec.ratioHistory = []
+      rec.styleSamples = []
+    } else {
+      rec.styleSamples = []
+    }
+    logAudit(rec, 'lexicon-fit', { ...names, chosen: best.label, hitRate: best.hitRate, signalBlocks: best.signalBlocks, ratioCV: best.ratioCV, hint: 'chosen lexicon fits this session output' })
+    return
+  }
+  rec.lexiconMismatch = true
+  rec.lexiconSource = 'mismatch'
+  logAudit(rec, 'lexicon-mismatch', { ...names, candidatesTested: candidates.length, hint: 'no candidate lexicon reads this output; collecting samples for auto-calibration' })
 }
 
-// ---------- per-provider auto lexicon lifecycle ----------
+// ---------- 输出风格词典：探测选词 + 签名桶自动标定 ----------
 
 function lexiconStateDir() {
   let dir = CONFIG.logDir
@@ -397,7 +431,7 @@ function lexiconStateDir() {
 function saveLexiconState() {
   if (!fsSvc) return
   const file = lexiconStateDir() + '/lexicon-state.json'
-  const text = JSON.stringify({ generated_utc: new Date().toISOString(), overrides: lexiconOverrides, ledger: lexiconLedger })
+  const text = JSON.stringify({ generated_utc: new Date().toISOString(), buckets: lexiconBuckets })
   Promise.resolve()
     .then(() => fsSvc.resolve(file, typeof baseDir === 'string' ? { cwd: baseDir } : undefined))
     .then(target => fsSvc.writeText(target, text))
@@ -413,19 +447,22 @@ function loadLexiconState() {
     .then(text => {
       const state = JSON.parse(text)
       if (!state || typeof state !== 'object') return
-      if (state.overrides && typeof state.overrides === 'object') {
-        for (const p of Object.keys(state.overrides)) {
-          const o = state.overrides[p]
-          if (o && o.positive && o.negative && o.neutral) lexiconOverrides[p] = o
-        }
-      }
-      if (state.ledger && typeof state.ledger === 'object') {
-        for (const p of Object.keys(state.ledger)) {
-          const l = state.ledger[p]
-          if (l && typeof l.sessions === 'number') {
-            lexiconLedger[p] = { sessions: l.sessions, chars: l.chars || 0, samples: Array.isArray(l.samples) ? l.samples : [] }
-          }
-        }
+      if (!Array.isArray(state.buckets)) return
+      for (const b of state.buckets) {
+        if (!b || typeof b !== 'object' || typeof b.id !== 'string') continue
+        lexiconBuckets.push({
+          id: b.id,
+          names: Array.isArray(b.names) ? b.names.filter(n => typeof n === 'string') : [],
+          sessions: typeof b.sessions === 'number' ? b.sessions : 0,
+          chars: typeof b.chars === 'number' ? b.chars : 0,
+          samples: Array.isArray(b.samples) ? b.samples : [],
+          signature: Array.isArray(b.signature) ? b.signature : [],
+          lexicon: b.lexicon || null,
+          targetChars: b.targetChars,
+          concentration: b.concentration,
+          lastStability: b.lastStability || null,
+          calibratedAt: b.calibratedAt || null,
+        })
       }
     })
     .catch(() => { /* first boot: no state file */ })
@@ -514,90 +551,154 @@ function stabilityOf(L, auto) {
   }
 }
 
-/** 会话关闭时：开头探测判为「词典读不懂该模型」才把本会话样本并入账本；
- *  语料达到自适应目标且通过稳定性验收就自动出词典、立即生效并落盘。 */
+/** 会话关闭时：输出签名找桶 → 并入/新建桶 → 语料达到自适应目标且通过
+ *  稳定性验收 → 标定出词典挂在桶上（以后按输出拟合自动选用）。
+ *  名字不参与识别：同名换风格自动开新桶，异名同风格自动并入同桶。 */
 function maybeAutoCalibrate(rec) {
   const auto = CONFIG.lexiconAuto
   if (!auto || auto.enabled === false) return
   if (rec.lexiconMismatch !== true) return
-  const modelKey = rec.modelKey
-  if (typeof modelKey !== 'string' || modelKey.length === 0) return
-  if (lexiconOverrides[modelKey] || (CONFIG.lexiconProfiles && CONFIG.lexiconProfiles[modelKey])) return
-  if (rec.countedModel === modelKey) return
-  rec.countedModel = modelKey
-  const L = (lexiconLedger[modelKey] = lexiconLedger[modelKey] || { sessions: 0, chars: 0, samples: [] })
-  L.sessions += 1
+  const minFreq = typeof auto.minFreq === 'number' ? auto.minFreq : 5
+  const top = typeof auto.top === 'number' ? auto.top : 60
+  const high = []
+  const low = []
+  for (const s of rec.styleSamples) {
+    if (s.percentile >= auto.percentileHigh) high.push(s.text)
+    else if (s.percentile <= auto.percentileLow) low.push(s.text)
+  }
+  if (high.length < 10 || low.length < 10) {
+    logAudit(rec, 'lexicon-auto-pending', { reason: 'insufficient contrast samples', anchored: high.length, drifted: low.length })
+    return
+  }
+  let rows
+  try {
+    rows = contrastPolarity(high, low, minFreq, top)
+  } catch (e) {
+    logAudit(rec, 'lexicon-auto-error', { error: msg(e) })
+    return
+  }
+  if (!rows || rows.length === 0) {
+    logAudit(rec, 'lexicon-auto-pending', { reason: 'no contrast terms' })
+    return
+  }
+  const signature = rows.map(r => r.term)
+  // 按输出签名匹配已有桶（Jaccard ≥ bucketMatchThreshold 并入最像的那个）
+  const threshold = typeof auto.bucketMatchThreshold === 'number' ? auto.bucketMatchThreshold : 0.25
+  let B = null
+  let bestSim = 0
+  for (const b of lexiconBuckets) {
+    const inter = b.signature.filter(t => signature.includes(t)).length
+    const union = new Set([...b.signature, ...signature]).size
+    const sim = union === 0 ? 0 : inter / union
+    if (sim >= threshold && sim > bestSim) {
+      B = b
+      bestSim = sim
+    }
+  }
+  if (!B) {
+    B = {
+      id: 'style-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6),
+      names: [],
+      sessions: 0,
+      chars: 0,
+      samples: [],
+      signature: [],
+      lexicon: null,
+    }
+    lexiconBuckets.push(B)
+  }
+  const tag = n => typeof n === 'string' && n.length > 0
+  if (tag(rec.model) && !B.names.includes(rec.model)) B.names.push(rec.model)
+  if (tag(rec.provider) && !B.names.includes(rec.provider)) B.names.push(rec.provider)
+  B.sessions += 1
   let chars = 0
   for (const s of rec.styleSamples) {
     chars += s.text.length
-    if (typeof s.percentile === 'number') L.samples.push(s)
+    if (typeof s.percentile === 'number') B.samples.push(s)
   }
-  L.chars += chars
-  if (L.samples.length > 1500) L.samples.splice(0, L.samples.length - 1500)
+  B.chars += chars
+  if (B.samples.length > 1500) B.samples.splice(0, B.samples.length - 1500)
+  // 桶签名随语料刷新：取最近 400 条样本的 contrast 词条
+  const bh = []
+  const bl = []
+  for (let i = Math.max(0, B.samples.length - 400); i < B.samples.length; i++) {
+    const s = B.samples[i]
+    if (s.percentile >= auto.percentileHigh) bh.push(s.text)
+    else if (s.percentile <= auto.percentileLow) bl.push(s.text)
+  }
+  if (bh.length >= 10 && bl.length >= 10) {
+    try {
+      const rowsB = contrastPolarity(bh, bl, minFreq, top)
+      if (rowsB && rowsB.length > 0) B.signature = rowsB.map(r => r.term)
+    } catch (e) { /* 签名刷新失败不影响主流程 */ }
+  } else {
+    B.signature = signature
+  }
   saveLexiconState()
   const minSessions = typeof auto.minSessions === 'number' ? auto.minSessions : 3
   const minChars = typeof auto.minChars === 'number' ? auto.minChars : 40000
   const maxChars = typeof auto.maxChars === 'number' ? auto.maxChars : 160000
-  if (L.sessions < minSessions || L.chars < minChars) {
-    logAudit(rec, 'lexicon-auto-progress', { model: rec.model, provider: rec.provider, key: modelKey, sessions: L.sessions, chars: L.chars, samples: L.samples.length })
+  if (B.sessions < minSessions || B.chars < minChars) {
+    logAudit(rec, 'lexicon-auto-progress', { bucket: B.id, names: B.names, sessions: B.sessions, chars: B.chars, samples: B.samples.length, merged: bestSim > 0 })
     return
   }
-  // 自适应目标：按该模型词表集中度计算（只算一次并随账本持久化展示）
-  if (!L.targetChars) {
-    const est = autoTargetChars(L, auto)
-    L.targetChars = est ? est.target : maxChars
-    L.concentration = est ? est.C : null
-    logAudit(rec, 'lexicon-auto-target', { key: modelKey, targetChars: L.targetChars, concentration: L.concentration })
+  // 自适应目标：按该桶词表集中度计算（只算一次并随状态持久化展示）
+  if (!B.targetChars) {
+    const est = autoTargetChars(B, auto)
+    B.targetChars = est ? est.target : maxChars
+    B.concentration = est ? est.C : null
+    logAudit(rec, 'lexicon-auto-target', { bucket: B.id, targetChars: B.targetChars, concentration: B.concentration })
   }
-  if (L.chars < L.targetChars) {
-    logAudit(rec, 'lexicon-auto-progress', { key: modelKey, sessions: L.sessions, chars: L.chars, targetChars: L.targetChars, samples: L.samples.length })
+  if (B.chars < B.targetChars) {
+    logAudit(rec, 'lexicon-auto-progress', { bucket: B.id, sessions: B.sessions, chars: B.chars, targetChars: B.targetChars, samples: B.samples.length })
     return
   }
   // 达到目标量 → 稳定性验收；不稳就自动把目标上调 1.5×（封顶 maxChars），继续攒
-  const st = stabilityOf(L, auto)
+  const st = stabilityOf(B, auto)
   if (!st.stable) {
-    L.lastStability = { jaccard: st.jaccard, weightAgree: st.weightAgree }
+    B.lastStability = { jaccard: st.jaccard, weightAgree: st.weightAgree }
     if (st.anchored < 20 || st.drifted < 20) {
-      logAudit(rec, 'lexicon-auto-pending', { key: modelKey, reason: 'insufficient contrast samples', anchored: st.anchored, drifted: st.drifted })
+      logAudit(rec, 'lexicon-auto-pending', { bucket: B.id, reason: 'insufficient contrast samples', anchored: st.anchored, drifted: st.drifted })
       return
     }
-    if (L.targetChars >= maxChars && L.chars >= maxChars) {
-      logAudit(rec, 'lexicon-auto-pending', { key: modelKey, reason: 'unstable at cap, waiting for more sessions', jaccard: st.jaccard, weightAgree: st.weightAgree })
+    if (B.targetChars >= maxChars && B.chars >= maxChars) {
+      logAudit(rec, 'lexicon-auto-pending', { bucket: B.id, reason: 'unstable at cap, waiting for more sessions', jaccard: st.jaccard, weightAgree: st.weightAgree })
       return
     }
-    L.targetChars = Math.min(maxChars, Math.round(L.targetChars * 1.5))
-    logAudit(rec, 'lexicon-auto-pending', { key: modelKey, reason: 'corpus not yet stable', jaccard: st.jaccard, weightAgree: st.weightAgree, nextTargetChars: L.targetChars })
+    B.targetChars = Math.min(maxChars, Math.round(B.targetChars * 1.5))
+    logAudit(rec, 'lexicon-auto-pending', { bucket: B.id, reason: 'corpus not yet stable', jaccard: st.jaccard, weightAgree: st.weightAgree, nextTargetChars: B.targetChars })
     return
   }
   const anchored = []
   const drifted = []
-  for (const s of L.samples) {
+  for (const s of B.samples) {
     if (s.percentile >= auto.percentileHigh) anchored.push(s.text)
     else if (s.percentile <= auto.percentileLow) drifted.push(s.text)
   }
-  let rows
+  let rowsFull
   try {
-    rows = contrastPolarity(anchored, drifted, typeof auto.minFreq === 'number' ? auto.minFreq : 5, typeof auto.top === 'number' ? auto.top : 60)
+    rowsFull = contrastPolarity(anchored, drifted, minFreq, top)
   } catch (e) {
-    logAudit(rec, 'lexicon-auto-error', { key: modelKey, error: msg(e) })
+    logAudit(rec, 'lexicon-auto-error', { bucket: B.id, error: msg(e) })
     return
   }
-  if (!rows || rows.length === 0) {
-    logAudit(rec, 'lexicon-auto-pending', { key: modelKey, reason: 'no contrast terms' })
+  if (!rowsFull || rowsFull.length === 0) {
+    logAudit(rec, 'lexicon-auto-pending', { bucket: B.id, reason: 'no contrast terms' })
     return
   }
-  const lexicon = rowsToLexicon(rows)
-  lexiconOverrides[modelKey] = lexicon
+  const lexicon = rowsToLexicon(rowsFull)
+  B.lexicon = lexicon
+  B.signature = rowsFull.map(r => r.term)
+  B.calibratedAt = Date.now()
   saveLexiconState()
   logAudit(rec, 'lexicon-calibrated', {
-    model: rec.model,
-    provider: rec.provider,
-    key: modelKey,
-    sessions: L.sessions,
-    chars: L.chars,
-    targetChars: L.targetChars,
-    concentration: L.concentration,
-    samples: L.samples.length,
+    bucket: B.id,
+    names: B.names,
+    sessions: B.sessions,
+    chars: B.chars,
+    targetChars: B.targetChars,
+    concentration: B.concentration,
+    samples: B.samples.length,
     anchored: anchored.length,
     drifted: drifted.length,
     stability: { jaccard: st.jaccard, weightAgree: st.weightAgree },
@@ -1027,7 +1128,7 @@ function closeRec(rec, reason) {
     rec.counterfactual = null
   }
   annotateReward(rec)
-  evaluateProbe(rec) // 短会话：探测窗口没满也在关闭时收尾判定
+  selectLexicon(rec) // 短会话：探测窗口没满也在关闭时收尾判定
   maybeAutoCalibrate(rec)
   rec.closed = true
   logAudit(rec, 'closed', { reason })
@@ -1121,7 +1222,7 @@ function adopt(agent, doAnchor, channel) {
     sourceKinds: {},
     provider: null,
     model: null,
-    modelKey: null,
+    namesLogged: false,
     lexicon: CONFIG.lexicon,
     lexiconSource: 'default',
     lexiconMismatch: null,
@@ -1182,20 +1283,12 @@ function feedSessionEvent(session, event) {
     const model = typeof d.model === 'string' && d.model.length > 0
       ? d.model
       : (d.header && d.header.config && d.header.config.model)
-    // 词典键 = 模型名；模型名缺失时才退供应商名兜底（同一供应商代售多种模型，风格不可混）。
-    const modelKey = typeof model === 'string' && model.length > 0 ? model : provider
-    if (typeof modelKey === 'string' && modelKey.length > 0 && modelKey !== rec.modelKey) {
-      if (typeof provider === 'string' && provider.length > 0) rec.provider = provider
-      if (typeof model === 'string' && model.length > 0) rec.model = model
-      rec.modelKey = modelKey
-      // 模型换了 → 词典、探测、样本全部重置（旧样本的百分位是旧词典算的，不能混用）
-      rec.probe = newProbe()
-      rec.lexiconMismatch = null
-      rec.styleSamples = []
-      const r = resolveLexicon(modelKey)
-      rec.lexicon = r.lexicon
-      rec.lexiconSource = r.source
-      logAudit(rec, 'lexicon-resolved', { model: rec.model, provider: rec.provider, key: modelKey, source: r.source })
+    if (typeof provider === 'string' && provider.length > 0) rec.provider = provider
+    if (typeof model === 'string' && model.length > 0) rec.model = model
+    // 名字只记标签，不参与词典选择——输出说话（selectLexicon 用输出拟合选词典）
+    if (!rec.namesLogged && (rec.model || rec.provider)) {
+      rec.namesLogged = true
+      logAudit(rec, 'lexicon-names', { model: rec.model, provider: rec.provider, hint: 'names are labels only; output decides the lexicon' })
     }
   }
   if (event.type === 'tool/call') {
@@ -1265,7 +1358,6 @@ function summaryOf(rec) {
     history: rec.ratioHistory.length,
     provider: rec.provider,
     model: rec.model,
-    modelKey: rec.modelKey,
     lexiconSource: rec.lexiconSource,
     lexiconMismatch: rec.lexiconMismatch,
     probeBlocks: rec.probe ? rec.probe.blocks : 0,
@@ -1333,20 +1425,19 @@ function buildSummary(filter) {
     lexicon: {
       auto: CONFIG.lexiconAuto,
       profiles: Object.keys(CONFIG.lexiconProfiles || {}),
-      overrides: Object.keys(lexiconOverrides).map(p => ({
-        provider: p,
-        terms: Object.keys(lexiconOverrides[p].positive || {}).length
-          + Object.keys(lexiconOverrides[p].negative || {}).length
-          + Object.keys(lexiconOverrides[p].neutral || {}).length,
-      })),
-      ledger: Object.keys(lexiconLedger).map(p => ({
-        provider: p,
-        sessions: lexiconLedger[p].sessions,
-        chars: lexiconLedger[p].chars,
-        targetChars: lexiconLedger[p].targetChars || null,
-        concentration: lexiconLedger[p].concentration === undefined ? null : lexiconLedger[p].concentration,
-        lastStability: lexiconLedger[p].lastStability || null,
-        samples: lexiconLedger[p].samples.length,
+      buckets: lexiconBuckets.map(b => ({
+        id: b.id,
+        names: b.names,
+        calibrated: b.lexicon !== null,
+        terms: b.lexicon
+          ? Object.keys(b.lexicon.positive || {}).length + Object.keys(b.lexicon.negative || {}).length + Object.keys(b.lexicon.neutral || {}).length
+          : 0,
+        sessions: b.sessions,
+        chars: b.chars,
+        targetChars: b.targetChars || null,
+        concentration: b.concentration === undefined ? null : b.concentration,
+        lastStability: b.lastStability || null,
+        signature: b.signature.length,
       })),
     },
     channelStats,
@@ -1504,8 +1595,8 @@ export function apply(ctx, config) {
       description: 'Read the live audit state of the dsh-trajectory-anchor plugin: adopted/anchored agents, '
         + 'bootstrap tool allow-lists, promotion-gate state, bootstrap context suppression, lexicon-weighted trajectory '
         + 'scores (ratio / persona-ratio bands / baseline percentile), drift-rollback state, counterfactual candidates, '
-        + 'reward annotations, per-model lexicon resolution with start-of-session fit probe, '
-        + 'auto-calibration ledger, and event-channel reachability.',
+        + 'reward annotations, output-fingerprinted lexicon selection (fit probe) and auto-calibration style buckets, '
+        + 'and event-channel reachability.',
       parameters: {
         type: 'object',
         properties: {
