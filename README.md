@@ -47,7 +47,8 @@ Restart DSH. The plugin mounts on the host plane: it adopts all live agents at s
 
 - **DeepSeek 系模型**：开箱即用（内置 DS 词典）。
 - **其他模型**：前几个会话先用默认词典计分，插件在后台自动积累该模型的风格样本；
-  攒够 3 个会话 / 约 4 万字符后**自动生成该模型的专属词典并立即生效**，
+  攒够下限（3 个会话 / 至少约 4 万字符）后，插件按该模型自己的风格特点判断语料是否足够
+  （词表集中度目标 + 稳定性验收），够了就**自动生成该模型的专属词典并立即生效**，
   之后所有会话自动沿用（跨重启持久化，无需任何操作）。
 - **看状态**：随时调用 `anchor_status` 工具，`lexicon` 块里有每个模型的标定进度与生效词典。
 
@@ -85,7 +86,7 @@ agent/disposed: RewardAnnotator process reward + trajectory JSONL final archive
 | `suppressContextOnBootstrap` | `true` | agent-scope context suppression during bootstrap |
 | `lexicon` / `ratioWeights` | monitor-calibrated | weighted lexicon scoring (we/let's/we'll/"we need"/our vs "let me"; neutral i will/i'll/i need/check/verify) |
 | `lexiconProfiles` | `{}` (`deepseek-official` pre-seeded with the DS lexicon) | per-provider built-in dictionaries; pre-seed a known model to skip the auto-calibration wait |
-| `lexiconAuto` | enabled; 3 sessions / 40k chars | unknown-provider auto-calibration (detect → sample → calibrate → apply); see "Lexicon calibration" below |
+| `lexiconAuto` | enabled; floor 3 sessions / 40k chars, cap 160k, stability 0.6 | unknown-provider auto-calibration (detect → sample → adaptive target → stability-gated calibrate → apply); see "Lexicon calibration" below |
 | `specMax` / `reactMin` | `0.2` / `0.5` | persona_ratio band boundaries (spec/mixed/react) |
 | `baselineMinSamples` / `rollbackPercentile` | `10` / `25` | **baseline-relative drift**: rollback only fires when the current ratio's percentile within the session's own history is < 25 |
 | `rollbackEnabled` | `true` | calibrated rollback switch (safe to enable under baseline-relative semantics) |
@@ -158,22 +159,35 @@ manual steps**:
 3. **Sample** — while a provider without a built-in dictionary is speaking, the plugin quietly
    accumulates style samples: reasoning text + the session's own baseline percentile (a
    model-agnostic quality signal — not DS-lexicon scores, so no circular bias).
-4. **Calibrate** — once that provider reaches `minSessions` sessions and `minChars` of reasoning
-   text, the plugin runs the shared contrast engine (`tools/lexicon-core.mjs`, log-odds n-gram
-   contrast) over the high-percentile vs low-percentile samples and derives
-   positive/negative/neutral marker terms with log-odds weights.
+4. **Calibrate** — "how much corpus is enough" is not a fixed number and not "the more the
+   better"; it is decided per model in three steps:
+   - **Floor** (`minSessions` + `minChars`): enough sessions/tasks that task vocabulary cannot
+     dominate the contrast (the known single-session contamination trap).
+   - **Adaptive target**: the char target scales with the model's own n-gram concentration —
+     concentrated style markers (like ark's 终验/终验证) converge fast, so the target shrinks
+     toward `minChars`; diffuse vocabulary gets up to 1.5× more text (formula below).
+   - **Stability acceptance**: at the target the plugin runs the shared contrast engine
+     (`tools/lexicon-core.mjs`, log-odds n-gram contrast) on two random split-halves of the
+     samples and compares the resulting dictionaries (term-set Jaccard + weight agreement).
+     Only when the halves agree (`minStability`, default 0.6) is the corpus declared
+     *converged*; otherwise the target auto-grows ×1.5 and sampling continues — up to the
+     `maxChars` cap, after which every new session re-tests stability. Measured on synthetic
+     corpora: thin (10+10) splits agree at ~0.6, thick (200+200) at ~0.9 — the gate fires where
+     it should.
 5. **Apply** — the derived lexicon is active immediately for that provider and persisted to
    `<logDir>/lexicon-state.json` (survives restarts; the ledger keeps accumulating).
 
-So: use any model. The first few sessions are scored with the default lexicon; after the
-threshold (defaults: 3 sessions / 40k characters) the plugin swaps in a lexicon calibrated on
-the model's own anchored-vs-drifted style, labeled by the session's own percentile baseline.
+Adaptive target formula: `target = minChars × (1 + (1 − C) × concentrationScale)`, clamped to
+`[minChars, maxChars]`, where `C` = frequency share of the top-50 n-grams (vocabulary
+concentration). Defaults: 3 sessions / 40k chars floor, 160k cap, scale 0.5, stability 0.6.
 
 Auto-calibration knobs (all under `lexiconAuto`, patchable in cordis.patch.yml): `enabled`
-(default `true`), `minSessions` (3), `minChars` (40000), `percentileHigh` / `percentileLow`
-(75/25), `minFreq` (5), `top` (60). Progress is audited per provider
-(`lexicon-resolved` / `lexicon-auto-progress` / `lexicon-calibrated` events) and visible in the
-`anchor_status` tool's `lexicon` block.
+(default `true`), `minSessions` (3), `minChars` (40000), `maxChars` (160000),
+`concentrationScale` (0.5), `minStability` (0.6), `percentileHigh` / `percentileLow` (75/25),
+`minFreq` (5), `top` (60). Progress is audited per provider (`lexicon-resolved` /
+`lexicon-auto-progress` / `lexicon-auto-target` / `lexicon-auto-pending` /
+`lexicon-calibrated` events) and visible in the `anchor_status` tool's `lexicon` block
+(target chars, concentration, last split-half stability per provider).
 
 **Pre-seed a known dictionary** (skip the waiting period) via `lexiconProfiles` in the patch:
 

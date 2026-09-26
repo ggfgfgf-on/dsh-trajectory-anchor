@@ -34,7 +34,7 @@
  * workspaceRoot (process.cwd()).
  */
 
-import { contrastPolarity } from './tools/lexicon-core.mjs'
+import { contrastPolarity, ngrams } from './tools/lexicon-core.mjs'
 
 const DEFAULTS = {
   anchorEnabled: true,
@@ -59,12 +59,19 @@ const DEFAULTS = {
   // profile；用户可在 patch 里预置其他模型的词典，例如
   // { huoshan: { positive: { '终验': 2 }, negative: {...}, neutral: {...} } }。
   lexiconProfiles: {},
-  // 未知模型自动标定：按 provider 积累风格样本（文本 + 会话内基准百分位），
-  // 达到阈值后自动 contrast 出词典、立即生效并持久化（lexicon-state.json）。
+  // 未知模型自动标定：按 provider 积累风格样本（文本 + 会话内基准百分位）。
+  // 「攒够多少」不是固定值，而是四段式：
+  //   下限 minSessions/minChars（保障跨任务覆盖）→
+  //   自适应目标（按该模型词表集中度放大/缩小）→
+  //   稳定性验收（split-half 词典一致才算够，不够自动加量）→
+  //   上限 maxChars（封顶后等新会话复检，保证总会收敛）。
   lexiconAuto: {
     enabled: true,
     minSessions: 3,
     minChars: 40000,
+    maxChars: 160000,
+    concentrationScale: 0.5,
+    minStability: 0.6,
     percentileHigh: 75,
     percentileLow: 25,
     minFreq: 5,
@@ -351,8 +358,92 @@ function loadLexiconState() {
     .catch(() => { /* first boot: no state file */ })
 }
 
-/** 会话关闭时并入账本；达到阈值就自动 contrast 出词典、立即生效并落盘。
- *  只对无内置词典的 provider 生效（deepseek-official 走 profile，永远不进账本）。 */
+function rowsToLexicon(rows) {
+  const lexicon = { positive: {}, negative: {}, neutral: {} }
+  for (const r of rows) {
+    const bucket = r.polarity === 'positive' ? lexicon.positive : r.polarity === 'negative' ? lexicon.negative : lexicon.neutral
+    bucket[r.term] = Math.round(Math.min(3, Math.max(0.5, Math.abs(r.odds))) * 10) / 10
+  }
+  return lexicon
+}
+
+/** 按模型特点计算语料目标量：词表集中度 C（top-50 n-gram 频次占比）。
+ *  风格标记越集中（C 高）→ log-odds 收敛越快 → 目标越小；
+ *  词汇越发散（C 低）→ 需要更多语料才能让标记浮出来。
+ *  target = minChars × (1 + (1 − C) × concentrationScale)，clamp [minChars, maxChars]。 */
+function autoTargetChars(L, auto) {
+  try {
+    const freq = new Map()
+    let total = 0
+    const cap = 300
+    const texts = []
+    for (const s of L.samples) {
+      texts.push(s.text)
+      if (texts.length >= cap) break
+    }
+    for (const g of ngrams(texts)) {
+      freq.set(g, (freq.get(g) || 0) + 1)
+      total += 1
+    }
+    if (total < 2000) return null // 集中度估算本身还不够可信，退回上限
+    const top50 = Array.from(freq.values()).sort((a, b) => b - a).slice(0, 50).reduce((a, b) => a + b, 0)
+    const C = top50 / total
+    const minChars = typeof auto.minChars === 'number' ? auto.minChars : 40000
+    const maxChars = typeof auto.maxChars === 'number' ? auto.maxChars : 160000
+    const scale = typeof auto.concentrationScale === 'number' ? auto.concentrationScale : 0.5
+    return { target: Math.min(maxChars, Math.round(minChars * (1 + (1 - C) * scale))), C: Math.round(C * 1000) / 1000 }
+  } catch (e) {
+    return null
+  }
+}
+
+/** split-half 稳定性验收：把高分/低分样本各分两半独立 contrast，
+ *  比较两份词典的 top 词集合（Jaccard）与权重一致率。
+ *  两份独立词典长得像 → 语料已收敛；不像 → 语料还薄，继续攒。 */
+function stabilityOf(L, auto) {
+  const high = []
+  const low = []
+  for (const s of L.samples) {
+    if (s.percentile >= auto.percentileHigh) high.push(s.text)
+    else if (s.percentile <= auto.percentileLow) low.push(s.text)
+  }
+  const halves = [
+    { a: high.slice(0, high.length >> 1), d: low.slice(0, low.length >> 1) },
+    { a: high.slice(high.length >> 1), d: low.slice(low.length >> 1) },
+  ]
+  const minFreq = typeof auto.minFreq === 'number' ? auto.minFreq : 5
+  const top = typeof auto.top === 'number' ? auto.top : 60
+  const lexA = rowsToLexicon(contrastPolarity(halves[0].a, halves[0].d, minFreq, top))
+  const lexB = rowsToLexicon(contrastPolarity(halves[1].a, halves[1].d, minFreq, top))
+  const termsA = new Set([...Object.keys(lexA.positive), ...Object.keys(lexA.negative), ...Object.keys(lexA.neutral)])
+  const termsB = new Set([...Object.keys(lexB.positive), ...Object.keys(lexB.negative), ...Object.keys(lexB.neutral)])
+  const inter = Array.from(termsA).filter(t => termsB.has(t)).length
+  const union = new Set([...termsA, ...termsB]).size
+  const jaccard = union === 0 ? 0 : inter / union
+  let wsum = 0
+  let wagree = 0
+  for (const pol of ['positive', 'negative', 'neutral']) {
+    for (const t of Object.keys(lexA[pol])) {
+      const wB = lexB[pol] && lexB[pol][t]
+      if (typeof wB !== 'number') continue
+      wsum += 1
+      if (Math.abs(lexA[pol][t] - wB) / Math.abs(lexA[pol][t]) < 0.5) wagree += 1
+    }
+  }
+  const weightAgree = wsum === 0 ? 1 : wagree / wsum
+  const minStability = typeof auto.minStability === 'number' ? auto.minStability : 0.6
+  return {
+    jaccard: Math.round(jaccard * 1000) / 1000,
+    weightAgree: Math.round(weightAgree * 1000) / 1000,
+    anchored: high.length,
+    drifted: low.length,
+    stable: jaccard >= minStability && weightAgree >= minStability,
+  }
+}
+
+/** 会话关闭时并入账本；语料达到自适应目标且通过稳定性验收就自动出词典、
+ *  立即生效并落盘。只对无内置词典的 provider 生效
+ *  （deepseek-official 走 profile，永远不进账本）。 */
 function maybeAutoCalibrate(rec) {
   const auto = CONFIG.lexiconAuto
   if (!auto || auto.enabled === false) return
@@ -373,21 +464,43 @@ function maybeAutoCalibrate(rec) {
   saveLexiconState()
   const minSessions = typeof auto.minSessions === 'number' ? auto.minSessions : 3
   const minChars = typeof auto.minChars === 'number' ? auto.minChars : 40000
+  const maxChars = typeof auto.maxChars === 'number' ? auto.maxChars : 160000
   if (L.sessions < minSessions || L.chars < minChars) {
     logAudit(rec, 'lexicon-auto-progress', { provider, sessions: L.sessions, chars: L.chars, samples: L.samples.length })
     return
   }
-  const high = typeof auto.percentileHigh === 'number' ? auto.percentileHigh : 75
-  const low = typeof auto.percentileLow === 'number' ? auto.percentileLow : 25
+  // 自适应目标：按该模型词表集中度计算（只算一次并随账本持久化展示）
+  if (!L.targetChars) {
+    const est = autoTargetChars(L, auto)
+    L.targetChars = est ? est.target : maxChars
+    L.concentration = est ? est.C : null
+    logAudit(rec, 'lexicon-auto-target', { provider, targetChars: L.targetChars, concentration: L.concentration })
+  }
+  if (L.chars < L.targetChars) {
+    logAudit(rec, 'lexicon-auto-progress', { provider, sessions: L.sessions, chars: L.chars, targetChars: L.targetChars, samples: L.samples.length })
+    return
+  }
+  // 达到目标量 → 稳定性验收；不稳就自动把目标上调 1.5×（封顶 maxChars），继续攒
+  const st = stabilityOf(L, auto)
+  if (!st.stable) {
+    L.lastStability = { jaccard: st.jaccard, weightAgree: st.weightAgree }
+    if (st.anchored < 20 || st.drifted < 20) {
+      logAudit(rec, 'lexicon-auto-pending', { provider, reason: 'insufficient contrast samples', anchored: st.anchored, drifted: st.drifted })
+      return
+    }
+    if (L.targetChars >= maxChars && L.chars >= maxChars) {
+      logAudit(rec, 'lexicon-auto-pending', { provider, reason: 'unstable at cap, waiting for more sessions', jaccard: st.jaccard, weightAgree: st.weightAgree })
+      return
+    }
+    L.targetChars = Math.min(maxChars, Math.round(L.targetChars * 1.5))
+    logAudit(rec, 'lexicon-auto-pending', { provider, reason: 'corpus not yet stable', jaccard: st.jaccard, weightAgree: st.weightAgree, nextTargetChars: L.targetChars })
+    return
+  }
   const anchored = []
   const drifted = []
   for (const s of L.samples) {
-    if (s.percentile >= high) anchored.push(s.text)
-    else if (s.percentile <= low) drifted.push(s.text)
-  }
-  if (anchored.length < 10 || drifted.length < 10) {
-    logAudit(rec, 'lexicon-auto-pending', { provider, reason: 'insufficient contrast samples', anchored: anchored.length, drifted: drifted.length })
-    return
+    if (s.percentile >= auto.percentileHigh) anchored.push(s.text)
+    else if (s.percentile <= auto.percentileLow) drifted.push(s.text)
   }
   let rows
   try {
@@ -400,20 +513,19 @@ function maybeAutoCalibrate(rec) {
     logAudit(rec, 'lexicon-auto-pending', { provider, reason: 'no contrast terms' })
     return
   }
-  const lexicon = { positive: {}, negative: {}, neutral: {} }
-  for (const r of rows) {
-    const bucket = r.polarity === 'positive' ? lexicon.positive : r.polarity === 'negative' ? lexicon.negative : lexicon.neutral
-    bucket[r.term] = Math.round(Math.min(3, Math.max(0.5, Math.abs(r.odds))) * 10) / 10
-  }
+  const lexicon = rowsToLexicon(rows)
   lexiconOverrides[provider] = lexicon
   saveLexiconState()
   logAudit(rec, 'lexicon-calibrated', {
     provider,
     sessions: L.sessions,
     chars: L.chars,
+    targetChars: L.targetChars,
+    concentration: L.concentration,
     samples: L.samples.length,
     anchored: anchored.length,
     drifted: drifted.length,
+    stability: { jaccard: st.jaccard, weightAgree: st.weightAgree },
     positive: Object.keys(lexicon.positive).length,
     negative: Object.keys(lexicon.negative).length,
     neutral: Object.keys(lexicon.neutral).length,
@@ -1133,6 +1245,9 @@ function buildSummary(filter) {
         provider: p,
         sessions: lexiconLedger[p].sessions,
         chars: lexiconLedger[p].chars,
+        targetChars: lexiconLedger[p].targetChars || null,
+        concentration: lexiconLedger[p].concentration === undefined ? null : lexiconLedger[p].concentration,
+        lastStability: lexiconLedger[p].lastStability || null,
         samples: lexiconLedger[p].samples.length,
       })),
     },
