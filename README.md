@@ -41,18 +41,6 @@ Restart DSH. The plugin mounts on the host plane: it adopts all live agents at s
 (audit-only) and every new agent then goes through the
 **anchor → gate promotion → continuous scoring** lifecycle.
 
-## 快速开始（普通用户）
-
-装完即用，零手动配置：`dsh plugin add github:ggfgfgf-on/dsh-trajectory-anchor` 之后重启 DSH 即可。
-
-- **只看输出，不看名字**：model/provider 名字只是标签（别名、网关转发都会让名字
-  对不上号），词典的识别、选择、积累、合并全部由**输出文本的风格**决定。
-  每个会话开头插件自动探测哪个候选词典读得懂这段输出——读得懂就一直用；
-  读不懂才在后台攒样本，攒够后自动标定出这个输出风格的专属词典并立即生效，
-  之后同样风格的会话自动沿用（跨重启持久化，无需任何操作）。
-- **看状态**：随时调用 `anchor_status` 工具，`lexicon` 块里有风格桶
-  （标定进度、签名、命中检测结果）。
-
 ## Lifecycle
 
 ```
