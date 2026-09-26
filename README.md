@@ -195,7 +195,10 @@ model tomorrow), so recognition, selection, accumulation and merging are all dri
      "let me" (Doubao-style) without inheriting the DS lexicon's polarity. Only without an
      oracle (unanchored / self sessions) does labeling fall back to session-own percentiles.
      Verified on synthetic corpora in both directions: let-me-anchored models get let-me
-     positive; we-anchored models get we positive.
+     positive; we-anchored models get we positive. The n-gram engine is script-generic
+     (CJK ideographs incl. ext-A, kana, Hangul, Latin incl. diacritics, Cyrillic — verified
+     auto-discovering oracle markers in Chinese, Japanese, Korean and French synthetic
+     corpora); scripts outside this coverage (e.g. pure Arabic) are an honest boundary.
    - **Floor** (`minSessions` + `minChars`): enough sessions/tasks that task vocabulary cannot
      dominate the contrast (the known single-session contamination trap).
    - **Adaptive target**: the char target scales with the bucket's own n-gram concentration —

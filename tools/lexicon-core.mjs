@@ -10,19 +10,21 @@ export const LATIN_STOPWORDS = new Set([
   'also', 'just', 'now', 'here', 'there', 'what', 'which', 'when', 'how', 'why', 'get', 'got',
 ])
 
-/** 对文本数组计 n-gram：CJK 字 n-gram（2-4）+ 拉丁词 n-gram（1-2，滤停用词）。 */
+/** 对文本数组计 n-gram：东方文字字 n-gram（2-4：中日韩统一表意含扩展A/兼容、
+ *  假名、谚文音节）+ 拉丁/西里尔词 n-gram（1-2，滤停用词，含带重音字母）。
+ *  覆盖之外的文字（如纯阿拉伯文）暂不参与对比——诚实边界。 */
 export function ngrams(texts) {
   const map = new Map()
   const bump = (k) => { if (k) map.set(k, (map.get(k) ?? 0) + 1) }
   for (const text of texts) {
     if (typeof text !== 'string' || text.length === 0) continue
-    const cjkRuns = text.match(/[\u4e00-\u9fff]{2,}/g) ?? []
+    const cjkRuns = text.match(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]{2,}/g) ?? []
     for (const run of cjkRuns) {
       for (let n = 2; n <= 4; n++) {
         for (let i = 0; i + n <= run.length; i++) bump(run.slice(i, i + n))
       }
     }
-    const latinRuns = text.match(/[A-Za-z][A-Za-z' -]*/g) ?? []
+    const latinRuns = text.match(/[A-Za-z\u00c0-\u024f\u0400-\u04ff][A-Za-z\u00c0-\u024f\u0400-\u04ff' -]*/g) ?? []
     for (const run of latinRuns) {
       const words = run.toLowerCase().split(/[\s-]+/).filter((w) => w.length > 1 && !LATIN_STOPWORDS.has(w))
       for (let i = 0; i < words.length; i++) {
