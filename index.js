@@ -635,7 +635,23 @@ function maybeAutoCalibrate(rec) {
       else if (s.percentile <= auto.percentileLow) low.push(s.text)
     }
   }
-  const useOracle = anchoredRef.length >= 10 && postLift.length >= 10
+  let useOracle = anchoredRef.length >= 10 && postLift.length >= 10
+  if (useOracle) {
+    // 神谕前提验证：bootstrap 期的「计划性」（带推理块的消息占比）不得明显差于晋升后。
+    // 若该模型在锚定期反而更浅（无推理裸答），「锚定=已知良好」的前提对该模型不成立，
+    // 退回百分位标签（独立的计划性信号来自消息结构，与词典无关）。
+    const bRich = rec.bootstrapMsgs > 0 ? rec.bootstrapBlocks / rec.bootstrapMsgs : 0
+    const pRich = rec.postLiftMsgs > 0 ? rec.postLiftBlocks / rec.postLiftMsgs : 0
+    if (rec.bootstrapMsgs >= 3 && pRich > 0 && bRich < pRich * 0.6) {
+      useOracle = false
+      logAudit(rec, 'oracle-unvalidated', {
+        bootstrapMsgs: rec.bootstrapMsgs,
+        bootstrapRich: Math.round(bRich * 100) / 100,
+        postLiftRich: Math.round(pRich * 100) / 100,
+        hint: 'bootstrap phase not planning-rich; polarity oracle premise fails for this model, falling back to percentile labels',
+      })
+    }
+  }
   const posSet = useOracle ? anchoredRef : high
   const negSet = useOracle ? postLift : low
   if (posSet.length < 10 || negSet.length < 10) {
@@ -870,6 +886,16 @@ function updateWindow(rec, texts, agent) {
     flags = flagsOf(texts, rec.lexicon)
     rec.lastMessages.push({ flags })
     while (rec.lastMessages.length > CONFIG.trajectoryWindowSize) rec.lastMessages.shift()
+  }
+  if (rec.anchored) {
+    // 计划性计数（神谕前提验证用）：bootstrap 期 vs 晋升后，有推理块的占比
+    if (!rec.lifted) {
+      rec.bootstrapMsgs = (rec.bootstrapMsgs || 0) + 1
+      rec.bootstrapBlocks = (rec.bootstrapBlocks || 0) + texts.length
+    } else {
+      rec.postLiftMsgs = (rec.postLiftMsgs || 0) + 1
+      rec.postLiftBlocks = (rec.postLiftBlocks || 0) + texts.length
+    }
   }
   // bootstrap 期（锚定阶段）参考块：该模型的已知良好状态，用作极性神谕
   if (rec.anchored && !rec.lifted && texts.length > 0) {

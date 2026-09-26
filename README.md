@@ -199,6 +199,18 @@ model tomorrow), so recognition, selection, accumulation and merging are all dri
      (CJK ideographs incl. ext-A, kana, Hangul, Latin incl. diacritics, Cyrillic — verified
      auto-discovering oracle markers in Chinese, Japanese, Korean and French synthetic
      corpora); scripts outside this coverage (e.g. pure Arabic) are an honest boundary.
+     The oracle premise is sanity-checked per session (`oracle-unvalidated` audit): if the
+     model's bootstrap phase is systematically shallower than its post-lift output (fewer
+     reasoning blocks per message — an independent, lexicon-free structural signal), the
+     oracle is refused for that model and percentile labels are used instead. Note this is a
+     premise check, not full per-block quality validation — the latter would need outcome
+     signals (task scores), which general sessions do not carry.
+   - **Low-frequency markers**: terms with total frequency below `minFreq` are only admitted
+     when they pass a two-sided Fisher exact test (p<0.05) on the 2×2 frequency table —
+     "1 hit in anchored, 0 in drifted" artifacts are rejected (p≈0.5), while genuinely rare
+     discriminative markers (≈6 single-side hits on a 3k-char side) are admitted. At the
+     designed corpus scale (40k+ chars) even ≈0.1‰ markers accumulate enough hits, so thin
+     corpora no longer gate discovery.
    - **Floor** (`minSessions` + `minChars`): enough sessions/tasks that task vocabulary cannot
      dominate the contrast (the known single-session contamination trap).
    - **Adaptive target**: the char target scales with the bucket's own n-gram concentration —

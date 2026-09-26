@@ -39,9 +39,11 @@ export function ngrams(texts) {
 /**
  * 锚定组 vs 漂移组对比：每个候选词的 log-odds，正 = 锚定组过度表达（positive），
  * 负 = 漂移组过度表达（negative）。返回按 |odds| 降序的 top 列表。
+ * 低频词（总频次 < minFreq）必须额外通过 Fisher 精确检验（p<0.05）才入榜，
+ * 否则「正组 1 次、负组 0 次」这类样本量伪影会冒充神谕词。
  * @param anchored - 锚定风文本块数组
  * @param drifted - 漂移风文本块数组
- * @param minFreq - 候选最小总频次
+ * @param minFreq - 候选硬下限（达到即免检验；未达到需 Fisher 显著）
  * @param top - 输出上限
  * @returns [{ term, fa, fd, odds, polarity }]
  */
@@ -55,15 +57,63 @@ export function contrastPolarity(anchored, drifted, minFreq, top) {
   for (const term of seen) {
     const fa = a.get(term) ?? 0
     const fd = d.get(term) ?? 0
-    if (fa + fd < minFreq) continue
+    const total = fa + fd
+    if (total < 2) continue
     const pa = fa / aN
     const pd = fd / dN
     const odds = Math.log((pa + 1e-9) / (pd + 1e-9))
     if (Math.abs(odds) < 0.4) continue
+    if (total < minFreq) {
+      // 低频词：过显著性检验才算数（Fisher 精确，双侧 p<0.05）
+      if (fisherExact(fa, aN, fd, dN) > 0.05) continue
+    }
     rows.push({ term, fa, fd, odds, polarity: odds > 0 ? 'positive' : 'negative' })
   }
   rows.sort((x, y) => Math.abs(y.odds) - Math.abs(x.odds))
   return rows.slice(0, top)
+}
+
+/** log-gamma（Lanczos 近似），供 Fisher 精确检验的 log 域组合数计算。 */
+function logGamma(x) {
+  const g = 7
+  const c = [
+    0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+    771.32342877765313, -176.61502916214059, 12.507343278686905,
+    -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7,
+  ]
+  if (x < 0.5) return Math.log(Math.PI / Math.sin(Math.PI * x)) - logGamma(1 - x)
+  x -= 1
+  let a = c[0]
+  const t = x + g + 0.5
+  for (let i = 1; i < g + 2; i++) a += c[i] / (x + i)
+  return 0.5 * Math.log(2 * Math.PI) + (x + 0.5) * Math.log(t) - t + Math.log(a)
+}
+
+function logComb(n, k) {
+  if (k < 0 || k > n) return -Infinity
+  return logGamma(n + 1) - logGamma(k + 1) - logGamma(n - k + 1)
+}
+
+/** 超几何概率 P(X=k) = C(K,k)·C(N−K,n−k)/C(N,n)。 */
+function hypergeomP(k, N, K, n) {
+  return Math.exp(logComb(K, k) + logComb(N - K, n - k) - logComb(N, n))
+}
+
+/** 2×2 双侧 Fisher 精确检验 p 值（表：[fa, aN−fa; fd, dN−fd]）。
+ *  字符量作为机会单位——这是筛选统计量，不是严格实验设计。 */
+export function fisherExact(fa, aN, fd, dN) {
+  const N = aN + dN
+  const K = fa + fd
+  const n = aN
+  const lo = Math.max(0, K - (N - n))
+  const hi = Math.min(K, n)
+  const pObs = hypergeomP(fa, N, K, n)
+  let p = 0
+  for (let k = lo; k <= hi; k++) {
+    const pk = hypergeomP(k, N, K, n)
+    if (pk <= pObs * (1 + 1e-9)) p += pk
+  }
+  return Math.min(1, p)
 }
 
 /** log-odds → 词典权重（截断到 [0.5, 3.0]，1 位小数）。 */
