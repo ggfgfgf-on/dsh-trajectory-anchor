@@ -69,7 +69,7 @@ const DEFAULTS = {
     // 开头适配探测：候选词典对该会话前几段输出做拟合检测。
     probeMaxBlocks: 8,
     probeMinChars: 2500,
-    probeMinBlocks: 3,
+    probeMinBlocks: 4,
     probeMinHitRate: 0.25,
     probeMinSignalBlocks: 3,
     probeMinRatioSpread: 0.15,
@@ -377,7 +377,7 @@ function selectLexicon(rec) {
   if (rec.lexiconMismatch !== null) return
   const p = rec.probe
   const auto = CONFIG.lexiconAuto
-  const minBlocks = typeof auto.probeMinBlocks === 'number' ? auto.probeMinBlocks : 3
+  const minBlocks = typeof auto.probeMinBlocks === 'number' ? auto.probeMinBlocks : 4
   if (!p || p.blocks < minBlocks) return
   const texts = p.texts
   const names = { model: rec.model, provider: rec.provider }
@@ -393,11 +393,14 @@ function selectLexicon(rec) {
     if (b && b.lexicon) candidates.push({ lexicon: b.lexicon, label: 'bucket:' + b.id })
   }
   candidates.push({ lexicon: CONFIG.lexicon, label: 'default' })
+  const attempts = []
   let best = null
   for (const c of candidates) {
     const fit = probeFit(c.lexicon, texts)
+    const row = { label: c.label, hitRate: Math.round(fit.hitRate * 1000) / 1000, signalBlocks: fit.signalBlocks, ratioCV: Math.round(fit.cv * 1000) / 1000 }
+    attempts.push(row)
     if (probeFits(fit, auto) && (!best || fit.hitRate > best.hitRate)) {
-      best = { ...c, hitRate: Math.round(fit.hitRate * 1000) / 1000, signalBlocks: fit.signalBlocks, ratioCV: Math.round(fit.cv * 1000) / 1000 }
+      best = { ...c, ...row }
     }
   }
   if (best) {
@@ -412,12 +415,12 @@ function selectLexicon(rec) {
     } else {
       rec.styleSamples = []
     }
-    logAudit(rec, 'lexicon-fit', { ...names, chosen: best.label, hitRate: best.hitRate, signalBlocks: best.signalBlocks, ratioCV: best.ratioCV, hint: 'chosen lexicon fits this session output' })
+    logAudit(rec, 'lexicon-fit', { ...names, chosen: best.label, hitRate: best.hitRate, signalBlocks: best.signalBlocks, ratioCV: best.ratioCV, attempts, hint: 'chosen lexicon fits this session output' })
     return
   }
   rec.lexiconMismatch = true
   rec.lexiconSource = 'mismatch'
-  logAudit(rec, 'lexicon-mismatch', { ...names, candidatesTested: candidates.length, hint: 'no candidate lexicon reads this output; collecting samples for auto-calibration' })
+  logAudit(rec, 'lexicon-mismatch', { ...names, candidatesTested: candidates.length, attempts, hint: 'no candidate lexicon reads this output; collecting samples for auto-calibration' })
 }
 
 // ---------- 输出风格词典：探测选词 + 签名桶自动标定 ----------

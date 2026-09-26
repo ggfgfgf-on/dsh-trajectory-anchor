@@ -203,7 +203,7 @@ Adaptive target formula: `target = minChars × (1 + (1 − C) × concentrationSc
 concentration). Defaults: 3 sessions / 40k chars floor, 160k cap, scale 0.5, stability 0.6.
 
 Auto-calibration knobs (all under `lexiconAuto`, patchable in cordis.patch.yml): `enabled`
-(default `true`), fit probe (`probeMaxBlocks` 8 / `probeMinChars` 2500 / `probeMinBlocks` 3 /
+(default `true`), fit probe (`probeMaxBlocks` 8 / `probeMinChars` 2500 / `probeMinBlocks` 4 /
 `probeMinHitRate` 0.25 / `probeMinSignalBlocks` 3 / `probeMinRatioSpread` 0.15),
 `bucketMatchThreshold` (0.25), `minSessions` (3), `minChars` (40000), `maxChars` (160000),
 `concentrationScale` (0.5), `minStability` (0.6), `percentileHigh` / `percentileLow` (75/25),
