@@ -156,29 +156,54 @@ function indexSessionLog(sessionId) {
       const turn = o.data?.turn, step = o.data?.step
       const content = o.data?.message?.content ?? []
       const texts = []
+      const callIds = []
+      const toolNames = []
       for (const b of content) {
         if (b?.type === 'reasoning' || b?.type === 'text') texts.push(b.text ?? '')
+        if (b?.type === 'tool-call') { if (b.id) callIds.push(b.id); if (b.name) toolNames.push(b.name) }
       }
       const t = texts.join('\n').trim()
-      if (t) {
+      if (t || callIds.length > 0) {
         const key = `${turn}:${step}`
         const cur = idx.assistantByKey.get(key)
         // DSH 会话日志会把一条消息拆成多个 assistant/message 片段落盘
         //（第 1 片 reasoning+tool-call、第 2 片 tool-result …），同 key 多记录是正常形态，
         // 必须合并而不是当作歧义。
-        if (cur) { cur.count++; if (t) cur.text = cur.text ? cur.text + '\n' + t : t }
-        else idx.assistantByKey.set(key, { text: t, count: 1 })
-        idx.history.push({ role: 'assistant', text: cap(t, capText) })
+        if (cur) {
+          cur.count++
+          if (t) cur.text = cur.text ? cur.text + '\n' + t : t
+          cur.callIds.push(...callIds)
+          cur.toolNames.push(...toolNames)
+        } else {
+          idx.assistantByKey.set(key, { text: t, count: 1, seqs: [o.seq ?? null], callIds, toolNames, resultCallIds: [] })
+        }
+        if (typeof o.seq === 'number') {
+          const e = idx.assistantByKey.get(key)
+          if (e && !e.seqs.includes(o.seq)) e.seqs.push(o.seq)
+        }
+        if (t) idx.history.push({ role: 'assistant', text: cap(t, capText) })
       }
     }
     if (o.type === 'tool/result') {
       const turn = o.data?.turn, step = o.data?.step
-      const t = textOf(o.data?.message?.content?.[0]?.content ?? o.data?.message?.content)
-      if (t) {
+      const content = o.data?.message?.content ?? []
+      const t = textOf(content?.[0]?.content ?? content)
+      let resultCallId = null
+      for (const b of content) { if (b?.type === 'tool-result' && b.toolCallId) resultCallId = b.toolCallId }
+      if (t || resultCallId) {
         const key = `${turn}:${step}`
         const cur = idx.toolResultByKey.get(key)
-        if (cur) { cur.count++; cur.text = cur.text ? cur.text + '\n' + t : t }
-        else idx.toolResultByKey.set(key, { text: t, count: 1 })
+        if (cur) {
+          cur.count++
+          if (t) cur.text = cur.text ? cur.text + '\n' + t : t
+          if (resultCallId) cur.resultCallIds.push(resultCallId)
+        } else {
+          idx.toolResultByKey.set(key, { text: t, count: 1, seqs: [o.seq ?? null], resultCallIds: resultCallId ? [resultCallId] : [] })
+        }
+        if (typeof o.seq === 'number') {
+          const e = idx.toolResultByKey.get(key)
+          if (e && !e.seqs.includes(o.seq)) e.seqs.push(o.seq)
+        }
       }
     }
     if (o.type === 'request/header' && o.data) {
@@ -265,29 +290,62 @@ function main() {
         },
         textComplete: false,
       }
-      // 执行标识与跨面证据：id = <sessionId>#<turn>:<step>；
-      // 会话侧同 key 多记录是消息片段（已合并），仅作信息性计数。
-      // 唯一「拒绝配对」的真实信号是两侧对同一 key 的文本相互矛盾——当前数据形态
-      // 下无法可判定检测，故不再设 ambiguous 拒绝，改为如实记录两侧证据。
+      // 执行标识与跨面验证：
+      // id = <sessionId>#<turn>:<step>；会话侧同 key 多记录=消息片段（已合并）。
+      // 真实矛盾信号（利用 DSH 原生调用级标识 call_00_...）：
+      //   tool-call：会话片段里的工具名不匹配轨迹侧名字 → 矛盾；
+      //              tool/result 的 callId 与会话片段的 callId 无交集 → 矛盾；
+      //   assistant-message：同 key 片段 seq 不连续 → 疑似两条执行交错。
       const tCount = trajCounts.get(key) ?? 0
+      const aE = sessIdx?.assistantByKey.get(key)
       const sCount = ev.kind === 'assistant-message'
         ? (sessIdx?.assistantByKey.get(key)?.count ?? 0)
         : (sessIdx?.toolResultByKey.get(key)?.count ?? 0)
+      let contradiction = false
+      let callIdVerified = null
+      let fragmentContiguous = null
+      if (ev.kind === 'tool-call') {
+        const rE = sessIdx?.toolResultByKey.get(key)
+        const sessNames = aE?.toolNames ?? []
+        if (sessNames.length > 0) {
+          const nameOk = sessNames.includes(ev.name)
+          callIdVerified = nameOk
+          if (!nameOk) contradiction = true
+        }
+        const aCalls = new Set(aE?.callIds ?? [])
+        const rCalls = rE?.resultCallIds ?? []
+        if (rCalls.length > 0) {
+          const overlap = rCalls.some((c) => aCalls.has(c))
+          if (callIdVerified === null) callIdVerified = overlap
+          if (!overlap) contradiction = true
+        }
+        if (callIdVerified === null) callIdVerified = (rCalls.length === 0 && sessNames.length === 0) ? null : callIdVerified
+      } else {
+        const seqs = (aE?.seqs ?? []).filter((s) => typeof s === 'number').sort((x, y) => x - y)
+        if (seqs.length > 1) {
+          fragmentContiguous = seqs.every((s, i) => i === 0 || s === seqs[i - 1] + 1)
+          if (!fragmentContiguous) contradiction = true
+        }
+      }
       sample.execution = {
         id: `${sessionId}#${ev.turn}:${ev.step}`,
         kind: ev.kind,
         trajectory_occurrences: tCount,
         session_occurrences: sCount,
         cross_plane: tCount > 0 && sCount > 0,
-        ambiguous: false,
+        call_id_verified: callIdVerified,
+        fragment_contiguous: fragmentContiguous,
+        ambiguous: contradiction,
       }
-      if (ev.kind === 'assistant-message') {
-        const e = sessIdx?.assistantByKey.get(key)
-        if (e?.text) { sample.response = cap(e.text, capText); sample.textComplete = true }
-      } else {
-        sample.toolName = ev.name ?? null
-        const e = sessIdx?.toolResultByKey.get(key)
-        if (e?.text) { sample.toolResult = cap(e.text, capText); sample.textComplete = true }
+      if (!contradiction) {
+        if (ev.kind === 'assistant-message') {
+          const e = sessIdx?.assistantByKey.get(key)
+          if (e?.text) { sample.response = cap(e.text, capText); sample.textComplete = true }
+        } else {
+          sample.toolName = ev.name ?? null
+          const e = sessIdx?.toolResultByKey.get(key)
+          if (e?.text) { sample.toolResult = cap(e.text, capText); sample.textComplete = true }
+        }
       }
       samples.push(sample)
     }
@@ -325,7 +383,8 @@ function main() {
   }
   const textSteps = samples.filter((s) => s.textComplete).length
   const oneSided = samples.filter((s) => s.execution && !s.execution.cross_plane).length
-  const crossVerified = samples.length - oneSided
+  const contradictions = samples.filter((s) => s.execution?.ambiguous).length
+  const crossVerified = samples.length - oneSided - contradictions
   const stats = {
     generated_utc: new Date().toISOString(),
     logs_dir: logsDir,
@@ -338,7 +397,7 @@ function main() {
       'tool-call': samples.filter((s) => s.kind === 'tool-call').length,
     },
     text_coverage: totalSamplesPct(samples, textSteps),
-    execution_stats: { cross_plane_verified: crossVerified, one_sided: oneSided },
+    execution_stats: { cross_plane_verified: crossVerified, one_sided: oneSided, contradictions: contradictions },
     lexicon_polarity: { pos_dominant: posCount, neg_dominant: negCount, neutral: neuCount },
     session_reward: { n: sessionScores.length, min: sMin, max: sMax, mean: Number(mean.toFixed(3)), std: Number(std.toFixed(3)) },
     band_buckets: buckets('band'),
