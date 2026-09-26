@@ -349,6 +349,66 @@ function main() {
       }
       samples.push(sample)
     }
+
+    // 补发 session-only 样本：会话日志里有、轨迹面没有的步骤
+    //（典型：门控引导轮 turn-1——插件审计环形缓冲 400 事件上限会在长任务 flush 前
+    //  逐出最旧的普通事件，turn-1 tool-call 因而缺失；生命周期标记有防裁剪保护）。
+    // 这些样本 cross_plane=false、execution.source='session-only'，文本完整可用。
+    if (sessIdx) {
+      const sessionOnly = new Map() // key -> { kind, data }
+      for (const [key, e] of sessIdx.assistantByKey) {
+        if ((trajCounts.get(key) ?? 0) === 0) sessionOnly.set(key, { kind: 'assistant-message', entry: e })
+      }
+      for (const [key, e] of sessIdx.toolResultByKey) {
+        if ((trajCounts.get(key) ?? 0) === 0 && !sessionOnly.has(key)) sessionOnly.set(key, { kind: 'tool-call', entry: e })
+      }
+      for (const [key, { kind, entry }] of sessionOnly) {
+        const [turn, step] = key.split(':').map((v) => Number(v))
+        const sample = {
+          sessionId,
+          model,
+          turn: Number.isFinite(turn) ? turn : null,
+          step: Number.isFinite(step) ? step : null,
+          kind,
+          messages: sessIdx.history.slice(-maxContext),
+          response: null,
+          toolName: null,
+          toolResult: null,
+          reward: {
+            lexicon: null,
+            sessionScore: record.reward?.score ?? null,
+            scoreNorm: null,
+            planner: record.reward?.planner ?? null,
+            planningMessages: record.reward?.planningMessages ?? null,
+            shallowMessages: record.reward?.shallowMessages ?? null,
+          },
+          trajectory_features: {
+            band: record.band ?? null,
+            ratio: record.ratio ?? null,
+            ewma: record.ewma ?? null,
+            percentile: record.percentile ?? null,
+            personaRatio: record.personaRatio ?? null,
+            liftReason: record.liftReason ?? null,
+            machineState: record.machineState ?? null,
+          },
+          execution: {
+            id: `${sessionId}#${key}`,
+            kind,
+            trajectory_occurrences: 0,
+            session_occurrences: entry?.count ?? 1,
+            cross_plane: false,
+            call_id_verified: null,
+            fragment_contiguous: null,
+            ambiguous: false,
+            source: 'session-only',
+          },
+          textComplete: false,
+        }
+        if (kind === 'assistant-message' && entry?.text) { sample.response = cap(entry.text, capText); sample.textComplete = true }
+        if (kind === 'tool-call' && entry?.text) { sample.toolResult = cap(entry.text, capText); sample.textComplete = true }
+        samples.push(sample)
+      }
+    }
   }
 
   // ---------- 归一化 + 统计 ----------
@@ -382,9 +442,10 @@ function main() {
     else neuCount++
   }
   const textSteps = samples.filter((s) => s.textComplete).length
-  const oneSided = samples.filter((s) => s.execution && !s.execution.cross_plane).length
+  const oneSided = samples.filter((s) => s.execution && !s.execution.cross_plane && s.execution.source !== 'session-only').length
+  const sessionOnly = samples.filter((s) => s.execution?.source === 'session-only').length
   const contradictions = samples.filter((s) => s.execution?.ambiguous).length
-  const crossVerified = samples.length - oneSided - contradictions
+  const crossVerified = samples.length - oneSided - sessionOnly - contradictions
   const stats = {
     generated_utc: new Date().toISOString(),
     logs_dir: logsDir,
@@ -397,7 +458,7 @@ function main() {
       'tool-call': samples.filter((s) => s.kind === 'tool-call').length,
     },
     text_coverage: totalSamplesPct(samples, textSteps),
-    execution_stats: { cross_plane_verified: crossVerified, one_sided: oneSided, contradictions: contradictions },
+    execution_stats: { cross_plane_verified: crossVerified, one_sided: oneSided, session_only: sessionOnly, contradictions: contradictions },
     lexicon_polarity: { pos_dominant: posCount, neg_dominant: negCount, neutral: neuCount },
     session_reward: { n: sessionScores.length, min: sMin, max: sMax, mean: Number(mean.toFixed(3)), std: Number(std.toFixed(3)) },
     band_buckets: buckets('band'),
