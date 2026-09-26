@@ -160,17 +160,24 @@ model tomorrow), so recognition, selection, accumulation and merging are all dri
    sessions — the bootstrap phase is persona-primed, not the model's own style) and scores them
    against every candidate lexicon: the default DS lexicon, all calibrated style buckets, and
    any name-hinted profiles. Fit = **marker hit rate** (do the lexicon's terms appear at all?)
-   + **ratio spread** (can the lexicon separate planning-style from reactive-style blocks?).
-   The best-fitting candidate wins; the output alone decides. Nothing is injected, no prompt is
-   added, and the model never sees the probe or its scores — the probe only changes which
-   lexicon computes the host-side audit score.
+   + **ratio spread** (can the lexicon separate planning-style from reactive-style blocks?)
+   + **bootstrap polarity** (does the candidate score the known-good anchored bootstrap phase
+   positive-dominant?). The best-fitting candidate wins; the output alone decides. Nothing is
+   injected, no prompt is added, and the model never sees the probe or its scores — the probe
+   only changes which lexicon computes the host-side audit score.
    - Fits (e.g. DS lexicon on DeepSeek-style output: hit rate ≈1, ratio CV ≈0.8) → keep using
      it, nothing else happens.
    - Nothing fits (e.g. DS lexicon on Doubao-style Chinese reasoning: hit rate ≈0) →
      `lexicon-mismatch` is logged and the auto-calibration flow below kicks in.
+   - **Polarity inversion** is caught, not ignored: a model whose *anchored* style is "let me"
+     (like Doubao — it writes let-me even during the anchored bootstrap) would score
+     negative-dominant under the DS lexicon, so the probe marks that candidate
+     `polaritySuspect` and refuses it (`reason: polarity-inverted`), even though the markers
+     all hit. Auto-calibration then rebuilds polarity from the bootstrap oracle (step 2/4).
 2. **Sample** — only for mismatched output, the plugin quietly accumulates style samples:
    reasoning text + the session's own baseline percentile (a model-agnostic quality signal —
-   not DS-lexicon scores, so no circular bias).
+   not DS-lexicon scores, so no circular bias). Samples taken during the anchored bootstrap
+   phase are tagged `anchored: true` — the **polarity oracle**.
 3. **Match by style signature** — at session close, the session's own contrast terms
    (high-percentile vs low-percentile n-grams) form its style signature, which is matched
    against every bucket's signature (term-set Jaccard ≥ `bucketMatchThreshold`, default 0.25).
@@ -180,6 +187,13 @@ model tomorrow), so recognition, selection, accumulation and merging are all dri
    instead of poisoning the old one.
 4. **Calibrate** — "how much corpus is enough" is not a fixed number and not "the more the
    better"; it is decided per bucket in three steps:
+   - **Polarity labeling (oracle first)**: when the bucket has ≥10 anchored-bootstrap samples
+     and ≥10 post-lift samples, the contrast is computed as *bootstrap (known-good) vs post-lift
+     (natural output)* — this fixes polarity automatically for models whose anchored style is
+     "let me" (Doubao-style) without inheriting the DS lexicon's polarity. Only without an
+     oracle (unanchored / self sessions) does labeling fall back to session-own percentiles.
+     Verified on synthetic corpora in both directions: let-me-anchored models get let-me
+     positive; we-anchored models get we positive.
    - **Floor** (`minSessions` + `minChars`): enough sessions/tasks that task vocabulary cannot
      dominate the contrast (the known single-session contamination trap).
    - **Adaptive target**: the char target scales with the bucket's own n-gram concentration —
@@ -209,7 +223,7 @@ window fills with too few marker hits (early blocks can be marker-poor text — 
 reasoning), the window auto-widens up to 2 times (3× the base caps, audited as
 `lexicon-probe-extend`) instead of deciding on thin evidence — a one-shot early sample once
 misjudged a DeepSeek session as "unreadable" whose later output was full of markers,
-`bucketMatchThreshold` (0.25), `minSessions` (3), `minChars` (40000), `maxChars` (160000),
+`polarityMinBootstrapBlocks` (3), `bucketMatchThreshold` (0.25), `minSessions` (3), `minChars` (40000), `maxChars` (160000),
 `concentrationScale` (0.5), `minStability` (0.6), `percentileHigh` / `percentileLow` (75/25),
 `minFreq` (5), `top` (60). Progress is audited (`lexicon-names` / `lexicon-fit` /
 `lexicon-mismatch` / `lexicon-probe-extend` / `lexicon-auto-progress` / `lexicon-auto-target` /

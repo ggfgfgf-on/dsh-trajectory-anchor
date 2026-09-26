@@ -75,6 +75,10 @@ const DEFAULTS = {
     probeMinRatioSpread: 0.15,
     // 风格签名匹配阈值：会话签名与桶签名的词条 Jaccard ≥ 该值才并入该桶。
     bucketMatchThreshold: 0.25,
+    // 极性神谕：bootstrap 期（锚定阶段）是该模型的已知良好状态。
+    // 若某候选词典把 bootstrap 期判为负向主导（如豆包的 let-me 锚定风），
+    // 说明该词典对此模型的极性是反的 → 不采用，走自动标定（用 bootstrap 块当正样本）。
+    polarityMinBootstrapBlocks: 3,
     minSessions: 3,
     minChars: 40000,
     maxChars: 160000,
@@ -310,7 +314,7 @@ function sampleStyle(rec, texts) {
   if (rec.lexiconMismatch === false) return
   const joined = texts.join('\n')
   if (joined.length < 40) return
-  rec.styleSamples.push({ text: joined, percentile: rec.percentile })
+  rec.styleSamples.push({ text: joined, percentile: rec.percentile, anchored: !!(rec.anchored && !rec.lifted) })
   if (rec.styleSamples.length > 400) rec.styleSamples.shift()
 }
 
@@ -386,6 +390,22 @@ function probeFits(p, auto) {
 /** 输出说话，名字不说话：候选词典 = 名字提示的 profile（可选）→ 已标定桶 → 默认 DS。
  *  逐个对探测文本做拟合检测，取拟合最好（命中率最高）的那个。
  *  一个都不拟合 → 判 mismatch，攒样本走自动标定。 */
+/** 极性神谕检查：用 bootstrap（锚定阶段）参考块给候选词典验极性。
+ *  锚定阶段是已知良好状态；若某词典把这段输出判为负向主导
+ *  （负标记总分 > 正标记总分），该词典对此模型的极性就是反的。 */
+function bootstrapPolarity(lexicon, texts) {
+  let pos = 0
+  let neg = 0
+  let neu = 0
+  for (const t of texts) {
+    const f = measureText(t, lexicon)
+    pos += f.positive
+    neg += f.negative
+    neu += f.neutral
+  }
+  return { pos: Math.round(pos * 100) / 100, neg: Math.round(neg * 100) / 100, neu: Math.round(neu * 100) / 100, suspect: neg > pos }
+}
+
 function selectLexicon(rec) {
   if (rec.lexiconMismatch !== null) return
   const p = rec.probe
@@ -406,13 +426,26 @@ function selectLexicon(rec) {
     if (b && b.lexicon) candidates.push({ lexicon: b.lexicon, label: 'bucket:' + b.id })
   }
   candidates.push({ lexicon: CONFIG.lexicon, label: 'default' })
+  const minBootstrap = typeof auto.polarityMinBootstrapBlocks === 'number' ? auto.polarityMinBootstrapBlocks : 3
+  const haveBootstrap = rec.anchorPhaseTexts.length >= minBootstrap
   const attempts = []
   let best = null
+  let polarityBlocked = false
   for (const c of candidates) {
     const fit = probeFit(c.lexicon, texts)
-    const row = { label: c.label, hitRate: Math.round(fit.hitRate * 1000) / 1000, signalBlocks: fit.signalBlocks, ratioCV: Math.round(fit.cv * 1000) / 1000 }
+    const pol = haveBootstrap ? bootstrapPolarity(c.lexicon, rec.anchorPhaseTexts) : null
+    const row = {
+      label: c.label,
+      hitRate: Math.round(fit.hitRate * 1000) / 1000,
+      signalBlocks: fit.signalBlocks,
+      ratioCV: Math.round(fit.cv * 1000) / 1000,
+      polaritySuspect: pol ? pol.suspect : null,
+      bootstrap: pol ? { pos: pol.pos, neg: pol.neg } : null,
+    }
     attempts.push(row)
-    if (probeFits(fit, auto) && (!best || fit.hitRate > best.hitRate)) {
+    const fits = probeFits(fit, auto)
+    if (fits && pol && pol.suspect) polarityBlocked = true
+    if (fits && (!pol || !pol.suspect) && (!best || fit.hitRate > best.hitRate)) {
       best = { ...c, ...row }
     }
   }
@@ -428,12 +461,20 @@ function selectLexicon(rec) {
     } else {
       rec.styleSamples = []
     }
-    logAudit(rec, 'lexicon-fit', { ...names, chosen: best.label, hitRate: best.hitRate, signalBlocks: best.signalBlocks, ratioCV: best.ratioCV, attempts, hint: 'chosen lexicon fits this session output' })
+    logAudit(rec, 'lexicon-fit', { ...names, chosen: best.label, hitRate: best.hitRate, signalBlocks: best.signalBlocks, ratioCV: best.ratioCV, attempts, hint: 'chosen lexicon fits this session output and passes the bootstrap polarity check' })
     return
   }
   rec.lexiconMismatch = true
   rec.lexiconSource = 'mismatch'
-  logAudit(rec, 'lexicon-mismatch', { ...names, candidatesTested: candidates.length, attempts, hint: 'no candidate lexicon reads this output; collecting samples for auto-calibration' })
+  logAudit(rec, 'lexicon-mismatch', {
+    ...names,
+    candidatesTested: candidates.length,
+    attempts,
+    reason: polarityBlocked ? 'polarity-inverted' : 'unreadable',
+    hint: polarityBlocked
+      ? 'a candidate read the output but scored the anchored bootstrap phase negative-dominant (inverted polarity); collecting samples for auto-calibration'
+      : 'no candidate lexicon reads this output; collecting samples for auto-calibration',
+  })
 }
 
 // ---------- 输出风格词典：探测选词 + 签名桶自动标定 ----------
@@ -576,19 +617,32 @@ function maybeAutoCalibrate(rec) {
   if (rec.lexiconMismatch !== true) return
   const minFreq = typeof auto.minFreq === 'number' ? auto.minFreq : 5
   const top = typeof auto.top === 'number' ? auto.top : 60
+  // 极性神谕优先：bootstrap（锚定阶段）文本 = 已知良好正样本；
+  // 负样本 = 晋升后的自然输出。对比「锚定→晋升」的风格增量给出正确极性
+  // （let me 反而是锚定风的模型也会得到 let-me 正向词典，不会被 DS 词典的
+  // 极性反转污染）。无神谕（未锚定/自会话）退回百分位标签。
+  const anchoredRef = []
+  const postLift = []
   const high = []
   const low = []
   for (const s of rec.styleSamples) {
-    if (s.percentile >= auto.percentileHigh) high.push(s.text)
-    else if (s.percentile <= auto.percentileLow) low.push(s.text)
+    if (s.anchored) anchoredRef.push(s.text)
+    else {
+      postLift.push(s.text)
+      if (s.percentile >= auto.percentileHigh) high.push(s.text)
+      else if (s.percentile <= auto.percentileLow) low.push(s.text)
+    }
   }
-  if (high.length < 10 || low.length < 10) {
-    logAudit(rec, 'lexicon-auto-pending', { reason: 'insufficient contrast samples', anchored: high.length, drifted: low.length })
+  const useOracle = anchoredRef.length >= 10 && postLift.length >= 10
+  const posSet = useOracle ? anchoredRef : high
+  const negSet = useOracle ? postLift : low
+  if (posSet.length < 10 || negSet.length < 10) {
+    logAudit(rec, 'lexicon-auto-pending', { reason: 'insufficient contrast samples', oracle: useOracle, anchoredRef: anchoredRef.length, postLift: postLift.length, high: high.length, low: low.length })
     return
   }
   let rows
   try {
-    rows = contrastPolarity(high, low, minFreq, top)
+    rows = contrastPolarity(posSet, negSet, minFreq, top)
   } catch (e) {
     logAudit(rec, 'lexicon-auto-error', { error: msg(e) })
     return
@@ -634,17 +688,26 @@ function maybeAutoCalibrate(rec) {
   }
   B.chars += chars
   if (B.samples.length > 1500) B.samples.splice(0, B.samples.length - 1500)
-  // 桶签名随语料刷新：取最近 400 条样本的 contrast 词条
+  // 桶签名随语料刷新：取最近 400 条样本的 contrast 词条（神谕优先）
+  const ba = []
+  const bp = []
   const bh = []
   const bl = []
   for (let i = Math.max(0, B.samples.length - 400); i < B.samples.length; i++) {
     const s = B.samples[i]
-    if (s.percentile >= auto.percentileHigh) bh.push(s.text)
-    else if (s.percentile <= auto.percentileLow) bl.push(s.text)
+    if (s.anchored) ba.push(s.text)
+    else {
+      bp.push(s.text)
+      if (s.percentile >= auto.percentileHigh) bh.push(s.text)
+      else if (s.percentile <= auto.percentileLow) bl.push(s.text)
+    }
   }
-  if (bh.length >= 10 && bl.length >= 10) {
+  const bOracle = ba.length >= 10 && bp.length >= 10
+  const bPos = bOracle ? ba : bh
+  const bNeg = bOracle ? bp : bl
+  if (bPos.length >= 10 && bNeg.length >= 10) {
     try {
-      const rowsB = contrastPolarity(bh, bl, minFreq, top)
+      const rowsB = contrastPolarity(bPos, bNeg, minFreq, top)
       if (rowsB && rowsB.length > 0) B.signature = rowsB.map(r => r.term)
     } catch (e) { /* 签名刷新失败不影响主流程 */ }
   } else {
@@ -685,15 +748,25 @@ function maybeAutoCalibrate(rec) {
     logAudit(rec, 'lexicon-auto-pending', { bucket: B.id, reason: 'corpus not yet stable', jaccard: st.jaccard, weightAgree: st.weightAgree, nextTargetChars: B.targetChars })
     return
   }
+  // 终版词典：全桶语料 contrast（神谕优先，bootstrap=正、晋升后=负）
+  const fA = []
+  const fP = []
   const anchored = []
   const drifted = []
   for (const s of B.samples) {
-    if (s.percentile >= auto.percentileHigh) anchored.push(s.text)
-    else if (s.percentile <= auto.percentileLow) drifted.push(s.text)
+    if (s.anchored) fA.push(s.text)
+    else {
+      fP.push(s.text)
+      if (s.percentile >= auto.percentileHigh) anchored.push(s.text)
+      else if (s.percentile <= auto.percentileLow) drifted.push(s.text)
+    }
   }
+  const finalOracle = fA.length >= 10 && fP.length >= 10
+  const finalPos = finalOracle ? fA : anchored
+  const finalNeg = finalOracle ? fP : drifted
   let rowsFull
   try {
-    rowsFull = contrastPolarity(anchored, drifted, minFreq, top)
+    rowsFull = contrastPolarity(finalPos, finalNeg, minFreq, top)
   } catch (e) {
     logAudit(rec, 'lexicon-auto-error', { bucket: B.id, error: msg(e) })
     return
@@ -710,6 +783,7 @@ function maybeAutoCalibrate(rec) {
   logAudit(rec, 'lexicon-calibrated', {
     bucket: B.id,
     names: B.names,
+    oracle: finalOracle,
     sessions: B.sessions,
     chars: B.chars,
     targetChars: B.targetChars,
@@ -794,6 +868,14 @@ function updateWindow(rec, texts, agent) {
     flags = flagsOf(texts, rec.lexicon)
     rec.lastMessages.push({ flags })
     while (rec.lastMessages.length > CONFIG.trajectoryWindowSize) rec.lastMessages.shift()
+  }
+  // bootstrap 期（锚定阶段）参考块：该模型的已知良好状态，用作极性神谕
+  if (rec.anchored && !rec.lifted && texts.length > 0) {
+    const joined = texts.join('\n')
+    if (joined.length >= 40) {
+      rec.anchorPhaseTexts.push(joined)
+      if (rec.anchorPhaseTexts.length > 20) rec.anchorPhaseTexts.shift()
+    }
   }
   recompute(rec, agent)
   probeFeed(rec, texts, flags)
@@ -1244,6 +1326,7 @@ function adopt(agent, doAnchor, channel) {
     lexiconMismatch: null,
     probe: newProbe(),
     styleSamples: [],
+    anchorPhaseTexts: [],
     contextSuppressed: false,
     contextSuppressedAt: null,
     contextSuppressError: null,
