@@ -150,8 +150,14 @@ node tools\export-layer4.mjs `
 - **Clean**: closed agents only; main-session traces (`anchor-session-*` / `summary.self`)
   excluded; lifecycle marker lines dropped; grouped per session
 - **Schema**: `{sessionId, model, turn, step, kind, messages, response, toolName, toolResult,
+  execution{id, trajectory_occurrences, session_occurrences, cross_plane, ambiguous},
   reward{lexicon, sessionScore, scoreNorm, planner}, trajectory_features{…}, textComplete}` —
   compatible with PRM (per-step process reward) and DPO/RLVR (pairwise sampling per sessionId)
+- **Execution guard**: every sample carries an execution id (`<sessionId>#<turn>:<step>`) plus a
+  cross-plane uniqueness check — when the session plane contains the same `(turn, step)` more than
+  once (retry / torn append), the join is marked `ambiguous` and refuses to attach text instead of
+  silently pairing two different executions. `stats.json` reports `execution_stats` (verified /
+  ambiguous / one-sided) per export run.
 - **Normalize**: min-max normalization of session rewards (`scoreNorm`), positive/negative
   lexicon-polarity counts, band/liftReason/machineState buckets
 - Output: `dataset.jsonl` + `stats.json` (inclusion/exclusion list, text coverage, model

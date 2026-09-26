@@ -160,13 +160,23 @@ function indexSessionLog(sessionId) {
         if (b?.type === 'reasoning' || b?.type === 'text') texts.push(b.text ?? '')
       }
       const t = texts.join('\n').trim()
-      if (t) idx.assistantByKey.set(`${turn}:${step}`, t)
-      if (t) idx.history.push({ role: 'assistant', text: cap(t, capText) })
+      if (t) {
+        const key = `${turn}:${step}`
+        const cur = idx.assistantByKey.get(key)
+        if (cur) cur.count++
+        else idx.assistantByKey.set(key, { text: t, count: 1 })
+        idx.history.push({ role: 'assistant', text: cap(t, capText) })
+      }
     }
     if (o.type === 'tool/result') {
       const turn = o.data?.turn, step = o.data?.step
       const t = textOf(o.data?.message?.content?.[0]?.content ?? o.data?.message?.content)
-      if (t) idx.toolResultByKey.set(`${turn}:${step}`, t)
+      if (t) {
+        const key = `${turn}:${step}`
+        const cur = idx.toolResultByKey.get(key)
+        if (cur) cur.count++
+        else idx.toolResultByKey.set(key, { text: t, count: 1 })
+      }
     }
     if (o.type === 'request/header' && o.data) {
       const m = o.data.model ?? o.data.provider ?? null
@@ -206,7 +216,14 @@ function main() {
     const sessIdx = noText ? null : indexSessionLog(sessionId)
     const model = sessIdx?.descriptor?.agentModel ?? sessIdx?.requestModels?.[0] ?? null
 
-    // 时间序 step 组装
+    // 时间序 step 组装（先数跨面 key 出现次数，防「同一执行键两次出现」导致的静默错配）
+    const trajCounts = new Map()
+    for (const ev of events) {
+      if (ev.kind === 'assistant-message' || ev.kind === 'tool-call') {
+        const k = `${ev.turn}:${ev.step}`
+        trajCounts.set(k, (trajCounts.get(k) ?? 0) + 1)
+      }
+    }
     let lastScore = null
     for (const ev of events) {
       if (ev.kind === 'score') { lastScore = ev; continue }
@@ -245,13 +262,31 @@ function main() {
         },
         textComplete: false,
       }
-      if (ev.kind === 'assistant-message') {
-        const t = sessIdx?.assistantByKey.get(key)
-        if (t) { sample.response = cap(t, capText); sample.textComplete = true }
-      } else {
-        sample.toolName = ev.name ?? null
-        const r = sessIdx?.toolResultByKey.get(key)
-        if (r) { sample.toolResult = cap(r, capText); sample.textComplete = true }
+      // 执行标识与跨面唯一性校验：会话侧同一 (turn,step) 出现多次 = 无法确认出自同一次执行，
+      // 拒绝静默配对（不附文本），样本仍保留并标记。轨迹侧同 key 多行 = 同一消息的多个块（合法），
+      // 仅作信息性计数，不判歧义。
+      const tCount = trajCounts.get(key) ?? 0
+      const sCount = ev.kind === 'assistant-message'
+        ? (sessIdx?.assistantByKey.get(key)?.count ?? 0)
+        : (sessIdx?.toolResultByKey.get(key)?.count ?? 0)
+      const ambiguous = sCount > 1
+      sample.execution = {
+        id: `${sessionId}#${ev.turn}:${ev.step}`,
+        kind: ev.kind,
+        trajectory_occurrences: tCount,
+        session_occurrences: sCount,
+        cross_plane: tCount > 0 && sCount > 0,
+        ambiguous,
+      }
+      if (!ambiguous) {
+        if (ev.kind === 'assistant-message') {
+          const e = sessIdx?.assistantByKey.get(key)
+          if (e?.text) { sample.response = cap(e.text, capText); sample.textComplete = true }
+        } else {
+          sample.toolName = ev.name ?? null
+          const e = sessIdx?.toolResultByKey.get(key)
+          if (e?.text) { sample.toolResult = cap(e.text, capText); sample.textComplete = true }
+        }
       }
       samples.push(sample)
     }
@@ -288,6 +323,9 @@ function main() {
     else neuCount++
   }
   const textSteps = samples.filter((s) => s.textComplete).length
+  const ambiguousSteps = samples.filter((s) => s.execution?.ambiguous).length
+  const oneSided = samples.filter((s) => s.execution && !s.execution.ambiguous && !s.execution.cross_plane).length
+  const crossVerified = samples.length - ambiguousSteps - oneSided
   const stats = {
     generated_utc: new Date().toISOString(),
     logs_dir: logsDir,
@@ -300,6 +338,7 @@ function main() {
       'tool-call': samples.filter((s) => s.kind === 'tool-call').length,
     },
     text_coverage: totalSamplesPct(samples, textSteps),
+    execution_stats: { cross_plane_verified: crossVerified, ambiguous: ambiguousSteps, one_sided: oneSided },
     lexicon_polarity: { pos_dominant: posCount, neg_dominant: negCount, neutral: neuCount },
     session_reward: { n: sessionScores.length, min: sMin, max: sMax, mean: Number(mean.toFixed(3)), std: Number(std.toFixed(3)) },
     band_buckets: buckets('band'),
