@@ -259,6 +259,15 @@ function reasoningBlocks(event) {
   }
 }
 
+/** 词条 → 匹配正则：纯 ASCII 词条用 \b 词边界（英文词语义）；
+ *  含非 ASCII 的词条（中文/假名/谚文等）\b 永不成立（CJK 字符非 \w），
+ *  必须按字面子串匹配——否则标定出的中文词条在运行时永远命中不了。 */
+function termRegex(term, flags) {
+  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+')
+  const asciiOnly = /^[\x20-\x7e]+$/.test(term)
+  return new RegExp(asciiOnly ? '\\b' + escaped + '\\b' : escaped, flags)
+}
+
 function measureText(text, lexicon) {
   if (!lexicon) lexicon = CONFIG.lexicon
   const normalized = text.replace(/[\u2018\u2019]/g, "'")
@@ -269,24 +278,21 @@ function measureText(text, lexicon) {
   let positiveWords = 0
   let negativeWords = 0
   for (const term of Object.keys(lexicon.positive || {})) {
-    const m = lower.match(new RegExp('\\b' + term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+') + '\\b', 'g'))
-    const n = m ? m.length : 0
+    const n = (lower.match(termRegex(term, 'g')) || []).length
     if (n > 0) {
       positive += n * lexicon.positive[term]
       positiveWords += n
     }
   }
   for (const term of Object.keys(lexicon.negative || {})) {
-    const m = lower.match(new RegExp('\\b' + term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+') + '\\b', 'g'))
-    const n = m ? m.length : 0
+    const n = (lower.match(termRegex(term, 'g')) || []).length
     if (n > 0) {
       negative += n * lexicon.negative[term]
       negativeWords += n
     }
   }
   for (const term of Object.keys(lexicon.neutral || {})) {
-    const m = lower.match(new RegExp('\\b' + term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+') + '\\b', 'g'))
-    const n = m ? m.length : 0
+    const n = (lower.match(termRegex(term, 'g')) || []).length
     if (n > 0) neutral += n * lexicon.neutral[term]
   }
   // 极性语义与具体词无关：正/负命中由当前词典的标记词决定，
