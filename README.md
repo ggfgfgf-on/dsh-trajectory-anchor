@@ -288,6 +288,32 @@ node tools\calibrate-lexicon.mjs `
   surfaces mostly task vocabulary; style markers (e.g. ark's 终验/终验证 abbreviation, ~197x
   over the DS corpus) appear once enough reasoning text accumulates.
 
+**Score-supervised calibration** (advanced users, connects to Layer 4) —
+`tools/calibrate-from-scores.mjs` uses real benchmark scores as supervision, closing the loop
+"run Project2-like tasks → scores label sessions → lexicon + scorer":
+
+```powershell
+node tools\calibrate-from-scores.mjs `
+  --results D:\DSHwork\modeltest\evaluator\results `   # each run's score_draft.json
+  --sessions C:\Users\chesand\.dsh\sessions `          # candidate session logs
+  --model ark-code-latest --run-group ark_dsh_trajectory_anchor `
+  --high 95 --low 90 --out .\lexicon-score
+```
+
+- High-score sessions (≥`--high`) form the anchored corpus, low-score (≤`--low`) the drifted
+  corpus; contrast polarity is decided by the scores themselves — no human review.
+- The same data grid-fits `ratioWeights` (the scorer) to maximize block-ratio separation
+  between high- and low-score corpora; both are reported and patch-ready.
+- Sessions match runs by model + time window with greedy one-to-one assignment
+  (`--run-group` narrows the run set; per-run evidence is in the report).
+- Layer-4 connection: those sessions' `export-layer4` samples now carry true quality labels.
+- Measured honest boundaries: benchmark scores are session-level (all blocks share one
+  label — coarse); a single task's vocabulary competes with style markers (the first real run
+  produced task-word-heavy candidates — the report's evidence table shows exactly why); if
+  either corpus side drops below 10 blocks the tool refuses to calibrate instead of
+  fabricating a lexicon. Accumulate runs across several different tasks for a clean style
+  layer.
+
 ## Layer-4 training-data export
 
 `tools/export-layer4.mjs` joins the trajectory JSONLs (event stream + process reward) with the
