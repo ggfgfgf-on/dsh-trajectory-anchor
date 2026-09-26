@@ -688,28 +688,27 @@ function closeRec(rec, reason) {
 }
 
 /** True when the session already contains real work (assistant messages or
- * tool calls) AND that work predates the adoption moment. Fresh sessions at
- * agent/created carry only ~5 seed events; resumed sessions (restart, fork
- * children) carry history — anchoring those would re-bootstrap a mid-flight
- * session, so they are adopted audit-only.
- * 竞态豁免：agent/created 派发常晚于子代理的首个工作事件——若首个工作事件
- * 刚刚发生（<60s），这是全新会话的起步竞态而不是恢复会话，允许锚定。 */
+ * tool calls) that predates this process — i.e. a resumed/forked session.
+ * Fresh sessions at agent/created carry only ~5 seed events; resumed sessions
+ * (restart, fork children) carry history — anchoring those would re-bootstrap
+ * a mid-flight session, so they are adopted audit-only.
+ * 权威判据 = session.firstLiveSeq：本进程构造时种子之外第一个 live 事件的 seq
+ * ——新鲜会话构造种子只有 ~5 个 seed 事件（firstLiveSeq ≤ 8），恢复/分叉会话
+ * 的构造种子是整份存储日志（firstLiveSeq 很大）。该值是构造时刻固化的「本进程
+ * 事实」，不随事件派发时序变化，天然免疫 agent/created 晚到竞态（旧 60 秒
+ * 时间启发式有慢派发漏判/恢复会话误判两个边界，已废弃）。 */
 function sessionHasWork(agent) {
   try {
-    const events = agent && agent.session ? agent.session.events : undefined
-    if (!events) return false
+    const session = agent && agent.session
+    if (!session) return false
+    if (typeof session.firstLiveSeq === 'number' && session.firstLiveSeq <= 8) return false
+    const events = session.events
+    if (!events) return true
     const list = Array.isArray(events) ? events : Array.from(events)
-    let work = 0
-    let firstWorkTime = null
     for (const ev of list) {
-      if (ev && (ev.type === 'assistant/message' || ev.type === 'tool/call')) {
-        work++
-        if (firstWorkTime === null && typeof ev.time === 'number') firstWorkTime = ev.time
-      }
+      if (ev && (ev.type === 'assistant/message' || ev.type === 'tool/call')) return true
     }
-    if (work === 0) return false
-    if (firstWorkTime !== null && Date.now() - firstWorkTime < 60000) return false
-    return true
+    return false
   } catch (e) {
     return false
   }
