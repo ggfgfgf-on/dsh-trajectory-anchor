@@ -84,6 +84,9 @@ function scanSessions(sessionsDir, modelFilter) {
     let provider = ''
     const texts = []
     let matched = !modelFilter
+    // 防混料：编排/父会话会调用 subagent 工具；候选会话的提示词禁止这些工具。
+    // 长于 4 小时的会话（用户日常聊天等）也不是候选会话。
+    let usedSubagentTool = false
     for (const line of text.split('\n')) {
       if (!line.trim()) continue
       let o
@@ -99,10 +102,15 @@ function scanSessions(sessionsDir, modelFilter) {
         if (p) provider = p
         if (modelFilter && (m === modelFilter || p === modelFilter)) matched = true
       }
+      if (o.type === 'tool/call' && o.data && typeof o.data.name === 'string') {
+        if (/^(subagent|subagent_fork|workflow|ralph|send_message|interrupt_agent|list_agents)$/.test(o.data.name)) usedSubagentTool = true
+      }
       const t = textFromRecord(o)
       if (t && t.length >= 40) texts.push(t)
     }
     if (!matched || texts.length === 0 || endMs === 0) continue
+    if (usedSubagentTool) continue
+    if (endMs - startMs > 4 * 3600 * 1000) continue
     sessions.push({ sid: basename(join(f, '..')), startMs, endMs, model, provider, texts })
   }
   return sessions
@@ -188,7 +196,9 @@ if (!labelsPath && (!resultsDir || !sessionsDir)) {
   process.exit(1)
 }
 const modelFilter = arg('--model', '')
-const runGroupFilter = arg('--run-group', '')
+// --run-group 可给逗号分隔的多个组（同模型同基准的多个轮次组一起用）
+const runGroupFilter = process.argv.filter((a, i) => i > 0 && process.argv[i - 1] === '--run-group').join(',')
+const runGroupSet = runGroupFilter ? new Set(runGroupFilter.split(',').map((s) => s.trim()).filter(Boolean)) : null
 const highScore = Number(arg('--high', '95'))
 const lowScore = Number(arg('--low', '90'))
 const minFreq = Number(arg('--min-freq', '5'))
@@ -227,16 +237,16 @@ if (labelsPath) {
     try { texts = collectCorpus(e.path) } catch (err) { console.warn(`[scores] 语料读取失败 ${e.path}: ${err.message}`) }
     const cls = e.label === 'negative' ? 'negative' : e.score >= highScore ? 'positive' : e.score <= lowScore ? 'negative' : 'ignored'
     const chars = texts.reduce((n, s) => n + s.length, 0)
-    if (cls === 'positive') posTexts.push(...texts)
-    else if (cls === 'negative') negTexts.push(...texts)
+    if (cls === 'positive') for (const t of texts) posTexts.push(t)
+    else if (cls === 'negative') for (const t of texts) negTexts.push(t)
     evidence.push({ corpus: basename(e.path), path: e.path, score: e.score, texts: texts.length, chars, cls })
   }
   console.log(`[scores] 标签条目: ${entries.length}`)
 } else {
   let runs = scanRuns(resultsDir)
-  if (runGroupFilter) {
+  if (runGroupSet) {
     const before = runs.length
-    runs = runs.filter((r) => r.runGroup === runGroupFilter)
+    runs = runs.filter((r) => runGroupSet.has(r.runGroup))
     console.log(`[scores] run-group 过滤: ${before} -> ${runs.length} (${runGroupFilter})`)
   }
   console.log(`[scores] 评测轮: ${runs.length}`)
@@ -257,8 +267,8 @@ if (labelsPath) {
       gapMin: Math.round(gapMs / 60000 * 10) / 10,
       cls,
     }
-    if (cls === 'positive') posTexts.push(...session.texts)
-    else if (cls === 'negative') negTexts.push(...session.texts)
+    if (cls === 'positive') for (const t of session.texts) posTexts.push(t)
+    else if (cls === 'negative') for (const t of session.texts) negTexts.push(t)
     evidence.push(rec)
   }
 }

@@ -318,7 +318,17 @@ node tools\calibrate-from-scores.mjs `
 - The same data grid-fits `ratioWeights` (the scorer) to maximize block-ratio separation
   between high- and low-score corpora; both are reported and patch-ready.
 - Sessions match runs by model + time window with greedy one-to-one assignment
-  (`--run-group` narrows the run set; per-run evidence is in the report).
+  (`--run-group` narrows the run set, comma-separated for several groups; per-run evidence is
+  in the report).
+- **Anti-mixing guards** (measured on real data — a 47M-char orchestration session once
+  polluted a corpus because it shared the model name): sessions that called
+  `subagent`/`workflow`/`ralph`/`send_message` tools (orchestrator/parent sessions) and
+  sessions longer than 4 hours (everyday chats) are excluded; `--model` filters by the
+  session's own request/header labels. Check the evidence table after every run — every row
+  must show the intended model and a sensible text-block count.
+- **One session per eval round** is required for clean labels: a single session that spans
+  several eval rounds (first pass + repairs in one session) carries several scores and cannot
+  be labeled; the evidence table exposes such rows (same session against different runs).
 - Layer-4 connection: those sessions' `export-layer4` samples now carry true quality labels.
 - Measured honest boundaries: benchmark scores are session-level (all blocks share one
   label — coarse); a single task's vocabulary competes with style markers (the first real run
