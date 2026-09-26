@@ -80,6 +80,23 @@ agent/disposed: RewardAnnotator process reward + trajectory JSONL final archive
 | `leanDenyPatterns` | 61 entries | drift-rollback deny set (`*` prefix wildcards) |
 | `rewardAnnotator` | `default` | Layer-4 process reward; pluggable extension point |
 
+## Ablation guidance (calibration vs core)
+
+For evaluators running ablations, these knobs are **calibration choices**, not core
+behavior — documented defaults are intentional:
+
+| Knob | Default | Role |
+|---|---|---|
+| `specMax` / `reactMin` | `0.2` / `0.5` | persona_ratio band boundaries (calibration) |
+| `baselineMinSamples` | `10` | minimum session-history window before baseline scoring engages |
+| `rollbackPercentile` | `25` | drift-rollback trigger: current ratio's percentile within the session's own history |
+| `lexicon` / `ratioWeights` | monitor-calibrated | weighted lexicon scoring table |
+
+Core behavior (anchoring, gating, context suppression, per-step trajectory export) does not
+depend on these values; the absolute-vs-baseline-relative drift decision is itself a core
+behavior that replaced an earlier absolute-band design (which misfired on models whose
+natural baseline style is let-me).
+
 ## Calibration findings (measured, important)
 
 1. **The anchoring effect holds on this deployment's model (deepseek-v4-flash)**: with only pwsh
@@ -99,6 +116,10 @@ agent/disposed: RewardAnnotator process reward + trajectory JSONL final archive
 5. Perception channels: `internal/dispatch` (unfiltered, fires before every dispatch) plus direct
    waterfalls (`agent/request` / `agent/pre-step` registered with `prepend: true`). Host-plane rows
    are reachable — verified live.
+6. **Anchor issuer principle**: anchors and scores are only meaningful when issued by a party
+   outside the measured subject. Here the lexicon scores, band/percentile state, and process
+   reward are all computed by the host-side audit plane (this plugin); the agent only produces
+   artifacts. Anchor credibility comes from the issuer, not the anchor count.
 
 ## Community reference mapping
 
