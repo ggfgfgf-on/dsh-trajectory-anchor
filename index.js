@@ -317,7 +317,7 @@ function sampleStyle(rec, texts) {
 // ---------- 开头适配探测：哪个候选词典读得懂这段输出？ ----------
 
 function newProbe() {
-  return { blocks: 0, chars: 0, texts: [] }
+  return { blocks: 0, chars: 0, texts: [], extended: 0 }
 }
 
 /** 探测只吃「自然风格」：锚定会话在 lift 之后才开始，因为 bootstrap 期
@@ -329,15 +329,28 @@ function probeFeed(rec, texts, flags) {
   if (rec.anchored && !rec.lifted) return
   if (!Array.isArray(flags) || flags.length === 0) return
   const p = rec.probe
-  const maxBlocks = typeof auto.probeMaxBlocks === 'number' ? auto.probeMaxBlocks : 8
-  const minChars = typeof auto.probeMinChars === 'number' ? auto.probeMinChars : 2500
+  const baseBlocks = typeof auto.probeMaxBlocks === 'number' ? auto.probeMaxBlocks : 8
+  const baseChars = typeof auto.probeMinChars === 'number' ? auto.probeMinChars : 2500
+  const maxBlocks = baseBlocks * (1 + (p.extended || 0))
+  const minChars = baseChars * (1 + (p.extended || 0))
   for (let i = 0; i < flags.length; i++) {
     if (p.blocks >= maxBlocks || p.chars >= minChars) break
     p.blocks += 1
     p.chars += (texts[i] || '').length
     p.texts.push(texts[i] || '')
   }
-  if (p.blocks >= maxBlocks || p.chars >= minChars) selectLexicon(rec)
+  if (p.blocks >= maxBlocks || p.chars >= minChars) {
+    // 窗口满但标记信号还太少：开头几块可能恰好是标记稀疏的文本（中文为主等），
+    // 一锤定音会误判。证据不足就扩窗继续采样（最多 2 次扩窗）。
+    const signal0 = probeFit(rec.lexicon, p.texts).signalBlocks
+    const minSignal = typeof auto.probeMinSignalBlocks === 'number' ? auto.probeMinSignalBlocks : 3
+    if (signal0 < minSignal && (p.extended || 0) < 2) {
+      p.extended = (p.extended || 0) + 1
+      logAudit(rec, 'lexicon-probe-extend', { blocks: p.blocks, chars: p.chars, signalBlocks: signal0, extended: p.extended, hint: 'marker signal too thin to decide; widening the probe window' })
+      return
+    }
+    selectLexicon(rec)
+  }
 }
 
 /** 单个词典对一段输出的拟合指标：标记命中率（词条出现得多不多）

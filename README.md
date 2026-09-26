@@ -204,13 +204,18 @@ concentration). Defaults: 3 sessions / 40k chars floor, 160k cap, scale 0.5, sta
 
 Auto-calibration knobs (all under `lexiconAuto`, patchable in cordis.patch.yml): `enabled`
 (default `true`), fit probe (`probeMaxBlocks` 8 / `probeMinChars` 2500 / `probeMinBlocks` 4 /
-`probeMinHitRate` 0.25 / `probeMinSignalBlocks` 3 / `probeMinRatioSpread` 0.15),
+`probeMinHitRate` 0.25 / `probeMinSignalBlocks` 3 / `probeMinRatioSpread` 0.15). When the probe
+window fills with too few marker hits (early blocks can be marker-poor text — e.g. Chinese-heavy
+reasoning), the window auto-widens up to 2 times (3× the base caps, audited as
+`lexicon-probe-extend`) instead of deciding on thin evidence — a one-shot early sample once
+misjudged a DeepSeek session as "unreadable" whose later output was full of markers,
 `bucketMatchThreshold` (0.25), `minSessions` (3), `minChars` (40000), `maxChars` (160000),
 `concentrationScale` (0.5), `minStability` (0.6), `percentileHigh` / `percentileLow` (75/25),
 `minFreq` (5), `top` (60). Progress is audited (`lexicon-names` / `lexicon-fit` /
-`lexicon-mismatch` / `lexicon-auto-progress` / `lexicon-auto-target` / `lexicon-auto-pending` /
-`lexicon-calibrated` events) and visible in the `anchor_status` tool's `lexicon` block
-(style buckets with names, calibration state, target chars, concentration, last split-half
+`lexicon-mismatch` / `lexicon-probe-extend` / `lexicon-auto-progress` / `lexicon-auto-target` /
+`lexicon-auto-pending` / `lexicon-calibrated` events) and visible in the `anchor_status` tool's
+`lexicon` block (style buckets with names, calibration state, target chars, concentration, last
+split-half
 stability).
 
 **Pre-seed a known dictionary** (optional, name-hinted) via `lexiconProfiles` in the patch —
