@@ -73,6 +73,10 @@ const DEFAULTS = {
   mineCounterfactualCandidates: true,
   exportTrajectoryLogs: true,
   logDir: '.dsh-trajectory-logs',
+  // 分块落盘：达到条数阈值或字节预算即把当前缓冲写成不可变块文件
+  // anchor-<id>.jsonl.<n>。没有任何事件被裁剪——400 是缓冲阈值而非数据丢失上限。
+  auditChunkEvents: 400,
+  auditChunkBytes: 262144,
   rewardAnnotator: 'default',
 }
 
@@ -129,17 +133,6 @@ function bump(channel) {
   channelStats[channel] = (channelStats[channel] || 0) + 1
 }
 
-/** Lifecycle kinds never trimmed by the audit cap: long runs (Project2 =
- * 150+ tool calls) otherwise lose the adopted/anchored/gate/lift evidence
- * that proves WHICH condition a run executed under. */
-const LIFECYCLE_KINDS = new Set([
-  'adopted', 'anchored', 'anchor-failed', 'anchor-skipped', 'context-suppressed',
-  'context-suppress-failed', 'context-restored', 'gate-armed', 'lift', 'lift-error',
-  'maxTokens-rewrite', 'maxTokens-strip', 'skill-catalog-suppressed',
-  'rollback', 'rollback-disabled', 'rollback-skipped', 'rollback-failed',
-  'state', 'counterfactual', 'reward', 'reward-error', 'closed',
-])
-
 function logAudit(rec, kind, fields) {
   try {
     const entry = { t: Date.now(), kind }
@@ -147,21 +140,52 @@ function logAudit(rec, kind, fields) {
       for (const k in fields) entry[k] = fields[k]
     }
     rec.events.push(entry)
-    if (LIFECYCLE_KINDS.has(kind)) {
-      rec.lifecycle.push(entry)
-      if (rec.lifecycle.length > 200) rec.lifecycle.splice(0, rec.lifecycle.length - 200)
+    rec.auditBytes = (rec.auditBytes || 0) + estimateEntryBytes(entry)
+    // 缓冲达到阈值 → 整块落盘（块文件只写一次，永不裁剪；生命周期事件随块
+    // 按时间序保留，不再需要单独的防裁剪数组）
+    if (rec.events.length >= CONFIG.auditChunkEvents || rec.auditBytes >= CONFIG.auditChunkBytes) {
+      drainAuditChunk(rec)
     }
-    if (rec.events.length > 400) rec.events.splice(0, rec.events.length - 400)
     flushRec(rec)
   } catch (e) {
     // audit must never break a hot path
   }
 }
 
+/** 事件字节估算：JSON 序列化长度的廉价近似（关键字段长度求和 + 结构开销）。 */
+function estimateEntryBytes(entry) {
+  let n = 48
+  for (const k in entry) {
+    const v = entry[k]
+    if (typeof v === 'string') n += v.length
+    else if (typeof v === 'number') n += 16
+  }
+  return n
+}
+
+/** 把当前缓冲写成不可变块文件 anchor-<id>.jsonl.<idx>，然后清空缓冲。
+ *  块文件按序号单调追加，永不重写——长任务的事件流因此零丢失。 */
+function drainAuditChunk(rec) {
+  if (rec.events.length === 0) return
+  if (!CONFIG.exportTrajectoryLogs || !fsSvc) { rec.events = []; rec.auditBytes = 0; return }
+  let dir = CONFIG.logDir
+  if (typeof baseDir === 'string' && baseDir.length > 0) dir = baseDir + '/' + CONFIG.logDir
+  const idx = rec.chunkIdx = (rec.chunkIdx || 0) + 1
+  const file = dir + '/anchor-' + rec.sessionId + '.jsonl.' + idx
+  const text = rec.events.map(e => JSON.stringify(e)).join('\n') + '\n'
+  rec.events = []
+  rec.auditBytes = 0
+  const write = () => Promise.resolve()
+    .then(() => fsSvc.resolve(file, typeof baseDir === 'string' ? { cwd: baseDir } : undefined))
+    .then(target => fsSvc.writeText(target, text))
+    .catch(error => { rec.fileError = msg(error) })
+  rec.flushChain = (rec.flushChain || Promise.resolve()).then(write, write)
+}
+
 function flushRec(rec) {
   if (!CONFIG.exportTrajectoryLogs || !fsSvc) return Promise.resolve()
-  // Lifecycle events (never-trimmed) precede the capped rolling tail.
-  const events = rec.lifecycle ? [...rec.lifecycle, ...rec.events] : rec.events.slice()
+  // 主文件只持有当前未满块的缓冲 + 终态 record（每次 flush 重算新鲜摘要）；历史在块文件里。
+  const events = rec.events.slice()
   if (rec.lifted || rec.closed) events.push({ t: Date.now(), kind: 'record', summary: summaryOf(rec) })
   let dir = CONFIG.logDir
   if (typeof baseDir === 'string' && baseDir.length > 0) dir = baseDir + '/' + CONFIG.logDir

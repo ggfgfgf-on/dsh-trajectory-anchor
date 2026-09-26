@@ -167,6 +167,9 @@ node tools\export-layer4.mjs `
 ## Verification
 
 - Per-agent trajectory audit: `<workspaceRoot>/.dsh-trajectory-logs/anchor-<agentId>.jsonl`
+  plus append-only chunk files `anchor-<agentId>.jsonl.<n>` (the buffer drains to an
+  immutable chunk when it crosses the event-count or byte-budget threshold —
+  `auditChunkEvents` / `auditChunkBytes` — so long runs lose no events)
 - Live state: the `anchor_status` tool (globally registered, read-only)
 - Event-sequence assertion: `adopted → anchored → context-suppressed → maxTokens-rewrite →
   gate-armed → lift(anchor-gate:minimal-like | max-steps) → context-restored →

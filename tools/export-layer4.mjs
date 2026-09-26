@@ -223,15 +223,24 @@ function main() {
   const samples = []
 
   for (const file of files) {
-    const path = join(logsDir, file)
-    const lines = readFileSync(path, 'utf8').split('\n').filter((l) => l.trim())
+    // 块文件（插件分块落盘的 append-only 历史）按序号排在主文件之前，
+    // 保证事件按时间序读取；主文件持有当前尾块与终态 record。
+    const chunkFiles = readdirSync(logsDir)
+      .filter((f) => f.startsWith(`${file}.`) && f.endsWith('.jsonl'))
+      .sort((a, b) => Number(a.slice(a.lastIndexOf('.') + 1)) - Number(b.slice(b.lastIndexOf('.') + 1)))
+    const paths = [...chunkFiles.map((f) => join(logsDir, f)), join(logsDir, file)]
     const events = []
     let record = null
-    for (const l of lines) {
-      let o
-      try { o = JSON.parse(l) } catch { continue }
-      if (o.kind === 'record') record = o.summary
-      else events.push(o)
+    for (const p of paths) {
+      let text
+      try { text = readFileSync(p, 'utf8') } catch { continue }
+      for (const l of text.split('\n')) {
+        if (!l.trim()) continue
+        let o
+        try { o = JSON.parse(l) } catch { continue }
+        if (o.kind === 'record') record = o.summary
+        else events.push(o)
+      }
     }
     const selfByName = file.startsWith('anchor-session-')
     const self = selfByName || (record?.self === true)
@@ -351,8 +360,7 @@ function main() {
     }
 
     // 补发 session-only 样本：会话日志里有、轨迹面没有的步骤
-    //（典型：门控引导轮 turn-1——插件审计环形缓冲 400 事件上限会在长任务 flush 前
-    //  逐出最旧的普通事件，turn-1 tool-call 因而缺失；生命周期标记有防裁剪保护）。
+    //（典型：门控引导轮 turn-1，或插件晚收养窗口——晚收养前的会话步骤无轨迹面记录）。
     // 这些样本 cross_plane=false、execution.source='session-only'，文本完整可用。
     if (sessIdx) {
       const sessionOnly = new Map() // key -> { kind, data }
