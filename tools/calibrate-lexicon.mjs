@@ -311,12 +311,19 @@ function main() {
   if (!corpusPath) { console.error('需要 --corpus（目标模型推理文本目录或文件）'); process.exit(1) }
   const name = arg('--name', basename(corpusPath).replace(/\.[^.]+$/, '') || 'model')
   const outPrefix = resolve(arg('--out', `./lexicon-${name}`))
-  const trajDir = arg('--trajectory-logs', '') ? resolve(arg('--trajectory-logs', '')) : null
+  // B（自动标注）默认优先：显式 --trajectory-logs，或自动探测常见轨迹目录；
+  // 探测不到或样本不足时才退回 A（候选+待审）。
+  let trajDir = arg('--trajectory-logs', '') ? resolve(arg('--trajectory-logs', '')) : null
+  if (!trajDir) {
+    const probes = [process.env.DSH_TRAJECTORY_LOGS, join(process.cwd(), '.dsh-trajectory-logs')].filter(Boolean)
+    for (const p of probes) { try { if (statSync(p).isDirectory()) { trajDir = resolve(p); break } } catch { /* continue */ } }
+  }
   if (trajDir) {
     const pHigh = Number(arg('--percentile-high', '75'))
     const pLow = Number(arg('--percentile-low', '25'))
     const r = autoLabeledLexicon(corpusPath, trajDir, name, outPrefix, Number(arg('--min-freq', '20')), Number(arg('--top', '60')), pHigh, pLow)
-    process.exit(r ? 0 : 1)
+    if (r) process.exit(0)
+    console.error('[calibrate] 自动标注（B）不可用，退回候选模式（A）……')
   }
   const refPath = arg('--reference-corpus', '') ? resolve(arg('--reference-corpus', '')) : null
   const minFreq = Number(arg('--min-freq', '20'))
