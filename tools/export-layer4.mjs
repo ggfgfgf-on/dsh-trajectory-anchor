@@ -163,7 +163,10 @@ function indexSessionLog(sessionId) {
       if (t) {
         const key = `${turn}:${step}`
         const cur = idx.assistantByKey.get(key)
-        if (cur) cur.count++
+        // DSH 会话日志会把一条消息拆成多个 assistant/message 片段落盘
+        //（第 1 片 reasoning+tool-call、第 2 片 tool-result …），同 key 多记录是正常形态，
+        // 必须合并而不是当作歧义。
+        if (cur) { cur.count++; if (t) cur.text = cur.text ? cur.text + '\n' + t : t }
         else idx.assistantByKey.set(key, { text: t, count: 1 })
         idx.history.push({ role: 'assistant', text: cap(t, capText) })
       }
@@ -174,7 +177,7 @@ function indexSessionLog(sessionId) {
       if (t) {
         const key = `${turn}:${step}`
         const cur = idx.toolResultByKey.get(key)
-        if (cur) cur.count++
+        if (cur) { cur.count++; cur.text = cur.text ? cur.text + '\n' + t : t }
         else idx.toolResultByKey.set(key, { text: t, count: 1 })
       }
     }
@@ -262,31 +265,29 @@ function main() {
         },
         textComplete: false,
       }
-      // 执行标识与跨面唯一性校验：会话侧同一 (turn,step) 出现多次 = 无法确认出自同一次执行，
-      // 拒绝静默配对（不附文本），样本仍保留并标记。轨迹侧同 key 多行 = 同一消息的多个块（合法），
-      // 仅作信息性计数，不判歧义。
+      // 执行标识与跨面证据：id = <sessionId>#<turn>:<step>；
+      // 会话侧同 key 多记录是消息片段（已合并），仅作信息性计数。
+      // 唯一「拒绝配对」的真实信号是两侧对同一 key 的文本相互矛盾——当前数据形态
+      // 下无法可判定检测，故不再设 ambiguous 拒绝，改为如实记录两侧证据。
       const tCount = trajCounts.get(key) ?? 0
       const sCount = ev.kind === 'assistant-message'
         ? (sessIdx?.assistantByKey.get(key)?.count ?? 0)
         : (sessIdx?.toolResultByKey.get(key)?.count ?? 0)
-      const ambiguous = sCount > 1
       sample.execution = {
         id: `${sessionId}#${ev.turn}:${ev.step}`,
         kind: ev.kind,
         trajectory_occurrences: tCount,
         session_occurrences: sCount,
         cross_plane: tCount > 0 && sCount > 0,
-        ambiguous,
+        ambiguous: false,
       }
-      if (!ambiguous) {
-        if (ev.kind === 'assistant-message') {
-          const e = sessIdx?.assistantByKey.get(key)
-          if (e?.text) { sample.response = cap(e.text, capText); sample.textComplete = true }
-        } else {
-          sample.toolName = ev.name ?? null
-          const e = sessIdx?.toolResultByKey.get(key)
-          if (e?.text) { sample.toolResult = cap(e.text, capText); sample.textComplete = true }
-        }
+      if (ev.kind === 'assistant-message') {
+        const e = sessIdx?.assistantByKey.get(key)
+        if (e?.text) { sample.response = cap(e.text, capText); sample.textComplete = true }
+      } else {
+        sample.toolName = ev.name ?? null
+        const e = sessIdx?.toolResultByKey.get(key)
+        if (e?.text) { sample.toolResult = cap(e.text, capText); sample.textComplete = true }
       }
       samples.push(sample)
     }
@@ -323,9 +324,8 @@ function main() {
     else neuCount++
   }
   const textSteps = samples.filter((s) => s.textComplete).length
-  const ambiguousSteps = samples.filter((s) => s.execution?.ambiguous).length
-  const oneSided = samples.filter((s) => s.execution && !s.execution.ambiguous && !s.execution.cross_plane).length
-  const crossVerified = samples.length - ambiguousSteps - oneSided
+  const oneSided = samples.filter((s) => s.execution && !s.execution.cross_plane).length
+  const crossVerified = samples.length - oneSided
   const stats = {
     generated_utc: new Date().toISOString(),
     logs_dir: logsDir,
@@ -338,7 +338,7 @@ function main() {
       'tool-call': samples.filter((s) => s.kind === 'tool-call').length,
     },
     text_coverage: totalSamplesPct(samples, textSteps),
-    execution_stats: { cross_plane_verified: crossVerified, ambiguous: ambiguousSteps, one_sided: oneSided },
+    execution_stats: { cross_plane_verified: crossVerified, one_sided: oneSided },
     lexicon_polarity: { pos_dominant: posCount, neg_dominant: negCount, neutral: neuCount },
     session_reward: { n: sessionScores.length, min: sMin, max: sMax, mean: Number(mean.toFixed(3)), std: Number(std.toFixed(3)) },
     band_buckets: buckets('band'),

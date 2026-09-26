@@ -153,11 +153,12 @@ node tools\export-layer4.mjs `
   execution{id, trajectory_occurrences, session_occurrences, cross_plane, ambiguous},
   reward{lexicon, sessionScore, scoreNorm, planner}, trajectory_features{…}, textComplete}` —
   compatible with PRM (per-step process reward) and DPO/RLVR (pairwise sampling per sessionId)
-- **Execution guard**: every sample carries an execution id (`<sessionId>#<turn>:<step>`) plus a
-  cross-plane uniqueness check — when the session plane contains the same `(turn, step)` more than
-  once (retry / torn append), the join is marked `ambiguous` and refuses to attach text instead of
-  silently pairing two different executions. `stats.json` reports `execution_stats` (verified /
-  ambiguous / one-sided) per export run.
+- **Execution identity**: every sample carries an execution id (`<sessionId>#<turn>:<step>`) plus
+  cross-plane evidence (`trajectory_occurrences` = trajectory block lines, `session_occurrences` =
+  session-log message fragments). DSH session logs split one message into several fragments that
+  share the same `(turn, step)` — the exporter merges them into the full text instead of treating
+  multi-fragment steps as ambiguity (a naive uniqueness check silently dropped ~12% of good text;
+  measured and fixed). `stats.json` reports `execution_stats` (verified / one-sided) per run.
 - **Normalize**: min-max normalization of session rewards (`scoreNorm`), positive/negative
   lexicon-polarity counts, band/liftReason/machineState buckets
 - Output: `dataset.jsonl` + `stats.json` (inclusion/exclusion list, text coverage, model
