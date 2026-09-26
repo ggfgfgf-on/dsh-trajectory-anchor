@@ -132,6 +132,31 @@ natural baseline style is let-me).
 | recency-position bias correction + per-round throttling | `@max-null/dsh-allostasis` |
 | decision-round / execution-round decoupling | `we-need-ds` |
 
+## Lexicon calibration (per-provider dictionaries)
+
+The default lexicon (we/let's/"we need"/our vs "let me") is calibrated on DeepSeek-style
+reasoning; other models need their own marker words. `tools/calibrate-lexicon.mjs` generates
+candidate dictionaries from a model's reasoning corpus — mode A: fully automatic candidates
+plus an evidence report, polarity pending a one-time human review.
+
+```powershell
+node tools\calibrate-lexicon.mjs `
+  --corpus <dir-with-model-session-logs> `        # reads DSH session.jsonl.zstd directly
+  --reference-corpus <dir-with-ds-session-logs> ` # cross-corpus frequency ratio
+  --name ark-doubao --out .\lexicon-ark
+```
+
+- Output: `<out>.json` (pending candidates with suggested weights) + `<out>-report.md`
+  (frequency / ratio / example sentences). Review once, move terms into
+  positive/negative/neutral, and paste them into the `lexicon:` key of the trajectory-anchor
+  row in cordis.patch.yml — the whole default dictionary is replaceable.
+- Honest boundary: statistics find the model's marker words; polarity (planning-style vs
+  reactive-style) is a semantic judgment, so the first review is one-time and everything after
+  is automatic.
+- Corpus size drives quality: a single short session surfaces mostly task vocabulary; style
+  markers (e.g. ark's 终验/终验证 abbreviation, ~197x over the DS corpus) appear once enough
+  reasoning text accumulates.
+
 ## Layer-4 training-data export
 
 `tools/export-layer4.mjs` joins the trajectory JSONLs (event stream + process reward) with the
