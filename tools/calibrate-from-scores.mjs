@@ -57,6 +57,14 @@ function scanRuns(resultsDir) {
     const meta = o.meta || {}
     let mtimeMs = 0
     try { mtimeMs = statSync(join(dir, '..')).mtimeMs } catch { /* ignore */ }
+    // behavior_blockers 在兄弟文件 blockers.json（顶层 behavior_blockers/final）；
+    // 部分旧结果只在 score_draft.json 顶层有 blockers 字段。
+    let blockers = Array.isArray(o.blockers) ? o.blockers : []
+    try {
+      const bj = JSON.parse(readFileSync(join(dir, '..', 'blockers.json'), 'utf8'))
+      const cand = bj.behavior_blockers || bj.final || bj.blockers || bj.auto
+      if (Array.isArray(cand)) blockers = cand
+    } catch { /* no blockers.json */ }
     runs.push({
       dir: join(dir, '..'),
       mtimeMs,
@@ -65,7 +73,7 @@ function scanRuns(resultsDir) {
       provider: meta.provider || '',
       runGroup: meta.run_group_id || '',
       runIndex: meta.run_index ?? null,
-      blockers: Array.isArray(o.blockers) ? o.blockers : [],
+      blockers,
     })
   }
   return runs
@@ -199,6 +207,9 @@ const modelFilter = arg('--model', '')
 // --run-group 可给逗号分隔的多个组（同模型同基准的多个轮次组一起用）
 const runGroupFilter = process.argv.filter((a, i) => i > 0 && process.argv[i - 1] === '--run-group').join(',')
 const runGroupSet = runGroupFilter ? new Set(runGroupFilter.split(',').map((s) => s.trim()).filter(Boolean)) : null
+// --use-blockers：按评测的 behavior_blockers 定标签（零缺陷=正，有缺陷=负），
+// 比纯分数更本质——分数是代理，blocker 是实质。分数仍记录进证据表。
+const useBlockers = process.argv.includes('--use-blockers')
 const highScore = Number(arg('--high', '95'))
 const lowScore = Number(arg('--low', '90'))
 const minFreq = Number(arg('--min-freq', '5'))
@@ -255,7 +266,9 @@ if (labelsPath) {
   const pairs = matchRuns(sessions, runs)
   console.log(`[scores] 匹配成功: ${pairs.length}`)
   for (const { run, session, gapMs } of pairs) {
-    const cls = run.ability >= highScore ? 'positive' : run.ability <= lowScore ? 'negative' : 'ignored'
+    const cls = useBlockers
+      ? (run.blockers.length === 0 ? 'positive' : 'negative')
+      : run.ability >= highScore ? 'positive' : run.ability <= lowScore ? 'negative' : 'ignored'
     const rec = {
       runDir: basename(run.dir),
       ability: run.ability,

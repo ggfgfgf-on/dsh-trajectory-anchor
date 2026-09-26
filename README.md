@@ -336,6 +336,16 @@ node tools\calibrate-from-scores.mjs `
   either corpus side drops below 10 blocks the tool refuses to calibrate instead of
   fabricating a lexicon. Accumulate runs across several different tasks for a clean style
   layer.
+- First complete empirical run (v4-pro, 4 clean one-session-per-run rounds: 97/98/98/100):
+  the pipeline matched 4/4 sessions with zero cross-model mixing; the calibrated lexicon
+  raised block-ratio separation from 0.13 (built-in DS lexicon — nearly blind on that day's
+  drifted v4-pro output, hit rate 0.28) to 0.42 — but the terms were pure task vocabulary
+  (positive: 占位符/模板措辞/BOM from the template-fix session; negative: ts/events/care
+  from the defect sessions). Verdict recorded as designed: single-task data must NOT feed
+  the built-in lexicon; the auto-bucket machinery remains the style-layer channel, and
+  score-supervised optimization needs several different benchmark tasks before its output
+  can replace the built-in. Use `tools/compare-lexicons.mjs` for the old-vs-new separation
+  test on any corpus pair.
 
 ## Layer-4 training-data export
 
