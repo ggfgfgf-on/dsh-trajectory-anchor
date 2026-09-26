@@ -156,17 +156,55 @@ function indexSessionLog(sessionId) {
       const turn = o.data?.turn, step = o.data?.step
       const content = o.data?.message?.content ?? []
       const texts = []
+      const callIds = []
+      const toolNames = []
       for (const b of content) {
         if (b?.type === 'reasoning' || b?.type === 'text') texts.push(b.text ?? '')
+        if (b?.type === 'tool-call') { if (b.id) callIds.push(b.id); if (b.name) toolNames.push(b.name) }
       }
       const t = texts.join('\n').trim()
-      if (t) idx.assistantByKey.set(`${turn}:${step}`, t)
-      if (t) idx.history.push({ role: 'assistant', text: cap(t, capText) })
+      if (t || callIds.length > 0) {
+        const key = `${turn}:${step}`
+        const cur = idx.assistantByKey.get(key)
+        // DSH 会话日志会把一条消息拆成多个 assistant/message 片段落盘
+        //（第 1 片 reasoning+tool-call、第 2 片 tool-result …），同 key 多记录是正常形态，
+        // 必须合并而不是当作歧义。
+        if (cur) {
+          cur.count++
+          if (t) cur.text = cur.text ? cur.text + '\n' + t : t
+          cur.callIds.push(...callIds)
+          cur.toolNames.push(...toolNames)
+        } else {
+          idx.assistantByKey.set(key, { text: t, count: 1, seqs: [o.seq ?? null], callIds, toolNames, resultCallIds: [] })
+        }
+        if (typeof o.seq === 'number') {
+          const e = idx.assistantByKey.get(key)
+          if (e && !e.seqs.includes(o.seq)) e.seqs.push(o.seq)
+        }
+        if (t) idx.history.push({ role: 'assistant', text: cap(t, capText) })
+      }
     }
     if (o.type === 'tool/result') {
       const turn = o.data?.turn, step = o.data?.step
-      const t = textOf(o.data?.message?.content?.[0]?.content ?? o.data?.message?.content)
-      if (t) idx.toolResultByKey.set(`${turn}:${step}`, t)
+      const content = o.data?.message?.content ?? []
+      const t = textOf(content?.[0]?.content ?? content)
+      let resultCallId = null
+      for (const b of content) { if (b?.type === 'tool-result' && b.toolCallId) resultCallId = b.toolCallId }
+      if (t || resultCallId) {
+        const key = `${turn}:${step}`
+        const cur = idx.toolResultByKey.get(key)
+        if (cur) {
+          cur.count++
+          if (t) cur.text = cur.text ? cur.text + '\n' + t : t
+          if (resultCallId) cur.resultCallIds.push(resultCallId)
+        } else {
+          idx.toolResultByKey.set(key, { text: t, count: 1, seqs: [o.seq ?? null], resultCallIds: resultCallId ? [resultCallId] : [] })
+        }
+        if (typeof o.seq === 'number') {
+          const e = idx.toolResultByKey.get(key)
+          if (e && !e.seqs.includes(o.seq)) e.seqs.push(o.seq)
+        }
+      }
     }
     if (o.type === 'request/header' && o.data) {
       const m = o.data.model ?? o.data.provider ?? null
@@ -185,15 +223,24 @@ function main() {
   const samples = []
 
   for (const file of files) {
-    const path = join(logsDir, file)
-    const lines = readFileSync(path, 'utf8').split('\n').filter((l) => l.trim())
+    // 块文件（插件分块落盘的 append-only 历史）按序号排在主文件之前，
+    // 保证事件按时间序读取；主文件持有当前尾块与终态 record。
+    const chunkFiles = readdirSync(logsDir)
+      .filter((f) => f.startsWith(`${file}.`) && f.endsWith('.jsonl'))
+      .sort((a, b) => Number(a.slice(a.lastIndexOf('.') + 1)) - Number(b.slice(b.lastIndexOf('.') + 1)))
+    const paths = [...chunkFiles.map((f) => join(logsDir, f)), join(logsDir, file)]
     const events = []
     let record = null
-    for (const l of lines) {
-      let o
-      try { o = JSON.parse(l) } catch { continue }
-      if (o.kind === 'record') record = o.summary
-      else events.push(o)
+    for (const p of paths) {
+      let text
+      try { text = readFileSync(p, 'utf8') } catch { continue }
+      for (const l of text.split('\n')) {
+        if (!l.trim()) continue
+        let o
+        try { o = JSON.parse(l) } catch { continue }
+        if (o.kind === 'record') record = o.summary
+        else events.push(o)
+      }
     }
     const selfByName = file.startsWith('anchor-session-')
     const self = selfByName || (record?.self === true)
@@ -206,7 +253,14 @@ function main() {
     const sessIdx = noText ? null : indexSessionLog(sessionId)
     const model = sessIdx?.descriptor?.agentModel ?? sessIdx?.requestModels?.[0] ?? null
 
-    // 时间序 step 组装
+    // 时间序 step 组装（先数跨面 key 出现次数，防「同一执行键两次出现」导致的静默错配）
+    const trajCounts = new Map()
+    for (const ev of events) {
+      if (ev.kind === 'assistant-message' || ev.kind === 'tool-call') {
+        const k = `${ev.turn}:${ev.step}`
+        trajCounts.set(k, (trajCounts.get(k) ?? 0) + 1)
+      }
+    }
     let lastScore = null
     for (const ev of events) {
       if (ev.kind === 'score') { lastScore = ev; continue }
@@ -245,15 +299,123 @@ function main() {
         },
         textComplete: false,
       }
-      if (ev.kind === 'assistant-message') {
-        const t = sessIdx?.assistantByKey.get(key)
-        if (t) { sample.response = cap(t, capText); sample.textComplete = true }
+      // 执行标识与跨面验证：
+      // id = <sessionId>#<turn>:<step>；会话侧同 key 多记录=消息片段（已合并）。
+      // 真实矛盾信号（利用 DSH 原生调用级标识 call_00_...）：
+      //   tool-call：会话片段里的工具名不匹配轨迹侧名字 → 矛盾；
+      //              tool/result 的 callId 与会话片段的 callId 无交集 → 矛盾；
+      //   assistant-message：同 key 片段 seq 不连续 → 疑似两条执行交错。
+      const tCount = trajCounts.get(key) ?? 0
+      const aE = sessIdx?.assistantByKey.get(key)
+      const sCount = ev.kind === 'assistant-message'
+        ? (sessIdx?.assistantByKey.get(key)?.count ?? 0)
+        : (sessIdx?.toolResultByKey.get(key)?.count ?? 0)
+      let contradiction = false
+      let callIdVerified = null
+      let fragmentContiguous = null
+      if (ev.kind === 'tool-call') {
+        const rE = sessIdx?.toolResultByKey.get(key)
+        const sessNames = aE?.toolNames ?? []
+        if (sessNames.length > 0) {
+          const nameOk = sessNames.includes(ev.name)
+          callIdVerified = nameOk
+          if (!nameOk) contradiction = true
+        }
+        const aCalls = new Set(aE?.callIds ?? [])
+        const rCalls = rE?.resultCallIds ?? []
+        if (rCalls.length > 0) {
+          const overlap = rCalls.some((c) => aCalls.has(c))
+          if (callIdVerified === null) callIdVerified = overlap
+          if (!overlap) contradiction = true
+        }
+        if (callIdVerified === null) callIdVerified = (rCalls.length === 0 && sessNames.length === 0) ? null : callIdVerified
       } else {
-        sample.toolName = ev.name ?? null
-        const r = sessIdx?.toolResultByKey.get(key)
-        if (r) { sample.toolResult = cap(r, capText); sample.textComplete = true }
+        const seqs = (aE?.seqs ?? []).filter((s) => typeof s === 'number').sort((x, y) => x - y)
+        if (seqs.length > 1) {
+          fragmentContiguous = seqs.every((s, i) => i === 0 || s === seqs[i - 1] + 1)
+          if (!fragmentContiguous) contradiction = true
+        }
+      }
+      sample.execution = {
+        id: `${sessionId}#${ev.turn}:${ev.step}`,
+        kind: ev.kind,
+        trajectory_occurrences: tCount,
+        session_occurrences: sCount,
+        cross_plane: tCount > 0 && sCount > 0,
+        call_id_verified: callIdVerified,
+        fragment_contiguous: fragmentContiguous,
+        ambiguous: contradiction,
+      }
+      if (!contradiction) {
+        if (ev.kind === 'assistant-message') {
+          const e = sessIdx?.assistantByKey.get(key)
+          if (e?.text) { sample.response = cap(e.text, capText); sample.textComplete = true }
+        } else {
+          sample.toolName = ev.name ?? null
+          const e = sessIdx?.toolResultByKey.get(key)
+          if (e?.text) { sample.toolResult = cap(e.text, capText); sample.textComplete = true }
+        }
       }
       samples.push(sample)
+    }
+
+    // 补发 session-only 样本：会话日志里有、轨迹面没有的步骤
+    //（典型：门控引导轮 turn-1，或插件晚收养窗口——晚收养前的会话步骤无轨迹面记录）。
+    // 这些样本 cross_plane=false、execution.source='session-only'，文本完整可用。
+    if (sessIdx) {
+      const sessionOnly = new Map() // key -> { kind, data }
+      for (const [key, e] of sessIdx.assistantByKey) {
+        if ((trajCounts.get(key) ?? 0) === 0) sessionOnly.set(key, { kind: 'assistant-message', entry: e })
+      }
+      for (const [key, e] of sessIdx.toolResultByKey) {
+        if ((trajCounts.get(key) ?? 0) === 0 && !sessionOnly.has(key)) sessionOnly.set(key, { kind: 'tool-call', entry: e })
+      }
+      for (const [key, { kind, entry }] of sessionOnly) {
+        const [turn, step] = key.split(':').map((v) => Number(v))
+        const sample = {
+          sessionId,
+          model,
+          turn: Number.isFinite(turn) ? turn : null,
+          step: Number.isFinite(step) ? step : null,
+          kind,
+          messages: sessIdx.history.slice(-maxContext),
+          response: null,
+          toolName: null,
+          toolResult: null,
+          reward: {
+            lexicon: null,
+            sessionScore: record.reward?.score ?? null,
+            scoreNorm: null,
+            planner: record.reward?.planner ?? null,
+            planningMessages: record.reward?.planningMessages ?? null,
+            shallowMessages: record.reward?.shallowMessages ?? null,
+          },
+          trajectory_features: {
+            band: record.band ?? null,
+            ratio: record.ratio ?? null,
+            ewma: record.ewma ?? null,
+            percentile: record.percentile ?? null,
+            personaRatio: record.personaRatio ?? null,
+            liftReason: record.liftReason ?? null,
+            machineState: record.machineState ?? null,
+          },
+          execution: {
+            id: `${sessionId}#${key}`,
+            kind,
+            trajectory_occurrences: 0,
+            session_occurrences: entry?.count ?? 1,
+            cross_plane: false,
+            call_id_verified: null,
+            fragment_contiguous: null,
+            ambiguous: false,
+            source: 'session-only',
+          },
+          textComplete: false,
+        }
+        if (kind === 'assistant-message' && entry?.text) { sample.response = cap(entry.text, capText); sample.textComplete = true }
+        if (kind === 'tool-call' && entry?.text) { sample.toolResult = cap(entry.text, capText); sample.textComplete = true }
+        samples.push(sample)
+      }
     }
   }
 
@@ -288,6 +450,10 @@ function main() {
     else neuCount++
   }
   const textSteps = samples.filter((s) => s.textComplete).length
+  const oneSided = samples.filter((s) => s.execution && !s.execution.cross_plane && s.execution.source !== 'session-only').length
+  const sessionOnly = samples.filter((s) => s.execution?.source === 'session-only').length
+  const contradictions = samples.filter((s) => s.execution?.ambiguous).length
+  const crossVerified = samples.length - oneSided - sessionOnly - contradictions
   const stats = {
     generated_utc: new Date().toISOString(),
     logs_dir: logsDir,
@@ -300,6 +466,7 @@ function main() {
       'tool-call': samples.filter((s) => s.kind === 'tool-call').length,
     },
     text_coverage: totalSamplesPct(samples, textSteps),
+    execution_stats: { cross_plane_verified: crossVerified, one_sided: oneSided, session_only: sessionOnly, contradictions: contradictions },
     lexicon_polarity: { pos_dominant: posCount, neg_dominant: negCount, neutral: neuCount },
     session_reward: { n: sessionScores.length, min: sMin, max: sMax, mean: Number(mean.toFixed(3)), std: Number(std.toFixed(3)) },
     band_buckets: buckets('band'),
