@@ -688,18 +688,28 @@ function closeRec(rec, reason) {
 }
 
 /** True when the session already contains real work (assistant messages or
- * tool calls). Fresh sessions at agent/created carry only ~5 seed events;
- * resumed sessions (restart, fork children) carry history — anchoring those
- * would re-bootstrap a mid-flight session, so they are adopted audit-only. */
+ * tool calls) AND that work predates the adoption moment. Fresh sessions at
+ * agent/created carry only ~5 seed events; resumed sessions (restart, fork
+ * children) carry history — anchoring those would re-bootstrap a mid-flight
+ * session, so they are adopted audit-only.
+ * 竞态豁免：agent/created 派发常晚于子代理的首个工作事件——若首个工作事件
+ * 刚刚发生（<60s），这是全新会话的起步竞态而不是恢复会话，允许锚定。 */
 function sessionHasWork(agent) {
   try {
     const events = agent && agent.session ? agent.session.events : undefined
     if (!events) return false
     const list = Array.isArray(events) ? events : Array.from(events)
+    let work = 0
+    let firstWorkTime = null
     for (const ev of list) {
-      if (ev && (ev.type === 'assistant/message' || ev.type === 'tool/call')) return true
+      if (ev && (ev.type === 'assistant/message' || ev.type === 'tool/call')) {
+        work++
+        if (firstWorkTime === null && typeof ev.time === 'number') firstWorkTime = ev.time
+      }
     }
-    return false
+    if (work === 0) return false
+    if (firstWorkTime !== null && Date.now() - firstWorkTime < 60000) return false
+    return true
   } catch (e) {
     return false
   }
@@ -800,7 +810,8 @@ function feedSessionEvent(session, event) {
       lateLookupDenied.add(session.id)
       return
     }
-    rec = adopt(agent, false, 'session-event-late')
+    // 晚收养也走同样的年轻会话判定：刚起步的会话值得补锚定，而不是直接只审计。
+    rec = adopt(agent, !sessionHasWork(agent), 'session-event-late')
     if (!rec) return
   }
   if (event.type === 'tool/call') {
