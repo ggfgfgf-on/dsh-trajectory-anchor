@@ -155,12 +155,15 @@ aliases and gateway labels that drift over time (`ark-code-latest` may point to 
 model tomorrow), so recognition, selection, accumulation and merging are all driven by the
 **output text itself**. Names are recorded as human-readable labels only.
 
-1. **Probe fit at session start** — the plugin scores the first few natural reasoning blocks
-   (post-lift for anchored sessions — the bootstrap phase is persona-primed, not the model's
-   own style) against every candidate lexicon: the default DS lexicon, all calibrated style
-   buckets, and any name-hinted profiles. Fit = **marker hit rate** (do the lexicon's terms
-   appear at all?) + **ratio spread** (can the lexicon separate planning-style from
-   reactive-style blocks?). The best-fitting candidate wins; the output alone decides.
+1. **Probe fit at session start** — pure passive observation, never a test: the plugin *reads*
+   the first few natural reasoning blocks the model already produced (post-lift for anchored
+   sessions — the bootstrap phase is persona-primed, not the model's own style) and scores them
+   against every candidate lexicon: the default DS lexicon, all calibrated style buckets, and
+   any name-hinted profiles. Fit = **marker hit rate** (do the lexicon's terms appear at all?)
+   + **ratio spread** (can the lexicon separate planning-style from reactive-style blocks?).
+   The best-fitting candidate wins; the output alone decides. Nothing is injected, no prompt is
+   added, and the model never sees the probe or its scores — the probe only changes which
+   lexicon computes the host-side audit score.
    - Fits (e.g. DS lexicon on DeepSeek-style output: hit rate ≈1, ratio CV ≈0.8) → keep using
      it, nothing else happens.
    - Nothing fits (e.g. DS lexicon on Doubao-style Chinese reasoning: hit rate ≈0) →
