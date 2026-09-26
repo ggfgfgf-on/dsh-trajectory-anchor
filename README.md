@@ -64,7 +64,9 @@ agent/created
 request #1: bootstrap tools + Minimal persona (maxTokens uncapped by default)
    │  first tool/call → gate-armed
    ▼
-gate wait: latest reasoning window looks minimal-like (contains "we", no "let me")
+gate wait: latest reasoning window looks minimal-like (positive markers hit, no negative
+   │  markers — under the DS lexicon: contains "we", no "let me"; the gate follows whichever
+   │  lexicon is active, so inverted-polarity bucket lexicons gate on their own markers)
    │  fallbacks: maxBootstrapSteps=5 / promoteAfterFirstResponse
    ▼
 promotion: lift restrictions + restore context + explicitly strip the maxTokens cap
