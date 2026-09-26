@@ -664,16 +664,29 @@ function closeRec(rec, reason) {
 }
 
 /** True when the session already contains real work (assistant messages or
- * tool calls). Fresh sessions at agent/created carry only ~5 seed events;
- * resumed sessions (restart, fork children) carry history — anchoring those
- * would re-bootstrap a mid-flight session, so they are adopted audit-only. */
+ * tool calls) that predates this process — i.e. a resumed/forked session.
+ * 动态判据（无固定阈值）：工作事件的 seq < session.firstLiveSeq ⇒ 该事件写于
+ * 本进程构造种子之前，是恢复/分叉携带的历史 → 只审计；所有工作事件
+ * seq ≥ firstLiveSeq ⇒ 全部是本进程 live 新产生 → 新鲜会话，锚定。
+ * firstLiveSeq 是「本进程第一个 live 事件」的构造事实，天然免疫 agent/created
+ * 晚到竞态，且对任意种子长度自适应（固定阈值 8/24 均会因种子形态变化失效）。 */
 function sessionHasWork(agent) {
   try {
-    const events = agent && agent.session ? agent.session.events : undefined
+    const session = agent && agent.session
+    if (!session) return false
+    const events = session.events
     if (!events) return false
     const list = Array.isArray(events) ? events : Array.from(events)
+    const firstLive = typeof session.firstLiveSeq === 'number' ? session.firstLiveSeq : null
     for (const ev of list) {
-      if (ev && (ev.type === 'assistant/message' || ev.type === 'tool/call')) return true
+      if (ev && (ev.type === 'assistant/message' || ev.type === 'tool/call')) {
+        if (firstLive !== null && typeof ev.seq === 'number') {
+          if (ev.seq < firstLive) return true
+          continue
+        }
+        // seq/firstLiveSeq 不可用时保守回退：有工作即视为历史
+        return true
+      }
     }
     return false
   } catch (e) {
