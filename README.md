@@ -41,6 +41,16 @@ Restart DSH. The plugin mounts on the host plane: it adopts all live agents at s
 (audit-only) and every new agent then goes through the
 **anchor → gate promotion → continuous scoring** lifecycle.
 
+## 快速开始（普通用户）
+
+装完即用，零手动配置：`dsh plugin add github:ggfgfgf-on/dsh-trajectory-anchor` 之后重启 DSH 即可。
+
+- **DeepSeek 系模型**：开箱即用（内置 DS 词典）。
+- **其他模型**：前几个会话先用默认词典计分，插件在后台自动积累该模型的风格样本；
+  攒够 3 个会话 / 约 4 万字符后**自动生成该模型的专属词典并立即生效**，
+  之后所有会话自动沿用（跨重启持久化，无需任何操作）。
+- **看状态**：随时调用 `anchor_status` 工具，`lexicon` 块里有每个模型的标定进度与生效词典。
+
 ## Lifecycle
 
 ```
@@ -74,6 +84,8 @@ agent/disposed: RewardAnnotator process reward + trajectory JSONL final archive
 | `maxBootstrapSteps` | `5` | gate fallback |
 | `suppressContextOnBootstrap` | `true` | agent-scope context suppression during bootstrap |
 | `lexicon` / `ratioWeights` | monitor-calibrated | weighted lexicon scoring (we/let's/we'll/"we need"/our vs "let me"; neutral i will/i'll/i need/check/verify) |
+| `lexiconProfiles` | `{}` (`deepseek-official` pre-seeded with the DS lexicon) | per-provider built-in dictionaries; pre-seed a known model to skip the auto-calibration wait |
+| `lexiconAuto` | enabled; 3 sessions / 40k chars | unknown-provider auto-calibration (detect → sample → calibrate → apply); see "Lexicon calibration" below |
 | `specMax` / `reactMin` | `0.2` / `0.5` | persona_ratio band boundaries (spec/mixed/react) |
 | `baselineMinSamples` / `rollbackPercentile` | `10` / `25` | **baseline-relative drift**: rollback only fires when the current ratio's percentile within the session's own history is < 25 |
 | `rollbackEnabled` | `true` | calibrated rollback switch (safe to enable under baseline-relative semantics) |
@@ -132,12 +144,47 @@ natural baseline style is let-me).
 | recency-position bias correction + per-round throttling | `@max-null/dsh-allostasis` |
 | decision-round / execution-round decoupling | `we-need-ds` |
 
-## Lexicon calibration (per-provider dictionaries)
+## Lexicon calibration (per-provider dictionaries, automatic)
 
 The default lexicon (we/let's/"we need"/our vs "let me") is calibrated on DeepSeek-style
-reasoning; other models need their own marker words. `tools/calibrate-lexicon.mjs` generates
-candidate dictionaries from a model's reasoning corpus — mode A: fully automatic candidates
-plus an evidence report, polarity pending a one-time human review.
+reasoning; other models need their own marker words. The plugin handles this **without any
+manual steps**:
+
+1. **Detect** — every session reports its model provider (request/header events), so the plugin
+   knows which model is talking.
+2. **Resolve** — per-provider dictionaries resolve in order: auto-calibrated override >
+   built-in profile (`lexiconProfiles`; `deepseek-official` ships pre-seeded with the default DS
+   lexicon) > default DS lexicon.
+3. **Sample** — while a provider without a built-in dictionary is speaking, the plugin quietly
+   accumulates style samples: reasoning text + the session's own baseline percentile (a
+   model-agnostic quality signal — not DS-lexicon scores, so no circular bias).
+4. **Calibrate** — once that provider reaches `minSessions` sessions and `minChars` of reasoning
+   text, the plugin runs the shared contrast engine (`tools/lexicon-core.mjs`, log-odds n-gram
+   contrast) over the high-percentile vs low-percentile samples and derives
+   positive/negative/neutral marker terms with log-odds weights.
+5. **Apply** — the derived lexicon is active immediately for that provider and persisted to
+   `<logDir>/lexicon-state.json` (survives restarts; the ledger keeps accumulating).
+
+So: use any model. The first few sessions are scored with the default lexicon; after the
+threshold (defaults: 3 sessions / 40k characters) the plugin swaps in a lexicon calibrated on
+the model's own anchored-vs-drifted style, labeled by the session's own percentile baseline.
+
+Auto-calibration knobs (all under `lexiconAuto`, patchable in cordis.patch.yml): `enabled`
+(default `true`), `minSessions` (3), `minChars` (40000), `percentileHigh` / `percentileLow`
+(75/25), `minFreq` (5), `top` (60). Progress is audited per provider
+(`lexicon-resolved` / `lexicon-auto-progress` / `lexicon-calibrated` events) and visible in the
+`anchor_status` tool's `lexicon` block.
+
+**Pre-seed a known dictionary** (skip the waiting period) via `lexiconProfiles` in the patch:
+
+```yaml
+config:
+  lexiconProfiles:
+    huoshan: { positive: { '终验': 2 }, negative: {}, neutral: {} }
+```
+
+**Manual CLI calibration** (research / one-off corpora) still works, now sharing the same
+contrast core as the runtime:
 
 ```powershell
 node tools\calibrate-lexicon.mjs `
@@ -146,16 +193,14 @@ node tools\calibrate-lexicon.mjs `
   --name ark-doubao --out .\lexicon-ark
 ```
 
-- Output: `<out>.json` (pending candidates with suggested weights) + `<out>-report.md`
-  (frequency / ratio / example sentences). Review once, move terms into
-  positive/negative/neutral, and paste them into the `lexicon:` key of the trajectory-anchor
-  row in cordis.patch.yml — the whole default dictionary is replaceable.
+- Output: `<out>.json` (auto-labeled positive/negative/neutral with suggested weights) +
+  `<out>-report.md` (frequency / ratio / example sentences).
 - Honest boundary: statistics find the model's marker words; polarity (planning-style vs
-  reactive-style) is a semantic judgment, so the first review is one-time and everything after
-  is automatic.
-- Corpus size drives quality: a single short session surfaces mostly task vocabulary; style
-  markers (e.g. ark's 终验/终验证 abbreviation, ~197x over the DS corpus) appear once enough
-  reasoning text accumulates.
+  reactive-style) is a semantic judgment. The plugin-side auto path sidesteps it by labeling
+  with the session-own percentile (planning-style = high percentile, reactive = low), which is
+  model-agnostic and needs no human review. Corpus size drives quality: a single short session
+  surfaces mostly task vocabulary; style markers (e.g. ark's 终验/终验证 abbreviation, ~197x
+  over the DS corpus) appear once enough reasoning text accumulates.
 
 ## Layer-4 training-data export
 

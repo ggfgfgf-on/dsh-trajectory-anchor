@@ -33,6 +33,7 @@
 import { readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join, resolve, basename, dirname } from 'node:path'
 import { zstdDecompressSync } from 'node:zlib'
+import { ngrams, contrastPolarity, LATIN_STOPWORDS } from './lexicon-core.mjs'
 
 const ZSTD_MAGIC = 0xfd2fb528
 
@@ -84,13 +85,6 @@ function decodeSessionLog(path) {
 }
 
 const DS_REFERENCE_TERMS = ['we', "let's", "we'll", 'we need', 'our', 'let me', 'i will', "i'll", 'i need', 'check', 'verify']
-
-const LATIN_STOPWORDS = new Set([
-  'the', 'and', 'of', 'to', 'in', 'is', 'a', 'it', 'for', 'on', 'that', 'this', 'with', 'as', 'are',
-  'was', 'be', 'at', 'by', 'or', 'an', 'not', 'but', 'from', 'we', 'i', 'if', 'then', 'so', 'can',
-  'will', 'would', 'should', 'could', 'have', 'has', 'do', 'does', 'did', 'all', 'any', 'no', 'yes',
-  'also', 'just', 'now', 'here', 'there', 'what', 'which', 'when', 'how', 'why', 'get', 'got',
-])
 
 function arg(name, fallback) {
   const i = process.argv.indexOf(name)
@@ -148,28 +142,7 @@ function collectCorpus(path) {
   return chunks
 }
 
-// ---------- n-gram ----------
-function ngrams(chunks) {
-  const map = new Map()
-  const bump = (k) => { if (k) map.set(k, (map.get(k) ?? 0) + 1) }
-  for (const text of chunks) {
-    const cjkRuns = text.match(/[\u4e00-\u9fff]{2,}/g) ?? []
-    for (const run of cjkRuns) {
-      for (let n = 2; n <= 4; n++) {
-        for (let i = 0; i + n <= run.length; i++) bump(run.slice(i, i + n))
-      }
-    }
-    const latinRuns = text.match(/[A-Za-z][A-Za-z' -]*/g) ?? []
-    for (const run of latinRuns) {
-      const words = run.toLowerCase().split(/[\s-]+/).filter((w) => w.length > 1 && !LATIN_STOPWORDS.has(w))
-      for (let i = 0; i < words.length; i++) {
-        bump(words[i])
-        if (i + 1 < words.length) bump(`${words[i]} ${words[i + 1]}`)
-      }
-    }
-  }
-  return map
-}
+// ---------- n-gram（共享核心见 lexicon-core.mjs） ----------
 
 // ---------- 自动标注（模式 B）：插件评分 → 锚定风/漂移风样例 ----------
 
@@ -222,27 +195,7 @@ function stepTexts(path) {
   return out
 }
 
-/** 对比统计：某词在锚定组 vs 漂移组的过度表达 → 极性 + log-odds 权重。 */
-function contrastPolarity(anchored, drifted, minFreq, top) {
-  const a = ngrams(anchored)
-  const d = ngrams(drifted)
-  const aN = anchored.reduce((n, s) => n + s.length, 0) || 1
-  const dN = drifted.reduce((n, s) => n + s.length, 0) || 1
-  const rows = []
-  const seen = new Set([...a.keys(), ...d.keys()])
-  for (const term of seen) {
-    const fa = a.get(term) ?? 0
-    const fd = d.get(term) ?? 0
-    if (fa + fd < minFreq) continue
-    const pa = fa / aN
-    const pd = fd / dN
-    const odds = Math.log((pa + 1e-9) / (pd + 1e-9))
-    if (Math.abs(odds) < 0.4) continue
-    rows.push({ term, fa, fd, odds, polarity: odds > 0 ? 'positive' : 'negative' })
-  }
-  rows.sort((x, y) => Math.abs(y.odds) - Math.abs(x.odds))
-  return rows.slice(0, top)
-}
+/** 对比统计：某词在锚定组 vs 漂移组的过度表达 → 极性 + log-odds 权重（共享核心）。 */
 
 function autoLabeledLexicon(corpusPath, trajDir, name, outPrefix, minFreq, top, pHigh, pLow) {
   const pct = loadStepPercentiles(trajDir)

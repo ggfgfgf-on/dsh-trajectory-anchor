@@ -34,6 +34,8 @@
  * workspaceRoot (process.cwd()).
  */
 
+import { contrastPolarity } from './tools/lexicon-core.mjs'
+
 const DEFAULTS = {
   anchorEnabled: true,
   bootstrapTools: ['bash', 'str_replace_editor', 'pwsh'],
@@ -52,6 +54,21 @@ const DEFAULTS = {
     positive: { we: 2, "let's": 1.5, "we'll": 1.2, 'we need': 1.2, our: 0.8 },
     negative: { 'let me': 3 },
     neutral: { 'i will': 1, "i'll": 1, 'i need': 0.8, check: 0.4, verify: 0.4 },
+  },
+  // 每-provider 内置词典。apply 时自动把默认 DS 词典登记为 deepseek-official 的
+  // profile；用户可在 patch 里预置其他模型的词典，例如
+  // { huoshan: { positive: { '终验': 2 }, negative: {...}, neutral: {...} } }。
+  lexiconProfiles: {},
+  // 未知模型自动标定：按 provider 积累风格样本（文本 + 会话内基准百分位），
+  // 达到阈值后自动 contrast 出词典、立即生效并持久化（lexicon-state.json）。
+  lexiconAuto: {
+    enabled: true,
+    minSessions: 3,
+    minChars: 40000,
+    percentileHigh: 75,
+    percentileLow: 25,
+    minFreq: 5,
+    top: 60,
   },
   ratioWeights: { alpha: 2, beta: 0.5, gamma: 1.5, epsilon: 1 },
   specMax: 0.2,
@@ -114,6 +131,8 @@ let waterfallPreStep = 0
 let listAtApply = { length: -1, error: null }
 let initiatorSessionId = null
 const lateLookupDenied = new Set()
+const lexiconOverrides = {} // provider -> { positive, negative, neutral }（自动标定产物，跨重启持久化）
+const lexiconLedger = {} // provider -> { sessions, chars, samples: [{text, percentile}] }
 
 function msg(error) {
   try {
@@ -218,7 +237,8 @@ function reasoningBlocks(event) {
   }
 }
 
-function measureText(text) {
+function measureText(text, lexicon) {
+  if (!lexicon) lexicon = CONFIG.lexicon
   const normalized = text.replace(/[\u2018\u2019]/g, "'")
   const lower = normalized.toLowerCase()
   let positive = 0
@@ -226,26 +246,26 @@ function measureText(text) {
   let neutral = 0
   let positiveWords = 0
   let letMe = 0
-  for (const term of Object.keys(CONFIG.lexicon.positive)) {
+  for (const term of Object.keys(lexicon.positive || {})) {
     const m = lower.match(new RegExp('\\b' + term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+') + '\\b', 'g'))
     const n = m ? m.length : 0
     if (n > 0) {
-      positive += n * CONFIG.lexicon.positive[term]
+      positive += n * lexicon.positive[term]
       positiveWords += n
     }
   }
-  for (const term of Object.keys(CONFIG.lexicon.negative)) {
+  for (const term of Object.keys(lexicon.negative || {})) {
     const m = lower.match(new RegExp('\\b' + term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+') + '\\b', 'g'))
     const n = m ? m.length : 0
     if (n > 0) {
-      negative += n * CONFIG.lexicon.negative[term]
+      negative += n * lexicon.negative[term]
       if (term === 'let me') letMe += n
     }
   }
-  for (const term of Object.keys(CONFIG.lexicon.neutral)) {
+  for (const term of Object.keys(lexicon.neutral || {})) {
     const m = lower.match(new RegExp('\\b' + term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+') + '\\b', 'g'))
     const n = m ? m.length : 0
-    if (n > 0) neutral += n * CONFIG.lexicon.neutral[term]
+    if (n > 0) neutral += n * lexicon.neutral[term]
   }
   return {
     positive,
@@ -258,10 +278,146 @@ function measureText(text) {
   }
 }
 
-function flagsOf(texts) {
+function flagsOf(texts, lexicon) {
   const flags = []
-  for (const text of texts) flags.push(measureText(text))
+  for (const text of texts) flags.push(measureText(text, lexicon))
   return flags
+}
+
+/** 按 provider 选词典：自动标定产物 > 内置/patch profile > 默认 DS 词典。 */
+function resolveLexicon(provider) {
+  if (typeof provider === 'string' && provider.length > 0) {
+    if (lexiconOverrides[provider]) return { lexicon: lexiconOverrides[provider], source: 'auto' }
+    if (CONFIG.lexiconProfiles && CONFIG.lexiconProfiles[provider]) return { lexicon: CONFIG.lexiconProfiles[provider], source: 'profile' }
+  }
+  return { lexicon: CONFIG.lexicon, source: 'default' }
+}
+
+/** 未知 provider（无内置词典）的风格样本积累：只收集 (文本, 会话内基准百分位)，
+ *  百分位是模型无关信号——高分样本=该模型自己的"锚定风"，低分=自己的"漂移风"。 */
+function sampleStyle(rec, texts) {
+  const auto = CONFIG.lexiconAuto
+  if (!auto || auto.enabled === false) return
+  if (typeof rec.provider !== 'string' || rec.provider.length === 0) return
+  if (rec.lexiconSource !== 'default') return
+  const joined = texts.join('\n')
+  if (joined.length < 40) return
+  rec.styleSamples.push({ text: joined, percentile: rec.percentile })
+  if (rec.styleSamples.length > 400) rec.styleSamples.shift()
+}
+
+// ---------- per-provider auto lexicon lifecycle ----------
+
+function lexiconStateDir() {
+  let dir = CONFIG.logDir
+  if (typeof baseDir === 'string' && baseDir.length > 0) dir = baseDir + '/' + CONFIG.logDir
+  return dir
+}
+
+function saveLexiconState() {
+  if (!fsSvc) return
+  const file = lexiconStateDir() + '/lexicon-state.json'
+  const text = JSON.stringify({ generated_utc: new Date().toISOString(), overrides: lexiconOverrides, ledger: lexiconLedger })
+  Promise.resolve()
+    .then(() => fsSvc.resolve(file, typeof baseDir === 'string' ? { cwd: baseDir } : undefined))
+    .then(target => fsSvc.writeText(target, text))
+    .catch(() => { /* persistence is best-effort */ })
+}
+
+function loadLexiconState() {
+  if (!fsSvc) return
+  const file = lexiconStateDir() + '/lexicon-state.json'
+  Promise.resolve()
+    .then(() => fsSvc.resolve(file, typeof baseDir === 'string' ? { cwd: baseDir } : undefined))
+    .then(target => fsSvc.readText(target))
+    .then(text => {
+      const state = JSON.parse(text)
+      if (!state || typeof state !== 'object') return
+      if (state.overrides && typeof state.overrides === 'object') {
+        for (const p of Object.keys(state.overrides)) {
+          const o = state.overrides[p]
+          if (o && o.positive && o.negative && o.neutral) lexiconOverrides[p] = o
+        }
+      }
+      if (state.ledger && typeof state.ledger === 'object') {
+        for (const p of Object.keys(state.ledger)) {
+          const l = state.ledger[p]
+          if (l && typeof l.sessions === 'number') {
+            lexiconLedger[p] = { sessions: l.sessions, chars: l.chars || 0, samples: Array.isArray(l.samples) ? l.samples : [] }
+          }
+        }
+      }
+    })
+    .catch(() => { /* first boot: no state file */ })
+}
+
+/** 会话关闭时并入账本；达到阈值就自动 contrast 出词典、立即生效并落盘。
+ *  只对无内置词典的 provider 生效（deepseek-official 走 profile，永远不进账本）。 */
+function maybeAutoCalibrate(rec) {
+  const auto = CONFIG.lexiconAuto
+  if (!auto || auto.enabled === false) return
+  const provider = rec.provider
+  if (typeof provider !== 'string' || provider.length === 0) return
+  if (lexiconOverrides[provider] || (CONFIG.lexiconProfiles && CONFIG.lexiconProfiles[provider])) return
+  if (rec.countedProvider === provider) return
+  rec.countedProvider = provider
+  const L = (lexiconLedger[provider] = lexiconLedger[provider] || { sessions: 0, chars: 0, samples: [] })
+  L.sessions += 1
+  let chars = 0
+  for (const s of rec.styleSamples) {
+    chars += s.text.length
+    if (typeof s.percentile === 'number') L.samples.push(s)
+  }
+  L.chars += chars
+  if (L.samples.length > 1500) L.samples.splice(0, L.samples.length - 1500)
+  saveLexiconState()
+  const minSessions = typeof auto.minSessions === 'number' ? auto.minSessions : 3
+  const minChars = typeof auto.minChars === 'number' ? auto.minChars : 40000
+  if (L.sessions < minSessions || L.chars < minChars) {
+    logAudit(rec, 'lexicon-auto-progress', { provider, sessions: L.sessions, chars: L.chars, samples: L.samples.length })
+    return
+  }
+  const high = typeof auto.percentileHigh === 'number' ? auto.percentileHigh : 75
+  const low = typeof auto.percentileLow === 'number' ? auto.percentileLow : 25
+  const anchored = []
+  const drifted = []
+  for (const s of L.samples) {
+    if (s.percentile >= high) anchored.push(s.text)
+    else if (s.percentile <= low) drifted.push(s.text)
+  }
+  if (anchored.length < 10 || drifted.length < 10) {
+    logAudit(rec, 'lexicon-auto-pending', { provider, reason: 'insufficient contrast samples', anchored: anchored.length, drifted: drifted.length })
+    return
+  }
+  let rows
+  try {
+    rows = contrastPolarity(anchored, drifted, typeof auto.minFreq === 'number' ? auto.minFreq : 5, typeof auto.top === 'number' ? auto.top : 60)
+  } catch (e) {
+    logAudit(rec, 'lexicon-auto-error', { provider, error: msg(e) })
+    return
+  }
+  if (!rows || rows.length === 0) {
+    logAudit(rec, 'lexicon-auto-pending', { provider, reason: 'no contrast terms' })
+    return
+  }
+  const lexicon = { positive: {}, negative: {}, neutral: {} }
+  for (const r of rows) {
+    const bucket = r.polarity === 'positive' ? lexicon.positive : r.polarity === 'negative' ? lexicon.negative : lexicon.neutral
+    bucket[r.term] = Math.round(Math.min(3, Math.max(0.5, Math.abs(r.odds))) * 10) / 10
+  }
+  lexiconOverrides[provider] = lexicon
+  saveLexiconState()
+  logAudit(rec, 'lexicon-calibrated', {
+    provider,
+    sessions: L.sessions,
+    chars: L.chars,
+    samples: L.samples.length,
+    anchored: anchored.length,
+    drifted: drifted.length,
+    positive: Object.keys(lexicon.positive).length,
+    negative: Object.keys(lexicon.negative).length,
+    neutral: Object.keys(lexicon.neutral).length,
+  })
 }
 
 function weightedRatio(agg) {
@@ -330,10 +486,11 @@ function recompute(rec, agent) {
 
 function updateWindow(rec, texts, agent) {
   if (texts.length > 0) {
-    rec.lastMessages.push({ flags: flagsOf(texts) })
+    rec.lastMessages.push({ flags: flagsOf(texts, rec.lexicon) })
     while (rec.lastMessages.length > CONFIG.trajectoryWindowSize) rec.lastMessages.shift()
   }
   recompute(rec, agent)
+  sampleStyle(rec, texts)
 }
 
 function backfill(rec, agent) {
@@ -347,7 +504,7 @@ function backfill(rec, agent) {
         assistantCount += 1
         const texts = reasoningBlocks(ev)
         if (texts.length > 0) {
-          rec.lastMessages.push({ flags: flagsOf(texts) })
+          rec.lastMessages.push({ flags: flagsOf(texts, rec.lexicon) })
           while (rec.lastMessages.length > CONFIG.trajectoryWindowSize) rec.lastMessages.shift()
         }
       }
@@ -680,6 +837,7 @@ function closeRec(rec, reason) {
     rec.counterfactual = null
   }
   annotateReward(rec)
+  maybeAutoCalibrate(rec)
   rec.closed = true
   logAudit(rec, 'closed', { reason })
   recs.delete(rec.sessionId)
@@ -770,6 +928,10 @@ function adopt(agent, doAnchor, channel) {
     lastStep: null,
     skillCatalogSeen: false,
     sourceKinds: {},
+    provider: null,
+    lexicon: CONFIG.lexicon,
+    lexiconSource: 'default',
+    styleSamples: [],
     contextSuppressed: false,
     contextSuppressedAt: null,
     contextSuppressError: null,
@@ -816,6 +978,19 @@ function feedSessionEvent(session, event) {
     // 晚收养也走同样的年轻会话判定：刚起步的会话值得补锚定，而不是直接只审计。
     rec = adopt(agent, !sessionHasWork(agent), 'session-event-late')
     if (!rec) return
+  }
+  if (event.type === 'request/header' || event.type === 'request/context') {
+    const d = event.data || {}
+    const provider = typeof d.provider === 'string' && d.provider.length > 0
+      ? d.provider
+      : (d.header && d.header.config && d.header.config.provider)
+    if (typeof provider === 'string' && provider.length > 0 && provider !== rec.provider) {
+      rec.provider = provider
+      const r = resolveLexicon(provider)
+      rec.lexicon = r.lexicon
+      rec.lexiconSource = r.source
+      logAudit(rec, 'lexicon-resolved', { provider, source: r.source })
+    }
   }
   if (event.type === 'tool/call') {
     rec.toolCalls += 1
@@ -882,6 +1057,9 @@ function summaryOf(rec) {
     personaRatio: round2(rec.personaRatio),
     percentile: rec.percentile,
     history: rec.ratioHistory.length,
+    provider: rec.provider,
+    lexiconSource: rec.lexiconSource,
+    styleSamples: rec.styleSamples.length,
     machineState: rec.machineState,
     driftSteps: rec.driftSteps,
     rollbackDeny: rec.rollbackDeny,
@@ -942,6 +1120,22 @@ function buildSummary(filter) {
     anchored: anchoredCount,
     lifted: liftedCount,
     rollbackCount,
+    lexicon: {
+      auto: CONFIG.lexiconAuto,
+      profiles: Object.keys(CONFIG.lexiconProfiles || {}),
+      overrides: Object.keys(lexiconOverrides).map(p => ({
+        provider: p,
+        terms: Object.keys(lexiconOverrides[p].positive || {}).length
+          + Object.keys(lexiconOverrides[p].negative || {}).length
+          + Object.keys(lexiconOverrides[p].neutral || {}).length,
+      })),
+      ledger: Object.keys(lexiconLedger).map(p => ({
+        provider: p,
+        sessions: lexiconLedger[p].sessions,
+        chars: lexiconLedger[p].chars,
+        samples: lexiconLedger[p].samples.length,
+      })),
+    },
     channelStats,
     waterfallAgentRequest,
     waterfallPreStep,
@@ -962,11 +1156,15 @@ function mergeConfig(config) {
 
 export function apply(ctx, config) {
   mergeConfig(config)
+  // 默认 DS 词典登记为 deepseek-official 的内置 profile：
+  // DS 会话走 profile（不进自动标定账本），未知 provider 走 default（积累样本）。
+  if (!CONFIG.lexiconProfiles['deepseek-official']) CONFIG.lexiconProfiles['deepseek-official'] = CONFIG.lexicon
   agentsSvc = ctx.get('agents')
   fsSvc = ctx.get('fs')
   spSvc = ctx.get('sandboxPolicy')
 
   if (spSvc && typeof spSvc.workspaceRoot === 'string' && spSvc.workspaceRoot.length > 0) baseDir = spSvc.workspaceRoot
+  loadLexiconState()
 
   // ---- guaranteed perception channel ----
   disposers.push(ctx.on('internal/dispatch', (type, name, args, thisArg) => {
@@ -1096,7 +1294,7 @@ export function apply(ctx, config) {
       description: 'Read the live audit state of the dsh-trajectory-anchor plugin: adopted/anchored agents, '
         + 'bootstrap tool allow-lists, promotion-gate state, bootstrap context suppression, lexicon-weighted trajectory '
         + 'scores (ratio / persona-ratio bands / baseline percentile), drift-rollback state, counterfactual candidates, '
-        + 'reward annotations, and event-channel reachability.',
+        + 'reward annotations, per-provider lexicon resolution, auto-calibration ledger, and event-channel reachability.',
       parameters: {
         type: 'object',
         properties: {
