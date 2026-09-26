@@ -45,12 +45,13 @@ Restart DSH. The plugin mounts on the host plane: it adopts all live agents at s
 
 装完即用，零手动配置：`dsh plugin add github:ggfgfgf-on/dsh-trajectory-anchor` 之后重启 DSH 即可。
 
-- **DeepSeek 系模型**：开箱即用（内置 DS 词典）。
-- **其他模型**：前几个会话先用默认词典计分，插件在后台自动积累该模型的风格样本；
-  攒够下限（3 个会话 / 至少约 4 万字符）后，插件按该模型自己的风格特点判断语料是否足够
-  （词表集中度目标 + 稳定性验收），够了就**自动生成该模型的专属词典并立即生效**，
-  之后所有会话自动沿用（跨重启持久化，无需任何操作）。
-- **看状态**：随时调用 `anchor_status` 工具，`lexicon` 块里有每个模型的标定进度与生效词典。
+- **每个模型独立判断**（按模型名，不是供应商——同一供应商会代售多个厂商的模型）：
+  每个会话开头插件先用默认 DS 词典，并自动探测**这个词典读不读得懂该模型**——
+  读得懂就一直用，什么都不发生；读不懂（标记命中率低 / 比率分不开）才在后台攒样本，
+  攒够后**自动生成该模型的专属词典并立即生效**，之后所有会话自动沿用
+  （跨重启持久化，无需任何操作）。
+- **看状态**：随时调用 `anchor_status` 工具，`lexicon` 块里有每个模型的
+  拟合探测结果与标定进度。
 
 ## Lifecycle
 
@@ -85,8 +86,8 @@ agent/disposed: RewardAnnotator process reward + trajectory JSONL final archive
 | `maxBootstrapSteps` | `5` | gate fallback |
 | `suppressContextOnBootstrap` | `true` | agent-scope context suppression during bootstrap |
 | `lexicon` / `ratioWeights` | monitor-calibrated | weighted lexicon scoring (we/let's/we'll/"we need"/our vs "let me"; neutral i will/i'll/i need/check/verify) |
-| `lexiconProfiles` | `{}` (`deepseek-official` pre-seeded with the DS lexicon) | per-provider built-in dictionaries; pre-seed a known model to skip the auto-calibration wait |
-| `lexiconAuto` | enabled; floor 3 sessions / 40k chars, cap 160k, stability 0.6 | unknown-provider auto-calibration (detect → sample → adaptive target → stability-gated calibrate → apply); see "Lexicon calibration" below |
+| `lexiconProfiles` | `{}` | per-model built-in dictionaries, keyed by model name (not provider); pre-seed a known model to skip the auto-calibration wait |
+| `lexiconAuto` | enabled; probe at session start; floor 3 sessions / 40k chars, cap 160k, stability 0.6 | fit probe → (mismatch only) sample → adaptive target → stability-gated calibrate → apply; see "Lexicon calibration" below |
 | `specMax` / `reactMin` | `0.2` / `0.5` | persona_ratio band boundaries (spec/mixed/react) |
 | `baselineMinSamples` / `rollbackPercentile` | `10` / `25` | **baseline-relative drift**: rollback only fires when the current ratio's percentile within the session's own history is < 25 |
 | `rollbackEnabled` | `true` | calibrated rollback switch (safe to enable under baseline-relative semantics) |
@@ -145,21 +146,32 @@ natural baseline style is let-me).
 | recency-position bias correction + per-round throttling | `@max-null/dsh-allostasis` |
 | decision-round / execution-round decoupling | `we-need-ds` |
 
-## Lexicon calibration (per-provider dictionaries, automatic)
+## Lexicon calibration (per-model dictionaries, automatic)
 
 The default lexicon (we/let's/"we need"/our vs "let me") is calibrated on DeepSeek-style
 reasoning; other models need their own marker words. The plugin handles this **without any
 manual steps**:
 
-1. **Detect** — every session reports its model provider (request/header events), so the plugin
-   knows which model is talking.
-2. **Resolve** — per-provider dictionaries resolve in order: auto-calibrated override >
-   built-in profile (`lexiconProfiles`; `deepseek-official` ships pre-seeded with the default DS
-   lexicon) > default DS lexicon.
-3. **Sample** — while a provider without a built-in dictionary is speaking, the plugin quietly
-   accumulates style samples: reasoning text + the session's own baseline percentile (a
-   model-agnostic quality signal — not DS-lexicon scores, so no circular bias).
-4. **Calibrate** — "how much corpus is enough" is not a fixed number and not "the more the
+1. **Detect** — every session reports its model name (request/header events), so the plugin
+   knows which *model* is talking. Dictionaries are keyed by model name, never by provider:
+   one provider (e.g. Huoshan/Volcano) resells many vendors' models, and their styles cannot
+   share a lexicon. The provider is only used as a fallback identifier when the model name is
+   missing.
+2. **Resolve** — per-model dictionaries resolve in order: auto-calibrated override >
+   built-in profile (`lexiconProfiles`, keyed by model name) > default DS lexicon.
+3. **Probe fit at session start** — before doing anything, the plugin checks whether the
+   active lexicon can actually read this model: it scores the first few natural reasoning
+   blocks (post-lift for anchored sessions — the bootstrap phase is persona-primed, not the
+   model's own style) and measures **marker hit rate** (do the lexicon's terms appear at all?)
+   plus **ratio spread** (can the lexicon separate planning-style from reactive-style blocks?).
+   - Fits (e.g. DS lexicon on a DeepSeek model: hit rate ≈1, ratio CV ≈0.8) → keep using it,
+     nothing else happens.
+   - Does not fit (e.g. DS lexicon on Doubao-style Chinese reasoning: hit rate ≈0) →
+     `lexicon-mismatch` is logged and the auto-calibration flow below kicks in.
+4. **Sample** — only for a mismatched model, the plugin quietly accumulates style samples:
+   reasoning text + the session's own baseline percentile (a model-agnostic quality signal —
+   not DS-lexicon scores, so no circular bias).
+5. **Calibrate** — "how much corpus is enough" is not a fixed number and not "the more the
    better"; it is decided per model in three steps:
    - **Floor** (`minSessions` + `minChars`): enough sessions/tasks that task vocabulary cannot
      dominate the contrast (the known single-session contamination trap).
@@ -174,7 +186,7 @@ manual steps**:
      `maxChars` cap, after which every new session re-tests stability. Measured on synthetic
      corpora: thin (10+10) splits agree at ~0.6, thick (200+200) at ~0.9 — the gate fires where
      it should.
-5. **Apply** — the derived lexicon is active immediately for that provider and persisted to
+6. **Apply** — the derived lexicon is active immediately for that model and persisted to
    `<logDir>/lexicon-state.json` (survives restarts; the ledger keeps accumulating).
 
 Adaptive target formula: `target = minChars × (1 + (1 − C) × concentrationScale)`, clamped to
@@ -182,19 +194,22 @@ Adaptive target formula: `target = minChars × (1 + (1 − C) × concentrationSc
 concentration). Defaults: 3 sessions / 40k chars floor, 160k cap, scale 0.5, stability 0.6.
 
 Auto-calibration knobs (all under `lexiconAuto`, patchable in cordis.patch.yml): `enabled`
-(default `true`), `minSessions` (3), `minChars` (40000), `maxChars` (160000),
-`concentrationScale` (0.5), `minStability` (0.6), `percentileHigh` / `percentileLow` (75/25),
-`minFreq` (5), `top` (60). Progress is audited per provider (`lexicon-resolved` /
+(default `true`), fit probe (`probeMaxBlocks` 8 / `probeMinChars` 2500 / `probeMinBlocks` 3 /
+`probeMinHitRate` 0.25 / `probeMinSignalBlocks` 3 / `probeMinRatioSpread` 0.15), `minSessions`
+(3), `minChars` (40000), `maxChars` (160000), `concentrationScale` (0.5), `minStability`
+(0.6), `percentileHigh` / `percentileLow` (75/25), `minFreq` (5), `top` (60). Progress is
+audited per model (`lexicon-resolved` / `lexicon-fit` / `lexicon-mismatch` /
 `lexicon-auto-progress` / `lexicon-auto-target` / `lexicon-auto-pending` /
 `lexicon-calibrated` events) and visible in the `anchor_status` tool's `lexicon` block
-(target chars, concentration, last split-half stability per provider).
+(target chars, concentration, last split-half stability per model).
 
-**Pre-seed a known dictionary** (skip the waiting period) via `lexiconProfiles` in the patch:
+**Pre-seed a known dictionary** (skip the probe waiting period) via `lexiconProfiles` in the
+patch — keyed by model name:
 
 ```yaml
 config:
   lexiconProfiles:
-    huoshan: { positive: { '终验': 2 }, negative: {}, neutral: {} }
+    ark-code-latest: { positive: { '终验': 2 }, negative: {}, neutral: {} }
 ```
 
 **Manual CLI calibration** (research / one-off corpora) still works, now sharing the same

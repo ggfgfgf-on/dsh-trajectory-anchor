@@ -55,18 +55,26 @@ const DEFAULTS = {
     negative: { 'let me': 3 },
     neutral: { 'i will': 1, "i'll": 1, 'i need': 0.8, check: 0.4, verify: 0.4 },
   },
-  // 每-provider 内置词典。apply 时自动把默认 DS 词典登记为 deepseek-official 的
-  // profile；用户可在 patch 里预置其他模型的词典，例如
-  // { huoshan: { positive: { '终验': 2 }, negative: {...}, neutral: {...} } }。
+  // 每-模型 内置词典，键 = 模型名（不是供应商：同一供应商会代售多个厂商的模型，
+  // 风格各不相同）。用户可在 patch 里预置已知模型的词典，例如
+  // { 'ark-code-latest': { positive: { '终验': 2 }, negative: {...}, neutral: {...} } }。
   lexiconProfiles: {},
-  // 未知模型自动标定：按 provider 积累风格样本（文本 + 会话内基准百分位）。
-  // 「攒够多少」不是固定值，而是四段式：
+  // 未知模型自动标定：按模型（model，缺失时退 provider）积累风格样本
+  // （文本 + 会话内基准百分位）。「攒够多少」不是固定值，而是四段式：
   //   下限 minSessions/minChars（保障跨任务覆盖）→
   //   自适应目标（按该模型词表集中度放大/缩小）→
   //   稳定性验收（split-half 词典一致才算够，不够自动加量）→
   //   上限 maxChars（封顶后等新会话复检，保证总会收敛）。
   lexiconAuto: {
     enabled: true,
+    // 开头适配探测：每个会话开头用当前词典对该模型前几段推理做拟合检测
+    // （标记命中率 + 比率离散度）。读得懂就沿用，读不懂才攒样本自动标定。
+    probeMaxBlocks: 8,
+    probeMinChars: 2500,
+    probeMinBlocks: 3,
+    probeMinHitRate: 0.25,
+    probeMinSignalBlocks: 3,
+    probeMinRatioSpread: 0.15,
     minSessions: 3,
     minChars: 40000,
     maxChars: 160000,
@@ -138,8 +146,8 @@ let waterfallPreStep = 0
 let listAtApply = { length: -1, error: null }
 let initiatorSessionId = null
 const lateLookupDenied = new Set()
-const lexiconOverrides = {} // provider -> { positive, negative, neutral }（自动标定产物，跨重启持久化）
-const lexiconLedger = {} // provider -> { sessions, chars, samples: [{text, percentile}] }
+const lexiconOverrides = {} // model -> { positive, negative, neutral }（自动标定产物，跨重启持久化）
+const lexiconLedger = {} // model -> { sessions, chars, samples: [{text, percentile}] }
 
 function msg(error) {
   try {
@@ -291,26 +299,91 @@ function flagsOf(texts, lexicon) {
   return flags
 }
 
-/** 按 provider 选词典：自动标定产物 > 内置/patch profile > 默认 DS 词典。 */
-function resolveLexicon(provider) {
-  if (typeof provider === 'string' && provider.length > 0) {
-    if (lexiconOverrides[provider]) return { lexicon: lexiconOverrides[provider], source: 'auto' }
-    if (CONFIG.lexiconProfiles && CONFIG.lexiconProfiles[provider]) return { lexicon: CONFIG.lexiconProfiles[provider], source: 'profile' }
+/** 按模型选词典：自动标定产物 > 内置/patch profile > 默认 DS 词典。
+ *  键 = 模型名（供应商只是网关，不同模型风格各异，不能混在一个词典里）。 */
+function resolveLexicon(modelKey) {
+  if (typeof modelKey === 'string' && modelKey.length > 0) {
+    if (lexiconOverrides[modelKey]) return { lexicon: lexiconOverrides[modelKey], source: 'auto' }
+    if (CONFIG.lexiconProfiles && CONFIG.lexiconProfiles[modelKey]) return { lexicon: CONFIG.lexiconProfiles[modelKey], source: 'profile' }
   }
   return { lexicon: CONFIG.lexicon, source: 'default' }
 }
 
-/** 未知 provider（无内置词典）的风格样本积累：只收集 (文本, 会话内基准百分位)，
- *  百分位是模型无关信号——高分样本=该模型自己的"锚定风"，低分=自己的"漂移风"。 */
+/** 风格样本积累：探测未判「匹配」且非 auto 词典的模型都先攒着
+ *  （探测期样本在判定为匹配时丢弃，判定为不匹配时保留进账本）。 */
 function sampleStyle(rec, texts) {
   const auto = CONFIG.lexiconAuto
   if (!auto || auto.enabled === false) return
-  if (typeof rec.provider !== 'string' || rec.provider.length === 0) return
-  if (rec.lexiconSource !== 'default') return
+  if (typeof rec.modelKey !== 'string' || rec.modelKey.length === 0) return
+  if (rec.lexiconSource === 'auto') return
+  if (rec.lexiconMismatch === false) return
   const joined = texts.join('\n')
   if (joined.length < 40) return
   rec.styleSamples.push({ text: joined, percentile: rec.percentile })
   if (rec.styleSamples.length > 400) rec.styleSamples.shift()
+}
+
+// ---------- 开头适配探测：当前词典读得懂这个模型吗？ ----------
+
+function newProbe() {
+  return { blocks: 0, chars: 0, signalBlocks: 0, ratios: [] }
+}
+
+/** 探测只吃「自然风格」：锚定会话在 lift 之后才开始，因为 bootstrap 期
+ *  是 Minimal persona 强灌的 we 风格，不能代表模型本色。 */
+function probeFeed(rec, texts, flags) {
+  const auto = CONFIG.lexiconAuto
+  if (!auto || auto.enabled === false) return
+  if (rec.lexiconMismatch !== null) return
+  if (typeof rec.modelKey !== 'string' || rec.modelKey.length === 0) return
+  if (rec.lexiconSource === 'auto') return
+  if (rec.anchored && !rec.lifted) return
+  if (!Array.isArray(flags) || flags.length === 0) return
+  const p = rec.probe
+  const maxBlocks = typeof auto.probeMaxBlocks === 'number' ? auto.probeMaxBlocks : 8
+  const minChars = typeof auto.probeMinChars === 'number' ? auto.probeMinChars : 2500
+  for (let i = 0; i < flags.length; i++) {
+    if (p.blocks >= maxBlocks || p.chars >= minChars) break
+    const f = flags[i]
+    p.blocks += 1
+    p.chars += (texts[i] || '').length
+    const signal = f.positive + f.neutral + f.negative
+    if (signal > 0) {
+      p.signalBlocks += 1
+      p.ratios.push(weightedRatio(f))
+    }
+  }
+  if (p.blocks >= maxBlocks || p.chars >= minChars) evaluateProbe(rec)
+}
+
+/** 拟合判定：标记命中率（词典词条在推理里出现得多不多）× 比率离散度
+ *  （词典能否把不同推理块区分开——ark 那种窄比率就是读不懂的信号）。
+ *  不匹配才进自动标定账本；匹配则一直用当前词典。 */
+function evaluateProbe(rec) {
+  if (rec.lexiconMismatch !== null) return
+  const p = rec.probe
+  const auto = CONFIG.lexiconAuto
+  const minBlocks = typeof auto.probeMinBlocks === 'number' ? auto.probeMinBlocks : 3
+  if (!p || p.blocks < minBlocks) return
+  const hitRate = p.signalBlocks / p.blocks
+  const minHitRate = typeof auto.probeMinHitRate === 'number' ? auto.probeMinHitRate : 0.25
+  const minSignalBlocks = typeof auto.probeMinSignalBlocks === 'number' ? auto.probeMinSignalBlocks : 3
+  const minRatioSpread = typeof auto.probeMinRatioSpread === 'number' ? auto.probeMinRatioSpread : 0.15
+  let cv = 0
+  if (p.ratios.length >= 2) {
+    const mean = p.ratios.reduce((a, b) => a + b, 0) / p.ratios.length
+    const variance = p.ratios.reduce((a, b) => a + (b - mean) * (b - mean), 0) / p.ratios.length
+    cv = mean === 0 ? 0 : Math.sqrt(variance) / mean
+  }
+  rec.lexiconMismatch = hitRate < minHitRate || p.signalBlocks < minSignalBlocks || cv < minRatioSpread
+  const probe = { model: rec.model, provider: rec.provider, key: rec.modelKey, blocks: p.blocks, hitRate: Math.round(hitRate * 1000) / 1000, signalBlocks: p.signalBlocks, ratioCV: Math.round(cv * 1000) / 1000 }
+  if (rec.lexiconMismatch) {
+    rec.lexiconSource = 'mismatch'
+    logAudit(rec, 'lexicon-mismatch', { ...probe, hint: 'active lexicon cannot read this model style; collecting samples for auto-calibration' })
+  } else {
+    rec.styleSamples = [] // 词典匹配：探测期样本作废，不进账本
+    logAudit(rec, 'lexicon-fit', { ...probe, hint: 'active lexicon fits this model; no auto-calibration' })
+  }
 }
 
 // ---------- per-provider auto lexicon lifecycle ----------
@@ -441,18 +514,18 @@ function stabilityOf(L, auto) {
   }
 }
 
-/** 会话关闭时并入账本；语料达到自适应目标且通过稳定性验收就自动出词典、
- *  立即生效并落盘。只对无内置词典的 provider 生效
- *  （deepseek-official 走 profile，永远不进账本）。 */
+/** 会话关闭时：开头探测判为「词典读不懂该模型」才把本会话样本并入账本；
+ *  语料达到自适应目标且通过稳定性验收就自动出词典、立即生效并落盘。 */
 function maybeAutoCalibrate(rec) {
   const auto = CONFIG.lexiconAuto
   if (!auto || auto.enabled === false) return
-  const provider = rec.provider
-  if (typeof provider !== 'string' || provider.length === 0) return
-  if (lexiconOverrides[provider] || (CONFIG.lexiconProfiles && CONFIG.lexiconProfiles[provider])) return
-  if (rec.countedProvider === provider) return
-  rec.countedProvider = provider
-  const L = (lexiconLedger[provider] = lexiconLedger[provider] || { sessions: 0, chars: 0, samples: [] })
+  if (rec.lexiconMismatch !== true) return
+  const modelKey = rec.modelKey
+  if (typeof modelKey !== 'string' || modelKey.length === 0) return
+  if (lexiconOverrides[modelKey] || (CONFIG.lexiconProfiles && CONFIG.lexiconProfiles[modelKey])) return
+  if (rec.countedModel === modelKey) return
+  rec.countedModel = modelKey
+  const L = (lexiconLedger[modelKey] = lexiconLedger[modelKey] || { sessions: 0, chars: 0, samples: [] })
   L.sessions += 1
   let chars = 0
   for (const s of rec.styleSamples) {
@@ -466,7 +539,7 @@ function maybeAutoCalibrate(rec) {
   const minChars = typeof auto.minChars === 'number' ? auto.minChars : 40000
   const maxChars = typeof auto.maxChars === 'number' ? auto.maxChars : 160000
   if (L.sessions < minSessions || L.chars < minChars) {
-    logAudit(rec, 'lexicon-auto-progress', { provider, sessions: L.sessions, chars: L.chars, samples: L.samples.length })
+    logAudit(rec, 'lexicon-auto-progress', { model: rec.model, provider: rec.provider, key: modelKey, sessions: L.sessions, chars: L.chars, samples: L.samples.length })
     return
   }
   // 自适应目标：按该模型词表集中度计算（只算一次并随账本持久化展示）
@@ -474,10 +547,10 @@ function maybeAutoCalibrate(rec) {
     const est = autoTargetChars(L, auto)
     L.targetChars = est ? est.target : maxChars
     L.concentration = est ? est.C : null
-    logAudit(rec, 'lexicon-auto-target', { provider, targetChars: L.targetChars, concentration: L.concentration })
+    logAudit(rec, 'lexicon-auto-target', { key: modelKey, targetChars: L.targetChars, concentration: L.concentration })
   }
   if (L.chars < L.targetChars) {
-    logAudit(rec, 'lexicon-auto-progress', { provider, sessions: L.sessions, chars: L.chars, targetChars: L.targetChars, samples: L.samples.length })
+    logAudit(rec, 'lexicon-auto-progress', { key: modelKey, sessions: L.sessions, chars: L.chars, targetChars: L.targetChars, samples: L.samples.length })
     return
   }
   // 达到目标量 → 稳定性验收；不稳就自动把目标上调 1.5×（封顶 maxChars），继续攒
@@ -485,15 +558,15 @@ function maybeAutoCalibrate(rec) {
   if (!st.stable) {
     L.lastStability = { jaccard: st.jaccard, weightAgree: st.weightAgree }
     if (st.anchored < 20 || st.drifted < 20) {
-      logAudit(rec, 'lexicon-auto-pending', { provider, reason: 'insufficient contrast samples', anchored: st.anchored, drifted: st.drifted })
+      logAudit(rec, 'lexicon-auto-pending', { key: modelKey, reason: 'insufficient contrast samples', anchored: st.anchored, drifted: st.drifted })
       return
     }
     if (L.targetChars >= maxChars && L.chars >= maxChars) {
-      logAudit(rec, 'lexicon-auto-pending', { provider, reason: 'unstable at cap, waiting for more sessions', jaccard: st.jaccard, weightAgree: st.weightAgree })
+      logAudit(rec, 'lexicon-auto-pending', { key: modelKey, reason: 'unstable at cap, waiting for more sessions', jaccard: st.jaccard, weightAgree: st.weightAgree })
       return
     }
     L.targetChars = Math.min(maxChars, Math.round(L.targetChars * 1.5))
-    logAudit(rec, 'lexicon-auto-pending', { provider, reason: 'corpus not yet stable', jaccard: st.jaccard, weightAgree: st.weightAgree, nextTargetChars: L.targetChars })
+    logAudit(rec, 'lexicon-auto-pending', { key: modelKey, reason: 'corpus not yet stable', jaccard: st.jaccard, weightAgree: st.weightAgree, nextTargetChars: L.targetChars })
     return
   }
   const anchored = []
@@ -506,18 +579,20 @@ function maybeAutoCalibrate(rec) {
   try {
     rows = contrastPolarity(anchored, drifted, typeof auto.minFreq === 'number' ? auto.minFreq : 5, typeof auto.top === 'number' ? auto.top : 60)
   } catch (e) {
-    logAudit(rec, 'lexicon-auto-error', { provider, error: msg(e) })
+    logAudit(rec, 'lexicon-auto-error', { key: modelKey, error: msg(e) })
     return
   }
   if (!rows || rows.length === 0) {
-    logAudit(rec, 'lexicon-auto-pending', { provider, reason: 'no contrast terms' })
+    logAudit(rec, 'lexicon-auto-pending', { key: modelKey, reason: 'no contrast terms' })
     return
   }
   const lexicon = rowsToLexicon(rows)
-  lexiconOverrides[provider] = lexicon
+  lexiconOverrides[modelKey] = lexicon
   saveLexiconState()
   logAudit(rec, 'lexicon-calibrated', {
-    provider,
+    model: rec.model,
+    provider: rec.provider,
+    key: modelKey,
     sessions: L.sessions,
     chars: L.chars,
     targetChars: L.targetChars,
@@ -597,11 +672,14 @@ function recompute(rec, agent) {
 }
 
 function updateWindow(rec, texts, agent) {
+  let flags = null
   if (texts.length > 0) {
-    rec.lastMessages.push({ flags: flagsOf(texts, rec.lexicon) })
+    flags = flagsOf(texts, rec.lexicon)
+    rec.lastMessages.push({ flags })
     while (rec.lastMessages.length > CONFIG.trajectoryWindowSize) rec.lastMessages.shift()
   }
   recompute(rec, agent)
+  probeFeed(rec, texts, flags)
   sampleStyle(rec, texts)
 }
 
@@ -949,6 +1027,7 @@ function closeRec(rec, reason) {
     rec.counterfactual = null
   }
   annotateReward(rec)
+  evaluateProbe(rec) // 短会话：探测窗口没满也在关闭时收尾判定
   maybeAutoCalibrate(rec)
   rec.closed = true
   logAudit(rec, 'closed', { reason })
@@ -1041,8 +1120,12 @@ function adopt(agent, doAnchor, channel) {
     skillCatalogSeen: false,
     sourceKinds: {},
     provider: null,
+    model: null,
+    modelKey: null,
     lexicon: CONFIG.lexicon,
     lexiconSource: 'default',
+    lexiconMismatch: null,
+    probe: newProbe(),
     styleSamples: [],
     contextSuppressed: false,
     contextSuppressedAt: null,
@@ -1096,12 +1179,23 @@ function feedSessionEvent(session, event) {
     const provider = typeof d.provider === 'string' && d.provider.length > 0
       ? d.provider
       : (d.header && d.header.config && d.header.config.provider)
-    if (typeof provider === 'string' && provider.length > 0 && provider !== rec.provider) {
-      rec.provider = provider
-      const r = resolveLexicon(provider)
+    const model = typeof d.model === 'string' && d.model.length > 0
+      ? d.model
+      : (d.header && d.header.config && d.header.config.model)
+    // 词典键 = 模型名；模型名缺失时才退供应商名兜底（同一供应商代售多种模型，风格不可混）。
+    const modelKey = typeof model === 'string' && model.length > 0 ? model : provider
+    if (typeof modelKey === 'string' && modelKey.length > 0 && modelKey !== rec.modelKey) {
+      if (typeof provider === 'string' && provider.length > 0) rec.provider = provider
+      if (typeof model === 'string' && model.length > 0) rec.model = model
+      rec.modelKey = modelKey
+      // 模型换了 → 词典、探测、样本全部重置（旧样本的百分位是旧词典算的，不能混用）
+      rec.probe = newProbe()
+      rec.lexiconMismatch = null
+      rec.styleSamples = []
+      const r = resolveLexicon(modelKey)
       rec.lexicon = r.lexicon
       rec.lexiconSource = r.source
-      logAudit(rec, 'lexicon-resolved', { provider, source: r.source })
+      logAudit(rec, 'lexicon-resolved', { model: rec.model, provider: rec.provider, key: modelKey, source: r.source })
     }
   }
   if (event.type === 'tool/call') {
@@ -1170,7 +1264,11 @@ function summaryOf(rec) {
     percentile: rec.percentile,
     history: rec.ratioHistory.length,
     provider: rec.provider,
+    model: rec.model,
+    modelKey: rec.modelKey,
     lexiconSource: rec.lexiconSource,
+    lexiconMismatch: rec.lexiconMismatch,
+    probeBlocks: rec.probe ? rec.probe.blocks : 0,
     styleSamples: rec.styleSamples.length,
     machineState: rec.machineState,
     driftSteps: rec.driftSteps,
@@ -1271,9 +1369,6 @@ function mergeConfig(config) {
 
 export function apply(ctx, config) {
   mergeConfig(config)
-  // 默认 DS 词典登记为 deepseek-official 的内置 profile：
-  // DS 会话走 profile（不进自动标定账本），未知 provider 走 default（积累样本）。
-  if (!CONFIG.lexiconProfiles['deepseek-official']) CONFIG.lexiconProfiles['deepseek-official'] = CONFIG.lexicon
   agentsSvc = ctx.get('agents')
   fsSvc = ctx.get('fs')
   spSvc = ctx.get('sandboxPolicy')
@@ -1409,7 +1504,8 @@ export function apply(ctx, config) {
       description: 'Read the live audit state of the dsh-trajectory-anchor plugin: adopted/anchored agents, '
         + 'bootstrap tool allow-lists, promotion-gate state, bootstrap context suppression, lexicon-weighted trajectory '
         + 'scores (ratio / persona-ratio bands / baseline percentile), drift-rollback state, counterfactual candidates, '
-        + 'reward annotations, per-provider lexicon resolution, auto-calibration ledger, and event-channel reachability.',
+        + 'reward annotations, per-model lexicon resolution with start-of-session fit probe, '
+        + 'auto-calibration ledger, and event-channel reachability.',
       parameters: {
         type: 'object',
         properties: {
