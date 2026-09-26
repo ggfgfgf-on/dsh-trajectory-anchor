@@ -9,16 +9,23 @@
  *
  * 与 Layer-4 衔接：这些会话导出的 layer4 训练样本从此携带真实质量标签。
  *
- * 用法:
- *   node tools/calibrate-from-scores.mjs
- *     --results DIR        评测结果根目录（含每轮 score_draft.json 的子目录，必填）
- *     --sessions DIR       DSH 会话日志根目录（递归找 session.jsonl.zstd，必填）
- *     [--model NAME]       只标定该模型（按会话日志里的 request/header model 过滤）
- *     [--high N]           高分线（默认 95）
- *     [--low N]            低分线（默认 90）
- *     [--min-freq N]       contrast 硬下限（默认 5；低于该值走 Fisher 显著检验）
- *     [--top N]            词典词条上限（默认 60）
- *     [--out PREFIX]       输出前缀（默认 ./lexicon-score）
+ * 用法（二选一）:
+ *   通用标签模式（高级用户：自带语料、自选任务、自给总分）:
+ *     node tools/calibrate-from-scores.mjs --labels <labels.json> [--high 95] [--low 90] [--out PREFIX]
+ *       labels.json 形式 A: [{ "corpus": "路径", "score": 100, "label": "可选注释" }, ...]
+ *       labels.json 形式 B: { "positive": ["路径", ...], "negative": ["路径", ...] }
+ *       corpus 路径支持：目录（.txt/.md/.jsonl/.zstd 递归）或单文件（含 DSH session.jsonl.zstd）
+ *   Project2 自动模式:
+ *     node tools/calibrate-from-scores.mjs
+ *       --results DIR        评测结果根目录（含每轮 score_draft.json 的子目录，必填）
+ *       --sessions DIR       DSH 会话日志根目录（递归找 session.jsonl.zstd，必填）
+ *       [--model NAME]       只标定该模型（按会话日志里的 request/header model 过滤）
+ *       [--run-group ID]     只取该 run_group_id 的评测轮
+ *       [--high N]           高分线（默认 95）
+ *       [--low N]            低分线（默认 90）
+ *       [--min-freq N]       contrast 硬下限（默认 5；低于该值走 Fisher 显著检验）
+ *       [--top N]            词典词条上限（默认 60）
+ *       [--out PREFIX]       输出前缀（默认 ./lexicon-score）
  *
  * 输出:
  *   <out>.json         监督词典 { positive, negative, neutral } + 拟合的 ratioWeights
@@ -31,7 +38,7 @@
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { join, resolve, basename } from 'node:path'
 import { contrastPolarity, fisherExact } from './lexicon-core.mjs'
-import { decodeSessionLog, walk, textFromRecord } from './session-log-core.mjs'
+import { decodeSessionLog, walk, textFromRecord, collectCorpus } from './session-log-core.mjs'
 
 function arg(name, fallback) {
   const i = process.argv.indexOf(name)
@@ -168,10 +175,16 @@ function fitRatioWeights(lexicon, posTexts, negTexts) {
 }
 
 // ---------- 主流程 ----------
+const labelsPath = arg('--labels', '') ? resolve(arg('--labels', '')) : ''
 const resultsDir = resolve(arg('--results', ''))
 const sessionsDir = resolve(arg('--sessions', ''))
-if (!resultsDir || !sessionsDir) {
-  console.error('用法: node tools/calibrate-from-scores.mjs --results <评测结果目录> --sessions <会话日志目录> [--model NAME] [--high 95] [--low 90] [--out PREFIX]')
+if (!labelsPath && (!resultsDir || !sessionsDir)) {
+  console.error('用法（二选一）:')
+  console.error('  通用标签模式: node tools/calibrate-from-scores.mjs --labels <labels.json> [--high 95] [--low 90] [--out PREFIX]')
+  console.error('     labels.json 形式 A: [{ "corpus": "路径", "score": 100 }, ...]（自选任务自评分）')
+  console.error('     labels.json 形式 B: { "positive": ["路径", ...], "negative": ["路径", ...] }')
+  console.error('     corpus 路径支持：目录（.txt/.md/.jsonl/.zstd 递归）或单文件（含 DSH session.jsonl.zstd）')
+  console.error('  Project2 自动模式: node tools/calibrate-from-scores.mjs --results <评测结果目录> --sessions <会话日志目录> [--model NAME] [--run-group ID] [--high 95] [--low 90] [--out PREFIX]')
   process.exit(1)
 }
 const modelFilter = arg('--model', '')
@@ -182,37 +195,72 @@ const minFreq = Number(arg('--min-freq', '5'))
 const top = Number(arg('--top', '60'))
 const outPrefix = resolve(arg('--out', './lexicon-score'))
 
-let runs = scanRuns(resultsDir)
-if (runGroupFilter) {
-  const before = runs.length
-  runs = runs.filter((r) => r.runGroup === runGroupFilter)
-  console.log(`[scores] run-group 过滤: ${before} -> ${runs.length} (${runGroupFilter})`)
-}
-console.log(`[scores] 评测轮: ${runs.length}`)
-const sessions = scanSessions(sessionsDir, modelFilter)
-console.log(`[scores] 会话日志: ${sessions.length}${modelFilter ? ` (model=${modelFilter})` : ''}`)
-const pairs = matchRuns(sessions, runs)
-console.log(`[scores] 匹配成功: ${pairs.length}`)
-
-const posTexts = []
-const negTexts = []
+let posTexts = []
+let negTexts = []
 const evidence = []
-for (const { run, session, gapMs } of pairs) {
-  const cls = run.ability >= highScore ? 'positive' : run.ability <= lowScore ? 'negative' : 'ignored'
-  const rec = {
-    runDir: basename(run.dir),
-    ability: run.ability,
-    runIndex: run.runIndex,
-    blockers: run.blockers,
-    session: session.sid,
-    model: session.model,
-    texts: session.texts.length,
-    gapMin: Math.round(gapMs / 60000 * 10) / 10,
-    cls,
+let labelMode = false
+
+if (labelsPath) {
+  // 通用标签模式：用户自带语料、自选任务、自给总分
+  labelMode = true
+  let labels
+  try {
+    labels = JSON.parse(readFileSync(labelsPath, 'utf8'))
+  } catch (e) {
+    console.error(`[scores] labels 解析失败: ${e.message}`)
+    process.exit(1)
   }
-  if (cls === 'positive') posTexts.push(...session.texts)
-  else if (cls === 'negative') negTexts.push(...session.texts)
-  evidence.push(rec)
+  const entries = []
+  if (Array.isArray(labels)) {
+    for (const row of labels) {
+      const path = row.corpus || row.path
+      const score = Number(row.score)
+      if (!path || !Number.isFinite(score)) continue
+      entries.push({ path: resolve(path), score, label: row.label || '' })
+    }
+  } else {
+    for (const p of labels.positive || []) entries.push({ path: resolve(p), score: highScore, label: 'positive' })
+    for (const p of labels.negative || []) entries.push({ path: resolve(p), score: lowScore, label: 'negative' })
+  }
+  for (const e of entries) {
+    let texts = []
+    try { texts = collectCorpus(e.path) } catch (err) { console.warn(`[scores] 语料读取失败 ${e.path}: ${err.message}`) }
+    const cls = e.label === 'negative' ? 'negative' : e.score >= highScore ? 'positive' : e.score <= lowScore ? 'negative' : 'ignored'
+    const chars = texts.reduce((n, s) => n + s.length, 0)
+    if (cls === 'positive') posTexts.push(...texts)
+    else if (cls === 'negative') negTexts.push(...texts)
+    evidence.push({ corpus: basename(e.path), path: e.path, score: e.score, texts: texts.length, chars, cls })
+  }
+  console.log(`[scores] 标签条目: ${entries.length}`)
+} else {
+  let runs = scanRuns(resultsDir)
+  if (runGroupFilter) {
+    const before = runs.length
+    runs = runs.filter((r) => r.runGroup === runGroupFilter)
+    console.log(`[scores] run-group 过滤: ${before} -> ${runs.length} (${runGroupFilter})`)
+  }
+  console.log(`[scores] 评测轮: ${runs.length}`)
+  const sessions = scanSessions(sessionsDir, modelFilter)
+  console.log(`[scores] 会话日志: ${sessions.length}${modelFilter ? ` (model=${modelFilter})` : ''}`)
+  const pairs = matchRuns(sessions, runs)
+  console.log(`[scores] 匹配成功: ${pairs.length}`)
+  for (const { run, session, gapMs } of pairs) {
+    const cls = run.ability >= highScore ? 'positive' : run.ability <= lowScore ? 'negative' : 'ignored'
+    const rec = {
+      runDir: basename(run.dir),
+      ability: run.ability,
+      runIndex: run.runIndex,
+      blockers: run.blockers,
+      session: session.sid,
+      model: session.model,
+      texts: session.texts.length,
+      gapMin: Math.round(gapMs / 60000 * 10) / 10,
+      cls,
+    }
+    if (cls === 'positive') posTexts.push(...session.texts)
+    else if (cls === 'negative') negTexts.push(...session.texts)
+    evidence.push(rec)
+  }
 }
 
 const posChars = posTexts.reduce((n, s) => n + s.length, 0)
@@ -235,7 +283,7 @@ if (posTexts.length >= 10 && negTexts.length >= 10) {
 
 const output = {
   generated_utc: new Date().toISOString(),
-  mode: 'score-supervised (基准分数监督标定)',
+  mode: labelMode ? 'score-supervised (用户标签模式：自选语料/任务/总分)' : 'score-supervised (Project2 评测结果自动模式)',
   highScore,
   lowScore,
   positive_texts: posTexts.length,
@@ -256,10 +304,14 @@ lines.push(`- 正语料：${posTexts.length} 块 / ${posChars} 字符；负语�
 lines.push('')
 lines.push('## 逐轮证据')
 lines.push('')
-lines.push('| 结果目录 | 分数 | runIndex | 会话 | 模型 | 文本块 | 归类 |')
-lines.push('|---|---|---|---|---|---|---|')
-for (const e of evidence) {
-  lines.push(`| ${e.runDir} | ${e.ability} | ${e.runIndex ?? '—'} | ${e.session} | ${e.model} | ${e.texts} | ${e.cls} |`)
+if (labelMode) {
+  lines.push('| 语料 | 分数 | 文本块 | 字符 | 归类 |')
+  lines.push('|---|---|---|---|---|')
+  for (const e of evidence) lines.push(`| ${e.corpus} | ${e.score} | ${e.texts} | ${e.chars} | ${e.cls} |`)
+} else {
+  lines.push('| 结果目录 | 分数 | runIndex | 会话 | 模型 | 文本块 | 归类 |')
+  lines.push('|---|---|---|---|---|---|---|')
+  for (const e of evidence) lines.push(`| ${e.runDir} | ${e.ability} | ${e.runIndex ?? '—'} | ${e.session} | ${e.model} | ${e.texts} | ${e.cls} |`)
 }
 lines.push('')
 lines.push('## 监督词典（直接可用）')

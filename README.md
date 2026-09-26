@@ -290,7 +290,20 @@ node tools\calibrate-lexicon.mjs `
 
 **Score-supervised calibration** (advanced users, connects to Layer 4) —
 `tools/calibrate-from-scores.mjs` uses real benchmark scores as supervision, closing the loop
-"run Project2-like tasks → scores label sessions → lexicon + scorer":
+"run Project2-like tasks → scores label sessions → lexicon + scorer". Two modes:
+
+*General labels mode* (any corpus, any task, any overall score):
+
+```powershell
+# labels.json 形式 A：自选任务、自给总分
+#   [ { "corpus": "路径", "score": 100 }, { "corpus": "路径", "score": 86 } ]
+# labels.json 形式 B：直接给正/负两组语料
+#   { "positive": ["路径", ...], "negative": ["路径", ...] }
+# corpus 路径：目录（.txt/.md/.jsonl/.zstd 递归）或单文件（含 DSH session.jsonl.zstd）
+node tools\calibrate-from-scores.mjs --labels .\labels.json --high 95 --low 90 --out .\lexicon-score
+```
+
+*Project2 auto mode* (scans evaluator results and matches candidate sessions):
 
 ```powershell
 node tools\calibrate-from-scores.mjs `
