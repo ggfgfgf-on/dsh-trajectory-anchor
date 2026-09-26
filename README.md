@@ -208,7 +208,14 @@ model tomorrow), so recognition, selection, accumulation and merging are all dri
      an anchored phase that behaves operationally worse than natural output fails the premise.
      These are premise checks on sparse real signals, not full per-block quality validation —
      output *quality* validation would need task scores (available in benchmark runs like
-     Project2, absent in general sessions).
+     Project2, absent in general sessions). v0.6.8 adds the general-session quality proxy:
+     reasoning blocks are linked to the outcomes of the tool calls issued in the same
+     turn/step (exit codes / sandbox denials / structured ok:false), and a freshly calibrated
+     lexicon is only published if its positive-marked blocks carry a LOWER downstream error
+     rate than its negative-marked blocks (`lexicon-outcome-inverted` refuses publication
+     otherwise). Attribution is noisy (a step can hold several tool calls; failures are not
+     always the block's fault) — it validates polarity against real outcomes, not output
+     quality itself.
    - **Low-frequency markers**: terms with total frequency below `minFreq` are only admitted
      when they pass a two-sided Fisher exact test (p<0.05) on the 2×2 frequency table —
      "1 hit in anchored, 0 in drifted" artifacts are rejected (p≈0.5), while genuinely rare

@@ -392,6 +392,46 @@ function probeFits(p, auto) {
 /** 输出说话，名字不说话：候选词典 = 名字提示的 profile（可选）→ 已标定桶 → 默认 DS。
  *  逐个对探测文本做拟合检测，取拟合最好（命中率最高）的那个。
  *  一个都不拟合 → 判 mismatch，攒样本走自动标定。 */
+/** 逐块结果验证：把候选词典给「输出块 → 工具结果」关联重打分，
+ *  正标记块的后续错误率应低于负标记块；反转说明极性标反了。 */
+function outcomeValidates(lexicon, blocks) {
+  let posOk = 0
+  let posErr = 0
+  let negOk = 0
+  let negErr = 0
+  for (const b of blocks) {
+    if (!b || !Array.isArray(b.texts) || b.texts.length === 0) continue
+    const total = (b.ok || 0) + (b.err || 0)
+    if (total === 0) continue
+    let pos = 0
+    let neg = 0
+    for (const t of b.texts) {
+      const f = measureText(t, lexicon)
+      pos += f.positive
+      neg += f.negative
+    }
+    if (pos + neg <= 0) continue
+    if (pos >= neg) {
+      posOk += b.ok || 0
+      posErr += b.err || 0
+    } else {
+      negOk += b.ok || 0
+      negErr += b.err || 0
+    }
+  }
+  const posTotal = posOk + posErr
+  const negTotal = negOk + negErr
+  const posRate = posTotal > 0 ? posErr / posTotal : 0
+  const negRate = negTotal > 0 ? negErr / negTotal : 0
+  return {
+    posBlocks: posTotal,
+    negBlocks: negTotal,
+    posErrRate: Math.round(posRate * 100) / 100,
+    negErrRate: Math.round(negRate * 100) / 100,
+    inverted: posTotal >= 5 && negTotal >= 5 && posRate > negRate + 0.2,
+  }
+}
+
 /** 极性神谕检查：用 bootstrap（锚定阶段）参考块给候选词典验极性。
  *  锚定阶段是已知良好状态；若某词典把这段输出判为负向主导
  *  （负标记总分 > 正标记总分），该词典对此模型的极性就是反的。 */
@@ -811,6 +851,13 @@ function maybeAutoCalibrate(rec) {
     return
   }
   const lexicon = rowsToLexicon(rowsFull)
+  // 结果侧发布门：新词典极性必须与逐块工具结果一致（正标记块错误率应低于负标记块；
+  // 反转说明极性标反了——通用会话里不需要任务分数的逐块质量验证）。
+  const align = outcomeValidates(lexicon, rec.blockOutcomes)
+  if (align.inverted) {
+    logAudit(rec, 'lexicon-outcome-inverted', { bucket: B.id, posBlocks: align.posBlocks, negBlocks: align.negBlocks, posErrRate: align.posErrRate, negErrRate: align.negErrRate, hint: 'new lexicon scores better-outcome blocks negative; refusing to publish, keeping samples for future sessions' })
+    return
+  }
   B.lexicon = lexicon
   B.signature = rowsFull.map(r => r.term)
   B.calibratedAt = Date.now()
@@ -1373,6 +1420,7 @@ function adopt(agent, doAnchor, channel) {
     probe: newProbe(),
     styleSamples: [],
     anchorPhaseTexts: [],
+    blockOutcomes: [],
     contextSuppressed: false,
     contextSuppressedAt: null,
     contextSuppressError: null,
@@ -1502,6 +1550,12 @@ function feedSessionEvent(session, event) {
         rec.postLiftOutcomes = rec.postLiftOutcomes || { ok: 0, err: 0 }
         rec.postLiftOutcomes[outcome] += 1
       }
+      // 逐块结果关联：把成败挂到同 turn/step 的最后一个推理块上，
+      // 形成「输出块 → 结果」的质量代理（通用会话里不需要任务分数）。
+      if (rec.lastBlock && typeof turn === 'number' && typeof step === 'number'
+        && turn === rec.lastBlock.turn && step === rec.lastBlock.step) {
+        rec.lastBlock[outcome] = (rec.lastBlock[outcome] || 0) + 1
+      }
     }
   } else if (event.type === 'assistant/message') {
     rec.messages += 1
@@ -1511,6 +1565,18 @@ function feedSessionEvent(session, event) {
     if (typeof step === 'number') rec.lastStep = step
     const texts = reasoningBlocks(event)
     logAudit(rec, 'assistant-message', { blocks: texts.length, turn, step })
+    // 轮换「输出块 → 结果」关联：旧块归档（上限 100），新块开账
+    if (rec.lastBlock) {
+      if (rec.blockOutcomes.length >= 100) rec.blockOutcomes.shift()
+      rec.blockOutcomes.push(rec.lastBlock)
+    }
+    rec.lastBlock = {
+      turn: typeof turn === 'number' ? turn : null,
+      step: typeof step === 'number' ? step : null,
+      texts: texts.slice(),
+      ok: 0,
+      err: 0,
+    }
     const agent = agentsSvc ? safeGet(agentsSvc, rec.sessionId) : null
     updateWindow(rec, texts, agent || undefined)
     if (CONFIG.gateEnabled && rec.anchored && !rec.lifted && rec.pendingPromote) {
