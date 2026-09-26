@@ -19,6 +19,11 @@
  *     [--top K]          输出候选上限（默认 60）
  *     [--name S]         词典名（默认 corpus 目录名）
  *     [--out PREFIX]     输出路径前缀（默认 ./lexicon-<name>）
+ *     [--trajectory-logs DIR]  自动标注模式 B：用插件自身每步评分（会话自身历史分位）
+ *                              把推理文本切成「锚定风（高分段）/ 漂移风（低分段）」，
+ *                              对比统计直接定极性，输出成品词典（人审降级为可选审计）
+ *     [--percentile-high P]    锚定风分位阈值（默认 75）
+ *     [--percentile-low P]     漂移风分位阈值（默认 25）
  *
  * 诚实边界：统计能自动回答「哪些词是标记」，不能回答「标记是好是坏」——
  * 全部候选极性标为 pending，由人对照证据报告一次性归档（划入
@@ -26,7 +31,7 @@
  * 的 `lexicon:` 配置整体替换默认 DS 词典、长期自动使用。
  */
 import { readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from 'node:fs'
-import { join, resolve, basename } from 'node:path'
+import { join, resolve, basename, dirname } from 'node:path'
 import { zstdDecompressSync } from 'node:zlib'
 
 const ZSTD_MAGIC = 0xfd2fb528
@@ -79,6 +84,13 @@ function decodeSessionLog(path) {
 }
 
 const DS_REFERENCE_TERMS = ['we', "let's", "we'll", 'we need', 'our', 'let me', 'i will', "i'll", 'i need', 'check', 'verify']
+
+const LATIN_STOPWORDS = new Set([
+  'the', 'and', 'of', 'to', 'in', 'is', 'a', 'it', 'for', 'on', 'that', 'this', 'with', 'as', 'are',
+  'was', 'be', 'at', 'by', 'or', 'an', 'not', 'but', 'from', 'we', 'i', 'if', 'then', 'so', 'can',
+  'will', 'would', 'should', 'could', 'have', 'has', 'do', 'does', 'did', 'all', 'any', 'no', 'yes',
+  'also', 'just', 'now', 'here', 'there', 'what', 'which', 'when', 'how', 'why', 'get', 'got',
+])
 
 function arg(name, fallback) {
   const i = process.argv.indexOf(name)
@@ -149,7 +161,7 @@ function ngrams(chunks) {
     }
     const latinRuns = text.match(/[A-Za-z][A-Za-z' -]*/g) ?? []
     for (const run of latinRuns) {
-      const words = run.toLowerCase().split(/[\s-]+/).filter((w) => w.length > 1)
+      const words = run.toLowerCase().split(/[\s-]+/).filter((w) => w.length > 1 && !LATIN_STOPWORDS.has(w))
       for (let i = 0; i < words.length; i++) {
         bump(words[i])
         if (i + 1 < words.length) bump(`${words[i]} ${words[i + 1]}`)
@@ -159,16 +171,157 @@ function ngrams(chunks) {
   return map
 }
 
+// ---------- 自动标注（模式 B）：插件评分 → 锚定风/漂移风样例 ----------
+
+/** 从轨迹目录读取每个代理的 score 行，建 (sessionId#turn:step) → percentile 映射。 */
+function loadStepPercentiles(trajDir) {
+  const map = new Map()
+  let files = []
+  try { files = readdirSync(trajDir) } catch { return map }
+  for (const f of files) {
+    if (!f.startsWith('anchor-') || !f.endsWith('.jsonl')) continue
+    const sid = f.replace(/^anchor-/, '').replace(/\.jsonl$/, '')
+    let text
+    try { text = readFileSync(join(trajDir, f), 'utf8') } catch { continue }
+    let last = null
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue
+      let o
+      try { o = JSON.parse(line) } catch { continue }
+      if (o.kind === 'score') last = o
+      else if ((o.kind === 'assistant-message' || o.kind === 'tool-call') && last && typeof last.percentile === 'number') {
+        map.set(`${sid}#${o.turn}:${o.step}`, last.percentile)
+      }
+    }
+  }
+  return map
+}
+
+/** 从会话日志抽取带 (turn,step) 的推理文本块（reasoning-chunks / assistant-message）。 */
+function stepTexts(path) {
+  const out = []
+  let text
+  try { text = path.endsWith('.zstd') ? decodeSessionLog(path) : readFileSync(path, 'utf8') } catch { return out }
+  // 会话 id 取父目录名（DSH 会话日志位于 <sessionsDir>/<cwd>/<sessionId>/session.jsonl.zstd）
+  const sid = basename(dirname(path))
+  if (sid === '.' || !sid || /^[a-z]:$/i.test(sid)) return out
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue
+    let o
+    try { o = JSON.parse(line) } catch { continue }
+    let t = ''
+    let turn = null, step = null
+    if (o.type === 'reasoning-chunks' && Array.isArray(o.data?.texts)) { t = o.data.texts.join(' '); turn = o.data?.turn; step = o.data?.step }
+    else if (o.type === 'assistant/message') {
+      const c = o.data?.message?.content
+      if (Array.isArray(c)) t = c.filter((b) => b?.type === 'reasoning' || b?.type === 'text').map((b) => b.text ?? '').join(' ')
+      turn = o.data?.turn; step = o.data?.step
+    }
+    if (t && turn !== null && step !== null) out.push({ sid, key: `${sid}#${turn}:${step}`, text: t })
+  }
+  return out
+}
+
+/** 对比统计：某词在锚定组 vs 漂移组的过度表达 → 极性 + log-odds 权重。 */
+function contrastPolarity(anchored, drifted, minFreq, top) {
+  const a = ngrams(anchored)
+  const d = ngrams(drifted)
+  const aN = anchored.reduce((n, s) => n + s.length, 0) || 1
+  const dN = drifted.reduce((n, s) => n + s.length, 0) || 1
+  const rows = []
+  const seen = new Set([...a.keys(), ...d.keys()])
+  for (const term of seen) {
+    const fa = a.get(term) ?? 0
+    const fd = d.get(term) ?? 0
+    if (fa + fd < minFreq) continue
+    const pa = fa / aN
+    const pd = fd / dN
+    const odds = Math.log((pa + 1e-9) / (pd + 1e-9))
+    if (Math.abs(odds) < 0.4) continue
+    rows.push({ term, fa, fd, odds, polarity: odds > 0 ? 'positive' : 'negative' })
+  }
+  rows.sort((x, y) => Math.abs(y.odds) - Math.abs(x.odds))
+  return rows.slice(0, top)
+}
+
+function autoLabeledLexicon(corpusPath, trajDir, name, outPrefix, minFreq, top, pHigh, pLow) {
+  const pct = loadStepPercentiles(trajDir)
+  if (pct.size === 0) { console.error('轨迹目录里没有 score/percentile 数据'); return null }
+  const anchored = []
+  const drifted = []
+  const files = statSync(corpusPath).isDirectory() ? walk(corpusPath, []) : [corpusPath]
+  for (const f of files) {
+    if (!/(\.jsonl)?\.zstd$|\.jsonl$/.test(f)) continue
+    for (const { key, text } of stepTexts(f)) {
+      const p = pct.get(key)
+      if (typeof p !== 'number') continue
+      if (p >= pHigh) anchored.push(text)
+      else if (p <= pLow) drifted.push(text)
+    }
+  }
+  if (anchored.length < 10 || drifted.length < 10) {
+    console.error(`自动标注样本不足：锚定风 ${anchored.length} 块 / 漂移风 ${drifted.length} 块（需要各自 ≥10）`)
+    return null
+  }
+  const rows = contrastPolarity(anchored, drifted, minFreq, top)
+  const lexicon = {
+    provider: name,
+    generated_utc: new Date().toISOString(),
+    mode: 'auto-labeled (插件自身历史分位对比统计)',
+    anchored_samples: anchored.length,
+    drifted_samples: drifted.length,
+    percentile_high: pHigh,
+    percentile_low: pLow,
+    positive: {},
+    negative: {},
+    neutral: {},
+    pending: {},
+  }
+  for (const r of rows) {
+    const w = Math.min(3.0, Math.max(0.5, Math.round(Math.abs(r.odds) * 10) / 10))
+    lexicon[r.polarity][r.term] = Number(w.toFixed(1))
+  }
+  const lines = []
+  lines.push(`# 词典标定报告（自动标注）：${name}`)
+  lines.push('')
+  lines.push(`- 标注信号：插件每步评分的会话自身历史分位（模型无关；≥${pHigh}=锚定风，≤${pLow}=漂移风）`)
+  lines.push(`- 样本量：锚定风 ${anchored.length} 块 / 漂移风 ${drifted.length} 块`)
+  lines.push(`- 极性：对比统计 log-odds（锚定组过度表达→positive，漂移组→negative）；权重=|log-odds| 截断到 [0.5,3]`)
+  lines.push('')
+  lines.push('| 词 | 锚定频 | 漂移频 | log-odds | 极性 | 权重 |')
+  lines.push('|---|---|---|---|---|---|')
+  for (const r of rows) {
+    lines.push(`| ${r.term} | ${r.fa} | ${r.fd} | ${r.odds.toFixed(2)} | ${r.polarity} | ${lexicon[r.polarity][r.term]} |`)
+  }
+  lines.push('')
+  lines.push('> 全自动输出，人审可选：抽查上表即可；词典已可直接贴入 cordis.patch.yml 的 lexicon: 键。')
+  writeFileSync(`${outPrefix}.json`, JSON.stringify(lexicon, null, 2), 'utf8')
+  writeFileSync(`${outPrefix}-report.md`, lines.join('\n'), 'utf8')
+  console.log(`[calibrate] 自动标注：锚定风 ${anchored.length} 块 / 漂移风 ${drifted.length} 块`)
+  console.log(`[calibrate] 词典（已定极性）: ${outPrefix}.json`)
+  console.log(`[calibrate] 证据报告 : ${outPrefix}-report.md`)
+  console.log(`[calibrate] Top 10:`)
+  for (const r of rows.slice(0, 10)) console.log(`  ${r.polarity === 'positive' ? '+' : '-'} ${r.term}  odds=${r.odds.toFixed(2)}`)
+  return lexicon
+}
+
 // ---------- 主流程 ----------
 function main() {
   const corpusPath = resolve(arg('--corpus', ''))
   if (!corpusPath) { console.error('需要 --corpus（目标模型推理文本目录或文件）'); process.exit(1) }
+  const name = arg('--name', basename(corpusPath).replace(/\.[^.]+$/, '') || 'model')
+  const outPrefix = resolve(arg('--out', `./lexicon-${name}`))
+  const trajDir = arg('--trajectory-logs', '') ? resolve(arg('--trajectory-logs', '')) : null
+  if (trajDir) {
+    const pHigh = Number(arg('--percentile-high', '75'))
+    const pLow = Number(arg('--percentile-low', '25'))
+    const r = autoLabeledLexicon(corpusPath, trajDir, name, outPrefix, Number(arg('--min-freq', '20')), Number(arg('--top', '60')), pHigh, pLow)
+    process.exit(r ? 0 : 1)
+  }
   const refPath = arg('--reference-corpus', '') ? resolve(arg('--reference-corpus', '')) : null
   const minFreq = Number(arg('--min-freq', '20'))
   const minRatio = Number(arg('--min-ratio', '3.0'))
   const top = Number(arg('--top', '60'))
-  const name = arg('--name', basename(corpusPath).replace(/\.[^.]+$/, '') || 'model')
-  const outPrefix = resolve(arg('--out', `./lexicon-${name}`))
 
   const chunks = collectCorpus(corpusPath)
   if (chunks.length === 0) { console.error('目标语料为空（无推理文本）'); process.exit(1) }
