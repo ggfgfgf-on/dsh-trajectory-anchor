@@ -116,6 +116,15 @@ export function fisherExact(fa, aN, fd, dN) {
   return Math.min(1, p)
 }
 
+/** 词条 → 匹配正则：纯 ASCII 词条用 \b 词边界（英文词语义）；
+ *  含非 ASCII 的词条（中文/假名/谚文等）\b 永不成立（CJK 字符非 \w），
+ *  必须按字面子串匹配——否则标定出的中文词条在运行时永远命中不了。 */
+export function termRegex(term, flags) {
+  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+')
+  const asciiOnly = /^[\x20-\x7e]+$/.test(term)
+  return new RegExp(asciiOnly ? '\\b' + escaped + '\\b' : escaped, flags)
+}
+
 /** log-odds → 词典权重（截断到 [0.5, 3.0]，1 位小数）。 */
 export function weightOf(odds) {
   return Math.min(3.0, Math.max(0.5, Math.round(Math.abs(odds) * 10) / 10))

@@ -34,7 +34,7 @@
  * workspaceRoot (process.cwd()).
  */
 
-import { contrastPolarity, ngrams } from './tools/lexicon-core.mjs'
+import { contrastPolarity, ngrams, termRegex } from './tools/lexicon-core.mjs'
 
 const DEFAULTS = {
   anchorEnabled: true,
@@ -257,15 +257,6 @@ function reasoningBlocks(event) {
   } catch (e) {
     return []
   }
-}
-
-/** 词条 → 匹配正则：纯 ASCII 词条用 \b 词边界（英文词语义）；
- *  含非 ASCII 的词条（中文/假名/谚文等）\b 永不成立（CJK 字符非 \w），
- *  必须按字面子串匹配——否则标定出的中文词条在运行时永远命中不了。 */
-function termRegex(term, flags) {
-  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+')
-  const asciiOnly = /^[\x20-\x7e]+$/.test(term)
-  return new RegExp(asciiOnly ? '\\b' + escaped + '\\b' : escaped, flags)
 }
 
 function measureText(text, lexicon) {

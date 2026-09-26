@@ -37,7 +37,7 @@
  */
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { join, resolve, basename } from 'node:path'
-import { contrastPolarity, fisherExact } from './lexicon-core.mjs'
+import { contrastPolarity, fisherExact, termRegex } from './lexicon-core.mjs'
 import { decodeSessionLog, walk, textFromRecord, collectCorpus } from './session-log-core.mjs'
 
 function arg(name, fallback) {
@@ -80,7 +80,9 @@ function scanRuns(resultsDir) {
 }
 
 // ---------- 会话日志扫描 ----------
-function scanSessions(sessionsDir, modelFilter) {
+// 防混料是可选提示（opt-in），不是内置策略：不同任务的候选协议不同，
+// 是否排除编排会话/长会话由用户在命令行显式指定，默认不做任何假设。
+function scanSessions(sessionsDir, modelFilter, opts) {
   const sessions = []
   const files = walk(sessionsDir, []).filter((f) => f.endsWith('session.jsonl.zstd'))
   for (const f of files) {
@@ -92,8 +94,6 @@ function scanSessions(sessionsDir, modelFilter) {
     let provider = ''
     const texts = []
     let matched = !modelFilter
-    // 防混料：编排/父会话会调用 subagent 工具；候选会话的提示词禁止这些工具。
-    // 长于 4 小时的会话（用户日常聊天等）也不是候选会话。
     let usedSubagentTool = false
     for (const line of text.split('\n')) {
       if (!line.trim()) continue
@@ -110,15 +110,15 @@ function scanSessions(sessionsDir, modelFilter) {
         if (p) provider = p
         if (modelFilter && (m === modelFilter || p === modelFilter)) matched = true
       }
-      if (o.type === 'tool/call' && o.data && typeof o.data.name === 'string') {
+      if (opts.excludeOrchestrator && o.type === 'tool/call' && o.data && typeof o.data.name === 'string') {
         if (/^(subagent|subagent_fork|workflow|ralph|send_message|interrupt_agent|list_agents)$/.test(o.data.name)) usedSubagentTool = true
       }
       const t = textFromRecord(o)
       if (t && t.length >= 40) texts.push(t)
     }
     if (!matched || texts.length === 0 || endMs === 0) continue
-    if (usedSubagentTool) continue
-    if (endMs - startMs > 4 * 3600 * 1000) continue
+    if (opts.excludeOrchestrator && usedSubagentTool) continue
+    if (opts.maxDurationHours > 0 && endMs - startMs > opts.maxDurationHours * 3600 * 1000) continue
     sessions.push({ sid: basename(join(f, '..')), startMs, endMs, model, provider, texts })
   }
   return sessions
@@ -156,8 +156,8 @@ function measureBlock(text, lexicon) {
   const pick = (map) => {
     let sum = 0
     for (const t of Object.keys(map || {})) {
-      const m = lower.match(new RegExp('\\b' + t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+') + '\\b', 'g'))
-      sum += (m ? m.length : 0) * map[t]
+      const n = (lower.match(termRegex(t, 'g')) || []).length
+      sum += n * map[t]
     }
     return sum
   }
@@ -210,6 +210,11 @@ const runGroupSet = runGroupFilter ? new Set(runGroupFilter.split(',').map((s) =
 // --use-blockers：按评测的 behavior_blockers 定标签（零缺陷=正，有缺陷=负），
 // 比纯分数更本质——分数是代理，blocker 是实质。分数仍记录进证据表。
 const useBlockers = process.argv.includes('--use-blockers')
+// 防混料提示（opt-in，默认关闭——不同任务的候选协议不同，工具不做内置假设）：
+//   --exclude-orchestrator   排除调用过 subagent/workflow/ralph/send_message 的会话
+//   --max-duration-hours N   排除长于 N 小时的会话（0=不限）
+const excludeOrchestrator = process.argv.includes('--exclude-orchestrator')
+const maxDurationHours = Number(arg('--max-duration-hours', '0'))
 const highScore = Number(arg('--high', '95'))
 const lowScore = Number(arg('--low', '90'))
 const minFreq = Number(arg('--min-freq', '5'))
@@ -261,7 +266,7 @@ if (labelsPath) {
     console.log(`[scores] run-group 过滤: ${before} -> ${runs.length} (${runGroupFilter})`)
   }
   console.log(`[scores] 评测轮: ${runs.length}`)
-  const sessions = scanSessions(sessionsDir, modelFilter)
+  const sessions = scanSessions(sessionsDir, modelFilter, { excludeOrchestrator, maxDurationHours })
   console.log(`[scores] 会话日志: ${sessions.length}${modelFilter ? ` (model=${modelFilter})` : ''}`)
   const pairs = matchRuns(sessions, runs)
   console.log(`[scores] 匹配成功: ${pairs.length}`)
@@ -288,8 +293,10 @@ if (labelsPath) {
 
 const posChars = posTexts.reduce((n, s) => n + s.length, 0)
 const negChars = negTexts.reduce((n, s) => n + s.length, 0)
-console.log(`[scores] 正语料（≥${highScore} 分）: ${posTexts.length} 块 / ${posChars} 字符`)
-console.log(`[scores] 负语料（≤${lowScore} 分）: ${negTexts.length} 块 / ${negChars} 字符`)
+const posLabel = useBlockers ? '零缺陷轮' : `≥${highScore} 分`
+const negLabel = useBlockers ? '有缺陷轮' : `≤${lowScore} 分`
+console.log(`[scores] 正语料（${posLabel}）: ${posTexts.length} 块 / ${posChars} 字符`)
+console.log(`[scores] 负语料（${negLabel}）: ${negTexts.length} 块 / ${negChars} 字符`)
 
 const lexicon = { positive: {}, negative: {}, neutral: {} }
 let ratioFit = null

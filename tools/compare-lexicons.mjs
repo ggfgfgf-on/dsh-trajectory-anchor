@@ -16,6 +16,7 @@
 import { readFileSync, statSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { collectCorpus } from './session-log-core.mjs'
+import { termRegex } from './lexicon-core.mjs'
 
 function arg(name, fallback) {
   const i = process.argv.indexOf(name)
@@ -28,8 +29,7 @@ function measure(text, lexicon) {
     let sum = 0
     let words = 0
     for (const t of Object.keys(map || {})) {
-      const m = lower.match(new RegExp('\\b' + t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+') + '\\b', 'g'))
-      const n = m ? m.length : 0
+      const n = (lower.match(termRegex(t, 'g')) || []).length
       sum += n * map[t]
       words += n
     }
@@ -74,10 +74,6 @@ const highTexts = collectCorpus(highPath)
 const lowTexts = collectCorpus(lowPath)
 console.log(`[compare] 高分语料: ${highTexts.length} 块；低分语料: ${lowTexts.length} 块`)
 
-const load = (p) => {
-  const o = JSON.parse(readFileSync(p, 'utf8'))
-  return { lexicon: o.lexicon || o, weights: o.ratioWeights || null, labels: [arg('--labels-a', 'A'), arg('--labels-b', 'B')] }
-}
 const lexA = JSON.parse(readFileSync(lexAPath, 'utf8'))
 const lexB = JSON.parse(readFileSync(lexBPath, 'utf8'))
 const lexAObj = lexA.lexicon || lexA
