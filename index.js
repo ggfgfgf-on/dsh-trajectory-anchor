@@ -896,12 +896,20 @@ function feedSessionEvent(session, event) {
     if (CONFIG.gateEnabled && rec.anchored && !rec.lifted && rec.pendingPromote) {
       const latest = rec.lastMessages[rec.lastMessages.length - 1]
       // 泛化锚定门：当前词典的正标记命中且无负标记命中（DS 词典下即 we 无 let me；
-      // 换任意词典自动跟随该词典的极性词）。
-      if (latest && latest.flags.some(f => f.hasPositive) && !latest.flags.some(f => f.hasNegative)) {
+      // 换任意词典自动跟随该词典的极性词）。负桶为空时 !hasNegative 恒真是
+      // 「无法判断」而非「通过」——此时不提前放行，回退 max-steps 的完整 bootstrap
+      // （避免 0 负词典让 gate 形同虚设、bootstrap 提前结束）。
+      if (latest && gateEarlyLift(latest.flags, Object.keys(CONFIG.lexicon.negative).length > 0)) {
         lift(rec, 'anchor-gate:minimal-like')
       }
     }
   }
+}
+
+/** 门提前放行判定（纯函数，可单测）：仅当负桶非空且正命中、无负命中时为真。 */
+export function gateEarlyLift(flags, hasNegTerms) {
+  if (!hasNegTerms) return false
+  return flags.some(f => f.hasPositive) && !flags.some(f => f.hasNegative)
 }
 
 function safeGet(service, id) {

@@ -52,5 +52,12 @@ for (const bad of ['{"positive":1}', '{"lexicon":{"positive":{}}}', 'not json'])
 }
 eq('坏形状/坏 JSON 全抛错', threw, 3)
 
+// gateEarlyLift：空负桶不得提前放行（0 负词典 gate 语义修正）
+eq('gate: 负桶空→不放行（即使正命中）', mod.gateEarlyLift([{ hasPositive: true, hasNegative: false }], false), false)
+eq('gate: 负桶空+无正→不放行', mod.gateEarlyLift([{ hasPositive: false, hasNegative: false }], false), false)
+eq('gate: 有负桶+正命中无负→放行', mod.gateEarlyLift([{ hasPositive: true, hasNegative: false }], true), true)
+eq('gate: 有负桶+正负都命中→不放行', mod.gateEarlyLift([{ hasPositive: true, hasNegative: true }], true), false)
+eq('gate: 有负桶+仅负命中→不放行', mod.gateEarlyLift([{ hasPositive: false, hasNegative: true }], true), false)
+
 console.log(`\n${pass} pass, ${fail} fail`)
 if (fail > 0) process.exit(1)
