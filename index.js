@@ -973,6 +973,13 @@ function buildSummary(filter) {
     initiatorSessionId,
     baseDir: baseDir || null,
     sessionCwd: sessionCwd || null,
+    lexicon: {
+      source: CONFIG.lexiconPath ? String(CONFIG.lexiconPath) : 'default',
+      positive: Object.keys(CONFIG.lexicon.positive).length,
+      negative: Object.keys(CONFIG.lexicon.negative).length,
+      neutral: Object.keys(CONFIG.lexicon.neutral).length,
+      ratioWeights: { ...CONFIG.ratioWeights },
+    },
     config: {
       gateEnabled: CONFIG.gateEnabled,
       maxBootstrapSteps: CONFIG.maxBootstrapSteps,
