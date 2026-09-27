@@ -18,6 +18,7 @@ const rows = contrastPolarity(B.positives, B.negatives, minFreq, 100000)
 const byTerm = new Map(rows.map((r) => [r.term, r]))
 
 const kept = { positive: {}, negative: {}, neutral: {} }
+for (const t of Object.keys(aLex.neutral || {})) kept.neutral[t] = aLex.neutral[t] // 中性词不经方向过滤，原样携带
 const prunedFlip = []
 const prunedAbsent = []
 const stats = { same: 0, flip: 0, absent: 0 }

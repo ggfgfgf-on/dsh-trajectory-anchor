@@ -25,7 +25,7 @@
  */
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { join, resolve, basename } from 'node:path'
-import { contrastPolarity, ngrams, termRegex } from './lexicon-core.mjs'
+import { contrastPolarity, neutralTerms, ngrams, termRegex } from './lexicon-core.mjs'
 import { decodeSessionLog, walk, textFromRecord, collectCorpus } from './session-log-core.mjs'
 
 function arg(name, fallback) {
@@ -359,6 +359,14 @@ for (const r of rows) {
   const bucket = r.polarity === 'positive' ? lexicon.positive : lexicon.negative
   bucket[r.term] = Math.round(Math.min(3, Math.max(0.5, Math.abs(r.odds))) * 10) / 10
 }
+// 中性输出类别：两侧高频、方向不显著的活动词（权重 1，不参与极性桶）
+const neutralTop = Number(arg('--neutral-top', '10'))
+const neutralRows = neutralTerms(posTexts, negTexts, minFreq, 0.4, neutralTop)
+for (const n of neutralRows) {
+  if (lexicon.positive[n.term] === undefined && lexicon.negative[n.term] === undefined) {
+    lexicon.neutral[n.term] = 1
+  }
+}
 const ratioFit = fitRatioWeights(lexicon, posTexts, negTexts)
 
 const output = {
@@ -389,13 +397,14 @@ lines.push('```yaml')
 lines.push('# 应用：lexiconProfiles.<model> 或桶种子；运行时输出拟合探测会自限')
 lines.push(`# positive: ${JSON.stringify(lexicon.positive)}`)
 lines.push(`# negative: ${JSON.stringify(lexicon.negative)}`)
+lines.push(`# neutral: ${JSON.stringify(lexicon.neutral)}`)
 if (ratioFit) lines.push(`# ratioWeights: ${JSON.stringify(ratioFit.weights)}  # 拟合分离度 ${ratioFit.separation}`)
 lines.push('```')
 
 writeFileSync(`${outPrefix}.json`, JSON.stringify(output, null, 2), 'utf8')
 writeFileSync(`${outPrefix}-report.md`, lines.join('\n'), 'utf8')
 console.log(`[v2] 词典: ${outPrefix}.json；报告: ${outPrefix}-report.md`)
-console.log(`[v2] 词条: positive=${Object.keys(lexicon.positive).length} negative=${Object.keys(lexicon.negative).length}`)
+console.log(`[v2] 词条: positive=${Object.keys(lexicon.positive).length} negative=${Object.keys(lexicon.negative).length} neutral=${Object.keys(lexicon.neutral).length}`)
 if (ratioFit) console.log(`[v2] ratioWeights: ${JSON.stringify(ratioFit.weights)}（分离度 ${ratioFit.separation}）`)
 console.log('[v2] Top 10:')
 for (const r of rows.slice(0, 10)) console.log(`  ${r.term}  ${r.polarity}  ${r.odds.toFixed(1)}`)

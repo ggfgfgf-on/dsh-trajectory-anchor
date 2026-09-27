@@ -130,6 +130,30 @@ export function termRegex(term, flags) {
   return new RegExp('(?<!' + L + ')' + escaped + '(?!' + L + ')', flags)
 }
 
+/** 中性词输出类别：两分类对比之外的第三类——两侧都高频、方向不显著（|odds|<maxOdds）
+ *  的活动词。要求两侧都出现（fa≥2 且 fd≥2）且总量达标，避免「1v0 低 odds」伪影。
+ *  返回按总频次降序的 top 列表 [{ term, fa, fd, odds }]。 */
+export function neutralTerms(anchored, drifted, minFreq, maxOdds, top) {
+  const a = ngrams(anchored)
+  const d = ngrams(drifted)
+  const aN = anchored.reduce((n, s) => n + (typeof s === 'string' ? s.length : 0), 0) || 1
+  const dN = drifted.reduce((n, s) => n + (typeof s === 'string' ? s.length : 0), 0) || 1
+  const rows = []
+  for (const term of new Set([...a.keys()].filter((t) => d.has(t)))) {
+    const fa = a.get(term) ?? 0
+    const fd = d.get(term) ?? 0
+    if (fa < 2 || fd < 2) continue
+    if (fa + fd < minFreq) continue
+    const pa = fa / aN
+    const pd = fd / dN
+    const odds = Math.log((pa + 1e-9) / (pd + 1e-9))
+    if (Math.abs(odds) >= maxOdds) continue
+    rows.push({ term, fa, fd, odds })
+  }
+  rows.sort((x, y) => (y.fa + y.fd) - (x.fa + x.fd))
+  return rows.slice(0, top)
+}
+
 /** log-odds → 词典权重（截断到 [0.5, 3.0]，1 位小数）。 */
 export function weightOf(odds) {
   return Math.min(3.0, Math.max(0.5, Math.round(Math.abs(odds) * 10) / 10))
