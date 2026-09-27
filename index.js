@@ -64,6 +64,9 @@ const DEFAULTS = {
   reactMin: 0.5,
   baselineMinSamples: 10,
   rollbackPercentile: 25,
+  // 动态恢复下限：drift 恢复的 spec 连续段阈值 = max(此下限, 会话自身预期 spec 段)，
+  // 实际阈值由 dynamicRecoveryLen 按会话历史 band 序列动态计算（无固定常数）。
+  minDriftSteps: 3,
   historyCap: 200,
   leanDenyPatterns: [
     'vision_*', 'browser_*', 'sandbox_*', 'desktop_*',
@@ -520,6 +523,26 @@ function recoverRollback(rec, reason) {
   logAudit(rec, 'state', { state: 'stable', via: reason, band: rec.band })
 }
 
+/** 动态恢复阈值（纯函数，可单测）：由会话自身历史 band 序列估计 spec 持续概率 p，
+ *  恢复要求当前 spec 连续段 ≥ k = max(floor, ⌈1/(1−p)⌉, 上限 50)——即 spec 段必须
+ *  长过该会话自己的预期 spec 段（p 越高说明 spec 是该会话常态，需要更长段才构成
+ *  「持续转好」的证据；p=0 时退化为 floor，过滤单次闪烁）。 */
+export function dynamicRecoveryLen(ratios, specMax, reactMin, floor, cap) {
+  const bands = ratios.map((r) => (r < specMax ? 'spec' : r < reactMin ? 'mixed' : 'react'))
+  let specCount = 0
+  let persist = 0
+  for (let i = 0; i < bands.length - 1; i++) {
+    if (bands[i] === 'spec') {
+      specCount += 1
+      if (bands[i + 1] === 'spec') persist += 1
+    }
+  }
+  if (bands[bands.length - 1] === 'spec') specCount += 1
+  const p = specCount > 0 ? persist / specCount : 0
+  const k = p >= 0.98 ? cap : Math.ceil(1 / (1 - p) - 1e-9)
+  return Math.max(floor, Math.min(k, cap))
+}
+
 function stateMachine(rec, agent) {
   const prev = rec.machineState
   if (prev === 'drift') {
@@ -528,8 +551,16 @@ function stateMachine(rec, agent) {
       rec.rollbackAttempted = true
       applyRollback(rec, agent, 'drift-retry')
     }
-    if (rec.band === 'spec' && rec.driftSteps >= CONFIG.minDriftSteps) {
-      recoverRollback(rec, 'spec-band')
+    // 动态恢复：spec 连续段须长过会话自身的预期 spec 段（阈值随会话自适应，无固定常数）
+    if (rec.band === 'spec') {
+      rec.specRunLen = (rec.specRunLen || 0) + 1
+      const k = dynamicRecoveryLen(rec.ratioHistory, CONFIG.specMax, CONFIG.reactMin, CONFIG.minDriftSteps, 50)
+      if (rec.specRunLen >= k) {
+        rec.specRunLen = 0
+        recoverRollback(rec, 'spec-band')
+      }
+    } else {
+      rec.specRunLen = 0
     }
     return
   }
@@ -809,6 +840,7 @@ function adopt(agent, doAnchor, channel) {
     lastState: 'stable',
     machineState: 'stable',
     driftSteps: 0,
+    specRunLen: 0,
     driftEnteredAt: null,
     rollbackLift: null,
     rollbackDeny: [],

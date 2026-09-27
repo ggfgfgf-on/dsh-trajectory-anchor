@@ -59,5 +59,22 @@ eq('gate: 有负桶+正命中无负→放行', mod.gateEarlyLift([{ hasPositive:
 eq('gate: 有负桶+正负都命中→不放行', mod.gateEarlyLift([{ hasPositive: true, hasNegative: true }], true), false)
 eq('gate: 有负桶+仅负命中→不放行', mod.gateEarlyLift([{ hasPositive: false, hasNegative: true }], true), false)
 
+// dynamicRecoveryLen：drift 恢复阈值随会话自身 band 历史动态计算（无固定常数）
+eq('dyn: 全 react 历史 → k=下限3', mod.dynamicRecoveryLen([0.8, 0.8, 0.8, 0.8], 0.2, 0.5, 3, 50), 3)
+eq('dyn: 单 spec 闪烁 → k=3（不恢复）', mod.dynamicRecoveryLen([0.8, 0.1, 0.8], 0.2, 0.5, 3, 50), 3)
+eq('dyn: 空历史 → k=下限3', mod.dynamicRecoveryLen([], 0.2, 0.5, 3, 50), 3)
+eq('dyn: 全 spec 10 段 → p=0.9 → k=10', mod.dynamicRecoveryLen(Array(10).fill(0.1), 0.2, 0.5, 3, 50), 10)
+eq('dyn: p≥0.98 → 封顶 50', mod.dynamicRecoveryLen(Array(51).fill(0.1), 0.2, 0.5, 3, 50), 50)
+{
+  // 复刻 75cbc07e 的 band 形态：spec 段 2,3,4,5,9,18,43 共 84 个 spec，段间夹 react
+  const runs = [2, 3, 4, 5, 9, 18, 43]
+  const seq = []
+  for (let i = 0; i < runs.length; i++) {
+    for (let j = 0; j < runs[i]; j++) seq.push(0.1)
+    if (i < runs.length - 1) seq.push(0.8)
+  }
+  eq('dyn: 75cbc07e 形态 → p≈0.92 → k=12', mod.dynamicRecoveryLen(seq, 0.2, 0.5, 3, 50), 12)
+}
+
 console.log(`\n${pass} pass, ${fail} fail`)
 if (fail > 0) process.exit(1)
