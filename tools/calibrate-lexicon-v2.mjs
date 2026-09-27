@@ -35,7 +35,7 @@ function arg(name, fallback) {
 
 // ---------- L2：从插件轨迹日志 + 会话日志提取词典外生标签 ----------
 
-function classifyResult(text) {
+function classifyResult(text, okOnNeutral) {
   // 失败信号（明确）：非零退出码 / 沙箱拒绝 / Traceback / 断言失败 / 显式 FAILED
   if (/\[exit code:\s*[1-9]\d*\]/.test(text)) return 'err'
   if (/\[sandbox: file access denied/.test(text)) return 'err'
@@ -49,7 +49,8 @@ function classifyResult(text) {
   if (/all visible diagnostic checks passed/.test(text)) return 'ok'
   if (/Build finished successfully/.test(text)) return 'ok'
   if (/\[probe\] all visible/.test(text)) return 'ok'
-  return null
+  // 无失败标记 = 调用完成（no-lift 交叉验证模式：pwsh 只在非零退出时打 exit code 标记）
+  return okOnNeutral ? 'ok' : null
 }
 
 /** 从轨迹 JSONL 找 lift 时间戳（ms）。 */
@@ -67,8 +68,11 @@ function liftTimeOf(trajFile) {
 }
 
 /** L2 标签：正=锚定阶段块；负=下游全失败的块。
- *  sessionFilter：可选逗号分隔的会话 id 子串，只取匹配的会话（限定同任务族）。 */
-function l2LabeledSamples(trajDir, sessionsDir, sessionFilter) {
+ *  sessionFilter：可选逗号分隔的会话 id 子串，只取匹配的会话（限定同任务族）。
+ *  noLift：可选——不再要求 lift 事件（编排器/父会话模式），标签退化为
+ *  纯调用级归属（ok→正、err→负，无 bootstrap 正样本）。用于"任务外语料"
+ *  交叉验证；默认关，避免编排器污染主词典。 */
+function l2LabeledSamples(trajDir, sessionsDir, sessionFilter, noLift) {
   const positives = []
   const negatives = []
   const sessionTally = []
@@ -94,7 +98,8 @@ function l2LabeledSamples(trajDir, sessionsDir, sessionFilter) {
     if (lift !== null) meta.liftFound += 1
     // L2 标签只取锚定候选会话（有 lift 事件）：编排/父会话没有 lift，
     // 其失败步骤不能当候选模型的负样本（避免跨语境污染）。
-    if (lift === null) continue
+    // --no-lift 显式打开时放行（任务外交叉验证模式）。
+    if (lift === null && !noLift) continue
     const steps = new Map()
     const key = (turn, step) => `${turn}#${step}`
     for (const line of text.split('\n')) {
@@ -131,14 +136,14 @@ function l2LabeledSamples(trajDir, sessionsDir, sessionFilter) {
           }
         } catch { resultText = '' }
         if (!resultText) continue
-        const c = classifyResult(resultText)
+        const c = classifyResult(resultText, noLift === true)
         if (c === 'ok') s.ok += 1
         else if (c === 'err') s.err += 1
       }
     }
     for (const s of steps.values()) {
       if (s.reasoning.length === 0) continue
-      const isBootstrap = lift !== null && typeof s.firstT === 'number' && s.firstT < lift
+      const isBootstrap = !noLift && lift !== null && typeof s.firstT === 'number' && s.firstT < lift
       if (isBootstrap) {
         // 锚定阶段 = 已知良好：每块计 1 次正样本
         for (const t of s.reasoning) positives.push(t)
@@ -287,7 +292,7 @@ let l2Meta = null
 
 if (trajDir && sessionsDir) {
   mode = 'L2-trajectory-labels'
-  const r = l2LabeledSamples(trajDir, sessionsDir, arg('--session-filter', ''))
+  const r = l2LabeledSamples(trajDir, sessionsDir, arg('--session-filter', ''), process.argv.includes('--no-lift'))
   posTexts = r.positives
   negTexts = r.negatives
   l2Meta = r.meta
@@ -332,6 +337,13 @@ if (trajDir && sessionsDir) {
 console.log(`[v2] 模式: ${mode}`)
 if (l2Meta) console.log(`[v2] L2 轨迹标签: ${l2Meta.sessions} 会话（${l2Meta.liftFound} 个找到 lift）`)
 console.log(`[v2] 正语料: ${posTexts.length} 块；负语料: ${negTexts.length} 块`)
+
+// 可选：把原始正/负块落盘（供跨任务方向一致性等二次分析使用；拒绝标定前也落）
+const dumpPath = arg('--dump-blocks', '')
+if (dumpPath) {
+  writeFileSync(resolve(dumpPath), JSON.stringify({ positives: posTexts, negatives: negTexts }, null, 2), 'utf8')
+  console.log(`[v2] 语料块已导出: ${resolve(dumpPath)}`)
+}
 
 if (posTexts.length < 10 || negTexts.length < 10) {
   console.error('[v2] 正/负语料不足（各需 ≥10 块），拒绝标定——多攒会话再来')
