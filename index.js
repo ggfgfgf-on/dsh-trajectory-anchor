@@ -32,7 +32,12 @@
  * `agent.ctx.get('tools')` / `agent.ctx.get('systemPrompt')` resolve the
  * per-scope instances; trajectory files must live under the sandbox-policy
  * workspaceRoot (process.cwd()).
+ * Lexicon is replaceable at startup: config `lexiconPath` (JSON file) or env
+ * TRAJECTORY_ANCHOR_LEXICON_PATH; CJK-safe term matching (no ASCII \b).
  */
+
+import { readFileSync } from 'node:fs'
+import { isAbsolute, resolve as resolvePath } from 'node:path'
 
 const DEFAULTS = {
   anchorEnabled: true,
@@ -54,6 +59,7 @@ const DEFAULTS = {
     neutral: { 'i will': 1, "i'll": 1, 'i need': 0.8, check: 0.4, verify: 0.4 },
   },
   ratioWeights: { alpha: 2, beta: 0.5, gamma: 1.5, epsilon: 1 },
+  lexiconPath: null,
   specMax: 0.2,
   reactMin: 0.5,
   baselineMinSamples: 10,
@@ -218,6 +224,46 @@ function reasoningBlocks(event) {
   }
 }
 
+/** 词条 → 匹配正则（与 tools/lexicon-core.mjs 的 termRegex 同语义）：
+ *  纯 CJK 词条按字面子串匹配（提取器提取的就是子串，匹配必须同语义）；
+ *  拉丁/西里尔词条用「非词内字母」前后环视当边界——\b 是 ASCII 词边界，
+ *  对带重音字母（é/ñ 等非 \w）失效；字母环视与提取器的词切分
+ *  （[A-Za-z\u00c0-\u024f\u0400-\u04ff] 起头）一致，并正确处理 we1 这类数字相邻情形。 */
+export function termRegex(term, flags) {
+  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+')
+  const hasLatin = /[A-Za-z\u00c0-\u024f\u0400-\u04ff]/.test(term)
+  if (!hasLatin) return new RegExp(escaped, flags)
+  const L = '[A-Za-z\u00c0-\u024f\u0400-\u04ff]'
+  return new RegExp('(?<!' + L + ')' + escaped + '(?!' + L + ')', flags)
+}
+
+/** 解析词典 JSON（启动加载）：接受 {positive,negative,neutral} 直体，或
+ *  校准工具输出 {lexicon:{...}, ratioWeights:{...}}；权重必须是有限数。 */
+export function parseLexiconJson(text) {
+  const raw = JSON.parse(text)
+  const body = raw && typeof raw === 'object' && !Array.isArray(raw) &&
+    raw.lexicon && typeof raw.lexicon === 'object' ? raw : { lexicon: raw }
+  const lex = body.lexicon
+  if (!lex || typeof lex !== 'object' || Array.isArray(lex)) throw new Error('lexicon JSON must contain a lexicon object')
+  const out = {}
+  for (const b of ['positive', 'negative', 'neutral']) {
+    const map = lex[b]
+    if (!map || typeof map !== 'object' || Array.isArray(map)) throw new Error(`lexicon bucket "${b}" must be an object`)
+    out[b] = {}
+    for (const t of Object.keys(map)) {
+      if (typeof map[t] !== 'number' || !Number.isFinite(map[t])) throw new Error(`lexicon weight for "${t}" must be a finite number`)
+      out[b][t] = map[t]
+    }
+  }
+  const w = body.ratioWeights
+  if (w && typeof w === 'object' &&
+    typeof w.alpha === 'number' && typeof w.beta === 'number' &&
+    typeof w.gamma === 'number' && typeof w.epsilon === 'number') {
+    out.ratioWeights = { alpha: w.alpha, beta: w.beta, gamma: w.gamma, epsilon: w.epsilon }
+  }
+  return out
+}
+
 function measureText(text) {
   const normalized = text.replace(/[\u2018\u2019]/g, "'")
   const lower = normalized.toLowerCase()
@@ -227,7 +273,7 @@ function measureText(text) {
   let positiveWords = 0
   let negativeWords = 0
   for (const term of Object.keys(CONFIG.lexicon.positive)) {
-    const m = lower.match(new RegExp('\\b' + term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+') + '\\b', 'g'))
+    const m = lower.match(termRegex(term, 'g'))
     const n = m ? m.length : 0
     if (n > 0) {
       positive += n * CONFIG.lexicon.positive[term]
@@ -235,7 +281,7 @@ function measureText(text) {
     }
   }
   for (const term of Object.keys(CONFIG.lexicon.negative)) {
-    const m = lower.match(new RegExp('\\b' + term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+') + '\\b', 'g'))
+    const m = lower.match(termRegex(term, 'g'))
     const n = m ? m.length : 0
     if (n > 0) {
       negative += n * CONFIG.lexicon.negative[term]
@@ -243,7 +289,7 @@ function measureText(text) {
     }
   }
   for (const term of Object.keys(CONFIG.lexicon.neutral)) {
-    const m = lower.match(new RegExp('\\b' + term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+') + '\\b', 'g'))
+    const m = lower.match(termRegex(term, 'g'))
     const n = m ? m.length : 0
     if (n > 0) neutral += n * CONFIG.lexicon.neutral[term]
   }
@@ -959,12 +1005,35 @@ function buildSummary(filter) {
 function mergeConfig(config) {
   if (config === undefined || config === null || typeof config !== 'object') return
   for (const key of Object.keys(config)) {
-    if (CONFIG_KEYS.has(key)) CONFIG[key] = config[key]
-    else console.error(`[${name}] unknown config key "${key}"`)
+    if (!CONFIG_KEYS.has(key)) { console.error(`[${name}] unknown config key "${key}"`); continue }
+    if (key === 'lexicon') {
+      const l = config[key]
+      if (!l || typeof l !== 'object' ||
+        typeof l.positive !== 'object' || typeof l.negative !== 'object' || typeof l.neutral !== 'object') {
+        console.error(`[${name}] invalid inline lexicon (needs positive/negative/neutral buckets); keeping current lexicon`)
+        continue
+      }
+    }
+    CONFIG[key] = config[key]
   }
 }
 
 export function apply(ctx, config) {
+  // 词典文件加载（先于 mergeConfig：显式 lexicon 配置仍可整体覆盖文件值）
+  const envLex = typeof process !== 'undefined' && process.env && process.env.TRAJECTORY_ANCHOR_LEXICON_PATH
+  const lexiconPath = (config && typeof config.lexiconPath === 'string' && config.lexiconPath) || envLex || ''
+  if (lexiconPath) {
+    try {
+      const p = isAbsolute(lexiconPath) ? lexiconPath : resolvePath(process.cwd(), lexiconPath)
+      const loaded = parseLexiconJson(readFileSync(p, 'utf8'))
+      CONFIG.lexicon = { positive: loaded.positive, negative: loaded.negative, neutral: loaded.neutral }
+      if (loaded.ratioWeights) CONFIG.ratioWeights = loaded.ratioWeights
+      const n = (x) => Object.keys(x).length
+      console.log(`[${name}] lexicon loaded from ${p} (${n(loaded.positive)}p/${n(loaded.negative)}n/${n(loaded.neutral)}u)`)
+    } catch (e) {
+      console.error(`[${name}] failed to load lexicon from "${lexiconPath}": ${e && e.message}; keeping default lexicon`)
+    }
+  }
   mergeConfig(config)
   agentsSvc = ctx.get('agents')
   fsSvc = ctx.get('fs')
