@@ -225,7 +225,7 @@ function measureText(text) {
   let negative = 0
   let neutral = 0
   let positiveWords = 0
-  let letMe = 0
+  let negativeWords = 0
   for (const term of Object.keys(CONFIG.lexicon.positive)) {
     const m = lower.match(new RegExp('\\b' + term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+') + '\\b', 'g'))
     const n = m ? m.length : 0
@@ -239,7 +239,7 @@ function measureText(text) {
     const n = m ? m.length : 0
     if (n > 0) {
       negative += n * CONFIG.lexicon.negative[term]
-      if (term === 'let me') letMe += n
+      negativeWords += n
     }
   }
   for (const term of Object.keys(CONFIG.lexicon.neutral)) {
@@ -247,14 +247,16 @@ function measureText(text) {
     const n = m ? m.length : 0
     if (n > 0) neutral += n * CONFIG.lexicon.neutral[term]
   }
+  // 极性语义与具体词无关：正/负命中由当前词典的标记词决定，
+  // 换一套词典（如 let-me 为正向的词典）这些计数自动跟着翻转。
   return {
     positive,
     negative,
     neutral,
     positiveWords,
-    letMe,
-    we: /\bwe\b/i.test(text),
-    hasLetMe: /\blet me\b/i.test(text),
+    negativeWords,
+    hasPositive: positiveWords > 0,
+    hasNegative: negativeWords > 0,
   }
 }
 
@@ -270,8 +272,8 @@ function weightedRatio(agg) {
 }
 
 function personaRatio(agg) {
-  const denom = agg.positiveWords + agg.letMe
-  return denom === 0 ? 0 : agg.letMe / denom
+  const denom = agg.positiveWords + agg.negativeWords
+  return denom === 0 ? 0 : agg.negativeWords / denom
 }
 
 function bandOf(ratio) {
@@ -290,14 +292,14 @@ function percentileRank(value, history) {
 }
 
 function recompute(rec, agent) {
-  const agg = { positive: 0, negative: 0, neutral: 0, positiveWords: 0, letMe: 0 }
+  const agg = { positive: 0, negative: 0, neutral: 0, positiveWords: 0, negativeWords: 0 }
   for (const m of rec.lastMessages) {
     for (const f of m.flags) {
       agg.positive += f.positive
       agg.negative += f.negative
       agg.neutral += f.neutral
       agg.positiveWords += f.positiveWords
-      agg.letMe += f.letMe
+      agg.negativeWords += f.negativeWords
     }
   }
   if (rec.lastMessages.length === 0) return
@@ -847,7 +849,9 @@ function feedSessionEvent(session, event) {
     updateWindow(rec, texts, agent || undefined)
     if (CONFIG.gateEnabled && rec.anchored && !rec.lifted && rec.pendingPromote) {
       const latest = rec.lastMessages[rec.lastMessages.length - 1]
-      if (latest && latest.flags.some(f => f.we) && !latest.flags.some(f => f.hasLetMe)) {
+      // 泛化锚定门：当前词典的正标记命中且无负标记命中（DS 词典下即 we 无 let me；
+      // 换任意词典自动跟随该词典的极性词）。
+      if (latest && latest.flags.some(f => f.hasPositive) && !latest.flags.some(f => f.hasNegative)) {
         lift(rec, 'anchor-gate:minimal-like')
       }
     }
