@@ -1019,7 +1019,9 @@ function mergeConfig(config) {
 }
 
 export function apply(ctx, config) {
-  // 词典文件加载（先于 mergeConfig：显式 lexicon 配置仍可整体覆盖文件值）
+  mergeConfig(config)
+  // 词典文件加载（在 mergeConfig 之后：lexiconPath 优先于内联 lexicon——
+  // 这样"仅加 lexiconPath"即可换词典，无需删除 patch 行里内联的默认词表）
   const envLex = typeof process !== 'undefined' && process.env && process.env.TRAJECTORY_ANCHOR_LEXICON_PATH
   const lexiconPath = (config && typeof config.lexiconPath === 'string' && config.lexiconPath) || envLex || ''
   if (lexiconPath) {
@@ -1034,7 +1036,6 @@ export function apply(ctx, config) {
       console.error(`[${name}] failed to load lexicon from "${lexiconPath}": ${e && e.message}; keeping default lexicon`)
     }
   }
-  mergeConfig(config)
   agentsSvc = ctx.get('agents')
   fsSvc = ctx.get('fs')
   spSvc = ctx.get('sandboxPolicy')
