@@ -64,9 +64,12 @@ const DEFAULTS = {
   reactMin: 0.5,
   baselineMinSamples: 10,
   rollbackPercentile: 25,
-  // 动态恢复下限：drift 恢复的 spec 连续段阈值 = max(此下限, 会话自身预期 spec 段)，
-  // 实际阈值由 dynamicRecoveryLen 按会话历史 band 序列动态计算（无固定常数）。
-  minDriftSteps: 3,
+  // 动态恢复下限：spec 连续段阈值 = max(此下限, ⌈1/(1−p)⌉)，p=P(spec|spec) 取自
+  // 会话自身真实 band 历史（personaRatio 导出的 band）。默认 1 = 无静态门槛
+  // （动态项即门槛）；防闪烁（1–2 窗抖动）可配 3。
+  minDriftSteps: 1,
+  // 持久度证据上限：p ≥ 此值视为 spec 已是该会话常态、drift 属偶发，按下限直接恢复。
+  driftPersistenceMax: 0.98,
   historyCap: 200,
   leanDenyPatterns: [
     'vision_*', 'browser_*', 'sandbox_*', 'desktop_*',
@@ -357,6 +360,9 @@ function recompute(rec, agent) {
   const band = bandOf(pr)
   rec.ratioHistory.push(ratio)
   if (rec.ratioHistory.length > CONFIG.historyCap) rec.ratioHistory.shift()
+  // 真实 band 历史（personaRatio 导出的 band，供动态恢复阈值估计 p=P(spec|spec)）
+  rec.bandHistory.push(band)
+  if (rec.bandHistory.length > CONFIG.historyCap) rec.bandHistory.shift()
   const percentile = percentileRank(ratio, rec.ratioHistory)
   rec.weightedRatio = ratio
   rec.personaRatio = pr
@@ -523,12 +529,12 @@ function recoverRollback(rec, reason) {
   logAudit(rec, 'state', { state: 'stable', via: reason, band: rec.band })
 }
 
-/** 动态恢复阈值（纯函数，可单测）：由会话自身历史 band 序列估计 spec 持续概率 p，
- *  恢复要求当前 spec 连续段 ≥ k = max(floor, ⌈1/(1−p)⌉, 上限 50)——即 spec 段必须
- *  长过该会话自己的预期 spec 段（p 越高说明 spec 是该会话常态，需要更长段才构成
- *  「持续转好」的证据；p=0 时退化为 floor，过滤单次闪烁）。 */
-export function dynamicRecoveryLen(ratios, specMax, reactMin, floor, cap) {
-  const bands = ratios.map((r) => (r < specMax ? 'spec' : r < reactMin ? 'mixed' : 'react'))
+/** 动态恢复阈值（纯函数，可单测）：p = P(spec|spec) 由会话自身的**真实 band 历史**
+ *  （personaRatio 导出的 band，与运行时同一来源）估计。恢复要求当前 spec 连续段
+ *  ≥ k = max(floor, ⌈1/(1−p)⌉)——spec 段必须长过该会话自己的预期 spec 段。
+ *  p ≥ pMax（spec 已是该会话常态，drift 属偶发）时 k=floor 直接恢复；无独立上限。 */
+export function dynamicRecoveryLen(bandHistory, floor, pMax) {
+  const bands = bandHistory
   let specCount = 0
   let persist = 0
   for (let i = 0; i < bands.length - 1; i++) {
@@ -539,8 +545,8 @@ export function dynamicRecoveryLen(ratios, specMax, reactMin, floor, cap) {
   }
   if (bands[bands.length - 1] === 'spec') specCount += 1
   const p = specCount > 0 ? persist / specCount : 0
-  const k = p >= 0.98 ? cap : Math.ceil(1 / (1 - p) - 1e-9)
-  return Math.max(floor, Math.min(k, cap))
+  const k = p >= pMax ? floor : Math.ceil(1 / (1 - p) - 1e-9)
+  return Math.max(floor, k)
 }
 
 function stateMachine(rec, agent) {
@@ -551,10 +557,10 @@ function stateMachine(rec, agent) {
       rec.rollbackAttempted = true
       applyRollback(rec, agent, 'drift-retry')
     }
-    // 动态恢复：spec 连续段须长过会话自身的预期 spec 段（阈值随会话自适应，无固定常数）
+    // 动态恢复：spec 连续段须长过会话自身的预期 spec 段（p 取自真实 band 历史）
     if (rec.band === 'spec') {
       rec.specRunLen = (rec.specRunLen || 0) + 1
-      const k = dynamicRecoveryLen(rec.ratioHistory, CONFIG.specMax, CONFIG.reactMin, CONFIG.minDriftSteps, 50)
+      const k = dynamicRecoveryLen(rec.bandHistory, CONFIG.minDriftSteps, CONFIG.driftPersistenceMax)
       if (rec.specRunLen >= k) {
         rec.specRunLen = 0
         recoverRollback(rec, 'spec-band')
@@ -841,6 +847,7 @@ function adopt(agent, doAnchor, channel) {
     machineState: 'stable',
     driftSteps: 0,
     specRunLen: 0,
+    bandHistory: [],
     driftEnteredAt: null,
     rollbackLift: null,
     rollbackDeny: [],
