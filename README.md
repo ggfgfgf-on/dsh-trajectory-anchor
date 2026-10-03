@@ -75,10 +75,63 @@ agent/disposed: RewardAnnotator process reward + trajectory JSONL final archive
 | `suppressContextOnBootstrap` | `true` | agent-scope context suppression during bootstrap |
 | `lexicon` / `ratioWeights` | monitor-calibrated | weighted lexicon scoring (we/let's/we'll/"we need"/our vs "let me"; neutral i will/i'll/i need/check/verify) |
 | `specMax` / `reactMin` | `0.2` / `0.5` | persona_ratio band boundaries (spec/mixed/react) |
-| `baselineMinSamples` / `rollbackPercentile` | `10` / `25` | **baseline-relative drift**: rollback only fires when the current ratio's percentile within the session's own history is < 25 |
-| `rollbackEnabled` | `true` | calibrated rollback switch (safe to enable under baseline-relative semantics) |
-| `leanDenyPatterns` | 61 entries | drift-rollback deny set (`*` prefix wildcards) |
+| `refMinSteps` / `testWindow` | `12` / `4` | **session-local reference test**: the last `testWindow` observations are compared against the session's own earlier history |
+| `actAlpha` / `notifyAlpha` | `0.01` / `0.05` | budgets for the capability layer / notification layer (one-sided Mann-Whitney p-value thresholds) |
+| `maxDriftSteps` | `12` | hard bound on any narrowed episode — the exit condition that is **provably reachable** |
+| `rollbackEnabled` / `notifyEnabled` | **`false` / `false`** | capability / notification switches. Both default OFF (observe-only) because the calibration measured the lexicon signal's session-level false-trigger rate at 15.9% (α=0.001) / 43.2% (α=0.01) — far above a 5% budget. See "Response policy" below |
+| `leanDenyPatterns` | 28 entries | the set hidden while `surfacePhase === 'narrowed'` (`*` prefix wildcards); count is asserted against the source by `tools/check-invariants.mjs` |
 | `rewardAnnotator` | `default` | Layer-4 process reward; pluggable extension point |
+
+## Response policy (P1–P7): derived tool surface, bounded episodes
+
+**The tool surface is derived at assembly time, never mutated in the registry.**
+A `system-prompt/assemble` handler filters `assembly.tools` by the current
+`surfacePhase` (`surfaceForPhase()`, a pure function). Two consequences:
+
+- **No "restore" step exists.** When the phase returns to `stable`, the *next*
+  assembly is the full catalog. The class of bug that plagued this plugin — a
+  restriction granted through `tools.restrict({deny})` whose only release path
+  (`band === 'spec'`) was unreachable — is structurally impossible now.
+  (Measured before the change: 23 sessions entered rollback, **0** ever
+  recovered; 18 sessions were permanently stuck at 23 tools and later calls
+  failed with `unknown tool`.)
+- **Fail-open.** Any exception inside the filter returns the original assembly
+  (`surface filter failed, exposing the full catalog`), and every bootstrap
+  degradation writes an `anchor-degraded` audit event plus a one-shot warning —
+  the plugin's own bug must never eat the user's capability.
+
+**Drift detection is a session-local reference test, not a fixed threshold.**
+The retired trigger was `percentile < 25` on a single step — a *definitional*
+rank (a bottom-quartile cut always contains ~25% of steps), whose measured
+per-session false rate ranged 4.3%–92.1% across 25 sessions (21× spread, lag-1
+autocorrelation 0.65). The replacement compares the last `testWindow`
+observations against the session's own earlier history with a one-sided
+Mann-Whitney test, so the budget lives *inside* the session and no global
+`(K, k)` pair is needed at all.
+
+**Every narrowed episode is bounded** by `maxDriftSteps` (exit condition
+provably reachable), and exhausting the capability budget blocks further
+narrowing until the episode genuinely ends.
+
+**Switches default OFF because the calibration says so.**
+`tools/calibrate-response-policy.mjs` replays the historical corpus through the
+runtime's own pure functions (`mannWhitneyLowerP`, `policyDecision`):
+
+| α | sessions falsely narrowed | worst-session narrowed-step share |
+|---|---|---|
+| 0.001 | 7/44 = 15.9% | 40.0% |
+| 0.01 | 19/44 = 43.2% | 43.3% |
+| 0.05 | 23/44 = 52.3% | 40.2% |
+
+Verdict: **FAIL — the lexicon signal cannot support capability-layer action.**
+Hence `rollbackEnabled=false` and `notifyEnabled=false` ship as defaults; the
+plugin observes and audits until a signal passes the budget (or a behavioural
+signal replaces the lexical one).
+
+`tools/replay-interventions.mjs` verifies the invariants that remain ours to
+keep: no episode exceeds the bound, no episode ends for an unexpected reason,
+and replaying the same series twice yields identical decisions.
+
 
 ## Ablation guidance (calibration vs core)
 
@@ -88,14 +141,15 @@ behavior — documented defaults are intentional:
 | Knob | Default | Role |
 |---|---|---|
 | `specMax` / `reactMin` | `0.2` / `0.5` | persona_ratio band boundaries (calibration) |
-| `baselineMinSamples` | `10` | minimum session-history window before baseline scoring engages |
-| `rollbackPercentile` | `25` | drift-rollback trigger: current ratio's percentile within the session's own history |
+| `refMinSteps` / `testWindow` | `12` / `4` | session-local reference-test sizes |
+| `actAlpha` / `notifyAlpha` | `0.01` / `0.05` | capability / notification budgets (calibration) |
 | `lexicon` / `ratioWeights` | monitor-calibrated | weighted lexicon scoring table |
 
-Core behavior (anchoring, gating, context suppression, per-step trajectory export) does not
-depend on these values; the absolute-vs-baseline-relative drift decision is itself a core
-behavior that replaced an earlier absolute-band design (which misfired on models whose
-natural baseline style is let-me).
+Core behavior (anchoring, gating, context suppression, per-step trajectory export, derived
+tool surface, bounded episodes) does not depend on these values. The drift decision itself is a
+core behavior that has been redesigned twice: absolute bands → baseline-relative percentile
+(v0.4.x) → **session-local reference test** (this version). Each redesign was driven by a
+measurement, and the measurements are recorded below.
 
 ## Calibration findings (measured, important)
 
@@ -106,12 +160,17 @@ natural baseline style is let-me).
 2. **The 1024 first-round cap is a risk, not an anchoring requirement**: truncating the opening
    plan makes the subagent die with zero tool calls (issue #85 reproduced locally), so it is off
    by default.
-3. **Absolute bands do not detect drift**: deepseek-v4's baseline style is let-me (react band),
-   so the old binary scoring always flagged drift. After upgrading to lexicon + bands +
-   **session-own baseline percentiles**, "drift" means degradation relative to the agent's own
-   history (the ratio 290→1 drop after promotion is exactly that signal), and rollback no longer
-   fires unconditionally.
-4. The runtime agent identifier field is `id` (not `sessionId`); trajectory files must live under
+3. **Absolute bands do not detect drift** — and neither did the percentile replacement:
+   deepseek-v4's baseline style is let-me (react band), so the old binary scoring always flagged
+   drift. v0.4.x replaced it with lexicon + bands + **session-own baseline percentiles**; that
+   fixed the absolute misfire but introduced a *definitional* trigger (a bottom-quartile cut
+   always contains ~25% of steps, so its marginal rate is set by the threshold, not by the
+   model). Measured across 25 sessions: per-session false rate 4.3%–92.1%, lag-1 autocorrelation
+   0.65, mean degraded run 4.27 steps, and window rules could not be tuned below an 8–16%
+   session-level floor. The current version therefore tests the last `testWindow` observations
+   against the session's own earlier history (one-sided Mann-Whitney) and keeps capability
+   changes switched off until the calibration passes.
+4. **The runtime agent identifier field is `id` (not `sessionId`)**; trajectory files must live under
    the process-level workspaceRoot (the sandbox-policy-allowed area).
 5. Perception channels: `internal/dispatch` (unfiltered, fires before every dispatch) plus direct
    waterfalls (`agent/request` / `agent/pre-step` registered with `prepend: true`). Host-plane rows

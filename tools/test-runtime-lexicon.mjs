@@ -59,24 +59,41 @@ eq('gate: 有负桶+正命中无负→放行', mod.gateEarlyLift([{ hasPositive:
 eq('gate: 有负桶+正负都命中→不放行', mod.gateEarlyLift([{ hasPositive: true, hasNegative: true }], true), false)
 eq('gate: 有负桶+仅负命中→不放行', mod.gateEarlyLift([{ hasPositive: false, hasNegative: true }], true), false)
 
-// dynamicRecoveryLen：p=P(spec|spec) 取自会话自身真实 band 历史（personaRatio 导出的 band）
-eq('dyn: 全 react 历史 → p=0 → k=下限1', mod.dynamicRecoveryLen(['react', 'react', 'react', 'react'], 1, 0.98), 1)
-eq('dyn: 单 spec 闪烁 → p=0 → k=1', mod.dynamicRecoveryLen(['react', 'spec', 'react'], 1, 0.98), 1)
-eq('dyn: 空历史 → k=下限1', mod.dynamicRecoveryLen([], 1, 0.98), 1)
-eq('dyn: 下限 3 生效（防闪烁配置）', mod.dynamicRecoveryLen(['react', 'spec', 'react'], 3, 0.98), 3)
-eq('dyn: 全 spec 10 段 → p=0.9 → k=10', mod.dynamicRecoveryLen(Array(10).fill('spec'), 1, 0.98), 10)
-eq('dyn: p≥0.98（spec 常态）→ k=下限直接恢复（无上限）', mod.dynamicRecoveryLen(Array(51).fill('spec'), 1, 0.98), 1)
-eq('dyn: p≥0.98 且下限 3 → k=3（不是 50）', mod.dynamicRecoveryLen(Array(51).fill('spec'), 3, 0.98), 3)
-{
-  // 复刻 75cbc07e 的 band 形态：spec 段 2,3,4,5,9,18,43 共 84 个 spec，段间夹 react
-  const runs = [2, 3, 4, 5, 9, 18, 43]
-  const seq = []
-  for (let i = 0; i < runs.length; i++) {
-    for (let j = 0; j < runs[i]; j++) seq.push('spec')
-    if (i < runs.length - 1) seq.push('react')
-  }
-  eq('dyn: 75cbc07e 形态 → p≈0.92 → k=12', mod.dynamicRecoveryLen(seq, 1, 0.98), 12)
-}
+// ── P3 策略纯函数（取代已删除的 dynamicRecoveryLen）────────────────────────
+// mannWhitneyLowerP：单侧"检验窗是否异常偏低"的 p 值（正态近似 + 并列修正）
+const mw = (t, r) => mod.mannWhitneyLowerP(t, r)
+eq('mw: 两窗同分布 → p 接近 0.5', Math.abs(mw([1, 2, 3, 4], [1, 2, 3, 4]) - 0.5) < 0.3, true)
+eq('mw: 检验窗显著更低 → p 很小', mw([0, 0, 0, 0], [5, 6, 7, 8, 9, 10, 11, 12]) < 0.01, true)
+eq('mw: 检验窗显著更高 → p 接近 1', mw([9, 10, 11, 12], [1, 2, 3, 4]) > 0.99, true)
+eq('mw: 空参考 → p=1（无证据）', mw([1, 2], []), 1)
+eq('mw: 全并列 → p=1（σ=0 时不误报）', mw([3, 3, 3], [3, 3, 3]), 1)
+eq('mw: 非数值输入被忽略', mw([0, 0, 0, 0, 'x'], [5, 6, 7, 8]) < 0.05, true)
+
+// policyDecision：行动分档（证据不足 / 词典退化 / 预算耗尽 / 总开关关 各自动降档）
+const pd = (o) => mod.policyDecision(Object.assign({
+  p: 0.001, refLen: 20, refMinSteps: 12, notifyAlpha: 0.05, actAlpha: 0.01,
+  degenerate: false, budgetExhausted: false, rollbackEnabled: true, notifyEnabled: true,
+}, o))
+eq('pd: 偏离强+闸门全过 → 收窄', pd({}).level + '/' + pd({}).action + '/' + pd({}).reason, 'narrowed/narrow/deviation')
+eq('pd: 参考不足 → 不动手', pd({ refLen: 3 }).level + '/' + pd({ refLen: 3 }).action + '/' + pd({ refLen: 3 }).reason, 'stable/none/insufficient-reference')
+eq('pd: 词典退化 → 状态 narrowed 但只通知', pd({ degenerate: true }).level + '/' + pd({ degenerate: true }).action + '/' + pd({ degenerate: true }).reason, 'narrowed/notice/lexicon-degenerate')
+eq('pd: 能力预算耗尽 → 只通知', pd({ budgetExhausted: true }).level + '/' + pd({ budgetExhausted: true }).action + '/' + pd({ budgetExhausted: true }).reason, 'narrowed/notice/capability-budget-exhausted')
+eq('pd: 能力层关 → 只通知', pd({ rollbackEnabled: false }).level + '/' + pd({ rollbackEnabled: false }).action + '/' + pd({ rollbackEnabled: false }).reason, 'narrowed/notice/capability-disabled')
+eq('pd: 双关（默认）→ 只观察不动手', pd({ rollbackEnabled: false, notifyEnabled: false }).action + '/' + pd({ rollbackEnabled: false, notifyEnabled: false }).reason, 'none/observe-only')
+eq('pd: 弱偏离（act<p≤notify）→ watch+通知', pd({ p: 0.03 }).level + '/' + pd({ p: 0.03 }).action, 'watch/notice')
+eq('pd: 无偏离 → stable', pd({ p: 0.6 }).level + '/' + pd({ p: 0.6 }).reason, 'stable/within-reference')
+eq('pd: 无观测 → stable', pd({ p: null }).level + '/' + pd({ p: null }).action + '/' + pd({ p: null }).reason, 'stable/none/no-observation')
+
+// lexiconDegenerate：正桶一次都没命中 = 该会话的词典退化（能力层闸门）
+eq('deg: 观测够且正桶 0 命中 → 退化', mod.lexiconDegenerate(0, 20, 12), 'positive-bucket-never-hit')
+eq('deg: 正桶命中过 → 不退化', mod.lexiconDegenerate(1, 20, 12), false)
+eq('deg: 观测不足 → 不下结论', mod.lexiconDegenerate(0, 5, 12), false)
+
+// surfaceForPhase：派生工具面（P1）
+const TT = (...names) => names.map((n) => ({ name: n }))
+eq('surface: narrowed 摘掉命中模式的工具', mod.surfaceForPhase('narrowed', TT('pwsh', 'browser_x', 'todo_write'), ['browser_*', 'todo_write']).length, 1)
+eq('surface: stable 原样返回', mod.surfaceForPhase('stable', TT('pwsh', 'browser_x'), ['browser_*']).length, 2)
+eq('surface: 空模式表不动手', mod.surfaceForPhase('narrowed', TT('pwsh'), []).length, 1)
 
 console.log(`\n${pass} pass, ${fail} fail`)
 if (fail > 0) process.exit(1)

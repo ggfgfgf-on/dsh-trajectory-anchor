@@ -1,0 +1,69 @@
+{
+  "name": "@argszero/cordis-plugin-preset-tool-filter",
+  "description": "Two public tools.restrict() use cases for the dsh harness, applied per agent scope: a per-preset tool ALLOWLIST (#5786: a preset agent inherits the global layer and every ancestor scope layer, so plugin-registered commands leak into a minimal preset) and a per-deployment tool-GROUP DENYLIST (#7080: opt out of provider tool groups such as a computer-use browser group without unmounting the provider that also serves the capabilities you use). Reports the measured model-facing prefix saving per agent.",
+  "version": "0.2.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/types/**/*.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-tools": ">=0.1.2-rc.1 <0.2.0 || >=0.1.3-alpha.2 <0.2.0 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": "^22.19 || >=24"
+  },
+  "keywords": [
+    "cordis",
+    "deepseek-harness",
+    "dsh",
+    "plugin",
+    "preset",
+    "tool-filter",
+    "tool-restriction",
+    "computer-use",
+    "minimal"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/argszero/cordis-plugin-preset-tool-filter.git"
+  },
+  "homepage": "https://github.com/argszero/cordis-plugin-preset-tool-filter#readme",
+  "scripts": {
+    "build": "tsc",
+    "pretest": "tsc",
+    "test": "node --test \"test/*.spec.mjs\"",
+    "prepublishOnly": "tsc"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-scope": "0.1.6-alpha.2",
+    "@deepseek-ai/dsh-system-prompt": "0.1.6-alpha.2",
+    "@deepseek-ai/dsh-tools": "0.1.6-alpha.2",
+    "@types/node": "^22.10.2",
+    "semver": "^7.6.3",
+    "typescript": "^5.5.0"
+  }
+}

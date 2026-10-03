@@ -52,7 +52,12 @@ const DEFAULTS = {
   suppressContextOnBootstrap: true,
   suppressSkillCatalog: true,
   suppressedSources: ['skill-catalog'],
-  rollbackEnabled: true,
+  // 能力层与通知层的总开关。默认**都关**（只观察、只审计）——这是按标定结论定下的
+  // 安全默认：tools/calibrate-response-policy.mjs 在 44 个历史会话上测得当前词表
+  // 信号的会话级误触发率 15.9%（α=0.001）/ 43.2%（α=0.01），远高于 5% 预算，
+  // 即"信号不足以支撑能力层干预"。开之前必须先让标定通过（或换 P5 行为轴信号）。
+  rollbackEnabled: false,
+  notifyEnabled: false,
   lexicon: {
     positive: { we: 2, "let's": 1.5, "we'll": 1.2, 'we need': 1.2, our: 0.8 },
     negative: { 'let me': 3 },
@@ -62,14 +67,20 @@ const DEFAULTS = {
   lexiconPath: null,
   specMax: 0.2,
   reactMin: 0.5,
-  baselineMinSamples: 10,
-  rollbackPercentile: 25,
-  // 动态恢复下限：spec 连续段阈值 = max(此下限, ⌈1/(1−p)⌉)，p=P(spec|spec) 取自
-  // 会话自身真实 band 历史（personaRatio 导出的 band）。默认 1 = 无静态门槛
-  // （动态项即门槛）；防闪烁（1–2 窗抖动）可配 3。
-  minDriftSteps: 1,
-  // 持久度证据上限：p ≥ 此值视为 spec 已是该会话常态、drift 属偶发，按下限直接恢复。
-  driftPersistenceMax: 0.98,
+  // ── P3 响应策略：会话内自参考偏离检验（取代旧的"单步 percentile<25"）──────
+  // 为什么换掉旧的：percentile 是**定义性秩**——取最低四分位就恒有 ~25% 的步落在
+  // 里面，它的边际率由阈值本身决定，不是模型行为；实测该信号在 25 个会话上的
+  // 会话间空转率是 4.3%–92.1%（差 21 倍），自相关 0.65、平均游程 4.27 步，
+  // 因此"根据全局语料解一对 (K,k)"在该信号上无解（K 拉到 32 仍有 8% 误进）。
+  // 新做法：拿**本会话自己的历史**当零假设，检验当前窗是否异常偏低（分布无关的
+  // 秩检验），预算直接落在会话内；离线语料只用来回答"该信号有没有判别力"。
+  refMinSteps: 12,      // 参考段最少步数；不足则不做任何动作（只记审计）
+  testWindow: 4,        // 检验窗长度
+  notifyAlpha: 0.05,    // 通知预算（p ≤ 该值 → 通知，不动能力）
+  actAlpha: 0.01,       // 能力层预算（更严；还需通过词典非退化闸门）
+  // P6 不变量：收窄态的步数硬上限（退出条件必然可达）。0 = 关闭该上限（不推荐）。
+  // 到顶后本漂移片段内禁止再次收窄，直到检验不再触发（片段结束）才复位。
+  maxDriftSteps: 12,
   historyCap: 200,
   leanDenyPatterns: [
     'vision_*', 'browser_*', 'sandbox_*', 'desktop_*',
@@ -135,6 +146,23 @@ function msg(error) {
   } catch (e) {
     return '<unprintable error>'
   }
+}
+
+// ---------- 失败姿态：fail-open + 可见 ----------
+// 原则（对照社区 dsh-anchored-standard/shared/{tool-bootstrap,context-gate}.mjs）：
+// 本插件自己的 bug 绝不能吃掉用户的能力或上下文——任何降级都必须朝"暴露全量"倒，
+// 并且必须响亮、可查（社区原文 "a gate bug must never eat the user's context"）。
+const warned = new Set()
+/** 一次性响亮告警：同一 reason 只打一次，避免每请求刷屏。 */
+function warnOnce(message) {
+  if (warned.has(message)) return
+  warned.add(message)
+  try { console.warn(`[${name}] ${message}`) } catch (e) { /* 无 console 环境忽略 */ }
+}
+const configWarnings = []
+function noteConfigWarning(message) {
+  if (!configWarnings.includes(message)) configWarnings.push(message)
+  warnOnce(message)
 }
 
 function round2(n) {
@@ -368,6 +396,22 @@ function recompute(rec, agent) {
   rec.personaRatio = pr
   rec.band = band
   rec.percentile = percentile === null ? null : Math.round(percentile * 10) / 10
+  // P5 词典非退化闸门所需：本会话累计的"桶是否命中过"证据。
+  rec.stepsScored += 1
+  if (agg.positiveWords > 0) rec.positiveHitSteps += 1
+  if (agg.negativeWords > 0) rec.negativeHitSteps += 1
+  const degen = lexiconDegenerate(rec.positiveHitSteps, rec.stepsScored, CONFIG.refMinSteps)
+  if (degen && rec.lexiconDegenerate !== degen) {
+    rec.lexiconDegenerate = degen
+    logAudit(rec, 'lexicon-degenerate', {
+      reason: degen,
+      stepsScored: rec.stepsScored,
+      positiveHitSteps: rec.positiveHitSteps,
+      negativeHitSteps: rec.negativeHitSteps,
+      effect: 'capability actions forbidden; notify-only',
+    })
+    warnOnce(`lexicon degenerate for ${rec.sessionId}: positive bucket never hit in ${rec.stepsScored} steps — capability actions disabled (notify-only)`)
+  }
   if (rec.ewmaCount === 0) rec.ewma = ratio
   else rec.ewma = CONFIG.ewmaAlpha * ratio + (1 - CONFIG.ewmaAlpha) * rec.ewma
   rec.ewmaCount += 1
@@ -451,66 +495,155 @@ function restrictWithCull(scopedTools, filter) {
   return { error: lastError || 'empty restriction' }
 }
 
-function applyRollback(rec, agent, via) {
+/**
+ * 阶段 → 模型可见工具面（纯函数，可单测；绝不修改入参、绝不触碰注册层）。
+ *
+ * 为什么是"派生"而不是 tools.restrict 的 deny 模式：注册层突变是不可逆的资源占用，
+ * 归还必须靠一个显式调用——本插件为此栽过跟头（实测 23 个会话触发、0 个归还，
+ * 恢复条件 band==='spec' 在 personaRatio≡1 时不可达；18 个会话工具面永久停在 23）。
+ * 组装期派生则天然可逆：阶段一变，下一次组装就是新面，"归还"这个词消失。
+ * 参照社区 dsh-anchored-standard/shared/tool-bootstrap.mjs（每次 assemble 由
+ * promotion 状态重新派生 filter）。
+ *
+ * @param phase - 'narrowed' 时收窄；其余阶段（stable/watch）原样返回。
+ * @param tools - 组装期交给模型的工具 schema 数组（PromptAssembly.tools）。
+ * @param patterns - 收窄用的 deny 模式（`*` 后缀通配）。
+ */
+export function surfaceForPhase(phase, tools, patterns) {
+  if (!Array.isArray(tools)) return tools
+  if (phase !== 'narrowed') return tools
+  const pats = Array.isArray(patterns) ? patterns : []
+  if (pats.length === 0) return tools
+  return tools.filter(t => !matchPatterns((t && t.name) || '', pats))
+}
+
+/**
+ * 单侧 Mann-Whitney 检验（纯函数，可单测）：P(检验窗取值随机地不高于参考窗) 的
+ * 正态近似 p 值（含并列修正与连续性修正）。用于"当前窗是否异常偏低"的**预算判定**
+ * ——不是发表级统计；参考段长度由 refMinSteps 兜底，近似在该量级足够决策用。
+ * 返回 [0,1]；样本不足返回 1（= 无证据，不动手）。
+ */
+export function mannWhitneyLowerP(test, reference) {
+  const t = Array.isArray(test) ? test.filter(v => Number.isFinite(v)) : []
+  const r = Array.isArray(reference) ? reference.filter(v => Number.isFinite(v)) : []
+  const n = t.length
+  const m = r.length
+  if (n === 0 || m === 0) return 1
+  const all = [...t, ...r]
+  // 平均秩（并列取平均）
+  const idx = all.map((v, i) => [v, i]).sort((a, b) => a[0] - b[0])
+  const ranks = new Array(all.length)
+  let tieSum = 0
+  for (let i = 0; i < idx.length;) {
+    let j = i
+    while (j + 1 < idx.length && idx[j + 1][0] === idx[i][0]) j += 1
+    const avg = (i + j) / 2 + 1
+    const tieCount = j - i + 1
+    if (tieCount > 1) tieSum += tieCount ** 3 - tieCount
+    for (let k = i; k <= j; k++) ranks[idx[k][1]] = avg
+    i = j + 1
+  }
+  const rankSumTest = ranks.slice(0, n).reduce((a, b) => a + b, 0)
+  const u = rankSumTest - (n * (n + 1)) / 2            // 越小 = 检验窗越低
+  const mu = (n * m) / 2
+  const N = n + m
+  const sigma = Math.sqrt(((n * m) / 12) * ((N + 1) - tieSum / (N * (N - 1))))
+  if (!(sigma > 0)) return 1
+  const z = (u + 0.5 - mu) / sigma                     // 连续性修正（向 0 收）
+  // 正态 CDF
+  const cdf = (x) => 0.5 * (1 + erf(x / Math.SQRT2))
+  return Math.min(1, Math.max(0, cdf(z)))
+}
+
+/** erf 近似（Abramowitz & Stegun 7.1.26），绝对误差 < 1.5e-7。 */
+function erf(x) {
+  const sign = x < 0 ? -1 : 1
+  const ax = Math.abs(x)
+  const t = 1 / (1 + 0.3275911 * ax)
+  const y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-ax * ax)
+  return sign * y
+}
+
+/**
+ * 行动分档（纯函数，可单测）。返回两个正交维度：
+ *   level  = 状态语义：'stable'（回到参考内，片段结束）| 'watch'（弱偏离，不动能力）
+ *            | 'narrowed'（强偏离，需过能力层闸门）
+ *   action = 实际动作：'none' | 'notice'（只审计，不改能力面）| 'narrow'（派生收窄）
+ * 分开的理由：状态是否结束只能由证据决定（p 回到参考内），而"要不要动手"还要过开关
+ * 与闸门——混在一起会导致"闸门拦截 → 片段被判结束 → 下一步立刻重新收窄"的抖动。
+ */
+export function policyDecision(input) {
+  const { p, refLen, refMinSteps, notifyAlpha, actAlpha, degenerate, budgetExhausted, rollbackEnabled, notifyEnabled } = input
+  if (!Number.isFinite(p)) return { level: 'stable', action: 'none', reason: 'no-observation' }
+  if (refLen < refMinSteps) return { level: 'stable', action: 'none', reason: 'insufficient-reference' }
+  if (p > notifyAlpha) return { level: 'stable', action: 'none', reason: 'within-reference' }
+  const notice = notifyEnabled === true ? 'notice' : 'none'
+  if (p > actAlpha) {
+    return { level: 'watch', action: notice, reason: notifyEnabled === true ? 'deviation-weak' : 'observe-only' }
+  }
+  // 强偏离：能力层闸门（任何一个不过 → 只通知/只审计，但仍保留 narrowed 状态语义）
+  if (rollbackEnabled !== true) {
+    const bothOff = notifyEnabled !== true
+    return { level: 'narrowed', action: notice, reason: bothOff ? 'observe-only' : 'capability-disabled' }
+  }
+  if (degenerate) return { level: 'narrowed', action: notice, reason: 'lexicon-degenerate' }
+  if (budgetExhausted) return { level: 'narrowed', action: notice, reason: 'capability-budget-exhausted' }
+  return { level: 'narrowed', action: 'narrow', reason: 'deviation' }
+}
+
+/** 词典退化判定（纯函数）：本会话已有足够观测，但正桶一次都没命中。 */
+export function lexiconDegenerate(positiveHitSteps, stepsScored, minSteps) {
+  if (stepsScored < minSteps) return false
+  return positiveHitSteps === 0 ? 'positive-bucket-never-hit' : false
+}
+
+function applyRollback(rec, via, p) {
   if (!CONFIG.rollbackEnabled) return
   if (!rec.anchored || !rec.lifted) return
-  if (rec.rollbackLift) return
-  const probe = probeFor(agent)
-  if (probe.error) {
-    logAudit(rec, 'rollback-failed', { error: probe.error, via })
+  if (rec.surfacePhase === 'narrowed') return
+  if (CONFIG.leanDenyPatterns.length === 0) {
+    logAudit(rec, 'rollback-skipped', { reason: 'no deny patterns configured', via })
     return
   }
-  const deny = probe.visible.filter(n => matchPatterns(n, CONFIG.leanDenyPatterns))
-  if (deny.length === 0) {
-    logAudit(rec, 'rollback-skipped', { reason: 'no deny matches', visibleCount: probe.visible.length, via })
-    return
-  }
-  const scopedTools = agent.ctx && agent.ctx.tools
-  if (!scopedTools || typeof scopedTools.restrict !== 'function') {
-    logAudit(rec, 'rollback-failed', { error: 'agent.ctx.tools.restrict unavailable', via })
-    return
-  }
-  const outcome = restrictWithCull(scopedTools, { deny })
-  if (outcome.error) {
-    logAudit(rec, 'rollback-failed', { error: outcome.error, via })
-    return
-  }
-  rec.rollbackLift = outcome.lift
-  rec.rollbackDeny = outcome.applied.slice()
+  // P1：只改阶段，可见面在下次组装时派生；不再调用 tools.restrict 的 deny 模式。
+  rec.surfacePhase = 'narrowed'
+  rec.surfaceNarrowedAt = Date.now()
+  rec.narrowedSteps = 0
+  rec.rollbackDeny = CONFIG.leanDenyPatterns.slice()
   if (CONFIG.mineCounterfactualCandidates) {
     rec.counterfactual = {
       startedAt: Date.now(),
-      decisionPoint: 'drift-entry',
-      injected: outcome.applied.slice(),
+      decisionPoint: 'deviation-test',
+      injected: CONFIG.leanDenyPatterns.slice(),
       requests: rec.requests,
       turn: rec.lastTurn,
       step: rec.lastStep,
       restored: null,
     }
   }
-  logAudit(rec, 'rollback', { deny: outcome.applied.slice(), ratio: round2(rec.weightedRatio), percentile: rec.percentile, via })
+  logAudit(rec, 'surface', { phase: 'narrowed', denied: CONFIG.leanDenyPatterns.slice(), via, p: round2(p), ratio: round2(rec.weightedRatio) })
 }
 
-function enterDrift(rec, agent, via) {
+function enterDrift(rec, via, p) {
   rec.machineState = 'drift'
-  rec.driftSteps = 1
+  rec.driftSteps = 0
   rec.driftEnteredAt = Date.now()
-  rec.rollbackAttempted = false
-  logAudit(rec, 'state', { state: 'drift', via, band: rec.band, percentile: rec.percentile })
-  applyRollback(rec, agent, 'drift-entry')
+  logAudit(rec, 'state', { state: 'drift', via, p: round2(p), band: rec.band })
+  applyRollback(rec, via, p)
 }
 
 function recoverRollback(rec, reason) {
   rec.machineState = 'stable'
   rec.driftSteps = 0
-  rec.rollbackAttempted = false
-  if (typeof rec.rollbackLift === 'function') {
-    try {
-      rec.rollbackLift()
-      rec.rollbackLift = null
-    } catch (e) {
-      logAudit(rec, 'rollback-lift-error', { error: msg(e) })
-    }
+  rec.narrowedSteps = 0
+  // 注意：capabilityBudgetExhausted 属于**漂移片段**的状态，只在片段真正结束
+  // （决策回到 stable）时复位。若在这里复位，会形成"耗尽→恢复→立刻再收窄"的
+  // 无限循环——那正是我们要消灭的那类不可达/不可终止的形态。
+  if (rec.surfacePhase === 'narrowed') {
+    // 派生面：只需把阶段改回去——下一次组装自然恢复全量，没有任何"归还"调用。
+    rec.surfacePhase = 'stable'
+    rec.surfaceRestoredAt = Date.now()
+    logAudit(rec, 'surface', { phase: 'stable', via: reason, denied: [] })
   }
   if (CONFIG.mineCounterfactualCandidates && rec.counterfactual) {
     rec.counterfactual.restored = {
@@ -529,70 +662,83 @@ function recoverRollback(rec, reason) {
   logAudit(rec, 'state', { state: 'stable', via: reason, band: rec.band })
 }
 
-/** 动态恢复阈值（纯函数，可单测）：p = P(spec|spec) 由会话自身的**真实 band 历史**
- *  （personaRatio 导出的 band，与运行时同一来源）估计。恢复要求当前 spec 连续段
- *  ≥ k = max(floor, ⌈1/(1−p)⌉)——spec 段必须长过该会话自己的预期 spec 段。
- *  p ≥ pMax（spec 已是该会话常态，drift 属偶发）时 k=floor 直接恢复；无独立上限。 */
-export function dynamicRecoveryLen(bandHistory, floor, pMax) {
-  const bands = bandHistory
-  let specCount = 0
-  let persist = 0
-  for (let i = 0; i < bands.length - 1; i++) {
-    if (bands[i] === 'spec') {
-      specCount += 1
-      if (bands[i + 1] === 'spec') persist += 1
-    }
-  }
-  if (bands[bands.length - 1] === 'spec') specCount += 1
-  const p = specCount > 0 ? persist / specCount : 0
-  const k = p >= pMax ? floor : Math.ceil(1 / (1 - p) - 1e-9)
-  return Math.max(floor, k)
+function notePolicySkipped(rec, reason) {
+  if (rec.lastPolicySkip === reason) return
+  rec.lastPolicySkip = reason
+  logAudit(rec, 'policy-skipped', { reason, history: rec.ratioHistory.length, refMinSteps: CONFIG.refMinSteps })
 }
 
+/**
+ * 状态机（P3）：判定 = 会话内自参考偏离检验，而非"单步落在最低四分位"。
+ * 进入收窄的每一次都带 (p, refLen)；退出有两条**必然可达**的路：
+ *   ① 检验不再触发（片段结束）；
+ *   ② 收窄满 maxDriftSteps → 能力预算耗尽（本片段内不再收窄，只通知）。
+ */
 function stateMachine(rec, agent) {
-  const prev = rec.machineState
-  if (prev === 'drift') {
-    rec.driftSteps += 1
-    if (rec.anchored && rec.lifted && !rec.rollbackLift && !rec.rollbackAttempted) {
-      rec.rollbackAttempted = true
-      applyRollback(rec, agent, 'drift-retry')
+  const hist = rec.ratioHistory
+  const refLen = hist.length - CONFIG.testWindow
+  let p = null
+  if (refLen >= 1) {
+    const test = hist.slice(hist.length - CONFIG.testWindow)
+    const reference = hist.slice(0, hist.length - CONFIG.testWindow)
+    p = mannWhitneyLowerP(test, reference)
+  }
+  const decision = policyDecision({
+    p,
+    refLen,
+    refMinSteps: CONFIG.refMinSteps,
+    notifyAlpha: CONFIG.notifyAlpha,
+    actAlpha: CONFIG.actAlpha,
+    degenerate: Boolean(rec.lexiconDegenerate),
+    budgetExhausted: Boolean(rec.capabilityBudgetExhausted),
+    rollbackEnabled: Boolean(CONFIG.rollbackEnabled),
+    notifyEnabled: Boolean(CONFIG.notifyEnabled),
+  })
+  rec.lastPolicy = decision.level
+  rec.lastPolicyAction = decision.action
+  rec.lastPolicyP = p === null ? null : round2(p)
+  rec.lastPolicyReason = decision.reason
+  if (decision.reason === 'insufficient-reference') {
+    notePolicySkipped(rec, decision.reason)
+  } else {
+    rec.lastPolicySkip = null
+  }
+  if (decision.level === 'stable') {
+    // 片段结束 = 证据回到参考内。这才是能力预算的复位点（见 recoverRollback 说明）。
+    if (rec.capabilityBudgetExhausted) {
+      rec.capabilityBudgetExhausted = false
+      logAudit(rec, 'capability-budget-reset', { via: 'episode-ended' })
     }
-    // 动态恢复：spec 连续段须长过会话自身的预期 spec 段（p 取自真实 band 历史）
-    if (rec.band === 'spec') {
-      rec.specRunLen = (rec.specRunLen || 0) + 1
-      const k = dynamicRecoveryLen(rec.bandHistory, CONFIG.minDriftSteps, CONFIG.driftPersistenceMax)
-      if (rec.specRunLen >= k) {
-        rec.specRunLen = 0
-        recoverRollback(rec, 'spec-band')
-      }
-    } else {
-      rec.specRunLen = 0
-    }
+    if (rec.machineState !== 'stable') recoverRollback(rec, decision.reason)
     return
   }
-  if (rec.band === 'spec') {
-    if (prev !== 'stable') {
-      rec.machineState = 'stable'
-      logAudit(rec, 'state', { state: 'stable', via: 'spec-band' })
-    }
-    return
-  }
-  if (rec.band === 'mixed') {
-    if (prev !== 'watch') {
+  if (decision.action === 'narrow') {
+    if (rec.machineState !== 'drift') enterDrift(rec, decision.reason, p)
+  } else {
+    // 偏离存在但不动能力面（弱偏离 / 闸门拦截）：保留状态语义，只写审计
+    if (rec.machineState === 'stable') {
       rec.machineState = 'watch'
-      logAudit(rec, 'state', { state: 'watch', band: 'mixed' })
+      logAudit(rec, 'state', { state: 'watch', via: decision.reason, p: rec.lastPolicyP })
     }
-    return
+    if (decision.action === 'notice' && rec.lastNoticeReason !== decision.reason) {
+      rec.lastNoticeReason = decision.reason
+      logAudit(rec, 'policy-notice', { reason: decision.reason, p: rec.lastPolicyP, effect: 'no capability change' })
+    }
   }
-  const baselineReady = rec.ratioHistory.length >= CONFIG.baselineMinSamples
-  const degraded = baselineReady && rec.percentile !== null && rec.percentile < CONFIG.rollbackPercentile
-  if (degraded) {
-    enterDrift(rec, agent, 'react-band+percentile')
-    return
-  }
-  if (prev !== 'watch') {
-    rec.machineState = 'watch'
-    logAudit(rec, 'state', { state: 'watch', band: 'react', baselineReady, percentile: rec.percentile })
+  // P6 不变量：收窄态必须有界——按"**面处于收窄态的步数**"计时，与本步动作无关
+  // （否则被闸门降级成 notice 的步数会漏计，实测就出现过 15 步 > maxDriftSteps=12）。
+  if (rec.surfacePhase === 'narrowed') {
+    rec.narrowedSteps += 1
+    rec.driftSteps = rec.narrowedSteps
+    if (CONFIG.maxDriftSteps > 0 && rec.narrowedSteps >= CONFIG.maxDriftSteps) {
+      rec.capabilityBudgetExhausted = true
+      logAudit(rec, 'capability-budget-exhausted', {
+        steps: rec.narrowedSteps,
+        maxDriftSteps: CONFIG.maxDriftSteps,
+        note: '本漂移片段内不再收窄；片段结束（回到参考内）后复位',
+      })
+      recoverRollback(rec, 'capability-budget-exhausted')
+    }
   }
 }
 
@@ -666,27 +812,32 @@ function restoreBootstrapContext(rec) {
 }
 
 function anchorAgent(agent, rec, channel) {
+  // 四条降级路径全部朝"暴露全量"倒：不施加任何限制，模型看到完整工具面。
+  // 每次降级都写 anchor-degraded 审计 + 一次性响亮告警，避免"以为锚定生效了"。
+  const degrade = (reason) => {
+    rec.anchorDegraded = true
+    rec.anchorError = reason
+    logAudit(rec, 'anchor-degraded', { reason, fullCatalogExposed: true, channel })
+    warnOnce(`bootstrap disabled, full catalog exposed: ${reason}`)
+  }
   const probe = probeFor(agent)
   if (probe.error) {
-    rec.anchorError = probe.error
-    logAudit(rec, 'anchor-failed', { error: probe.error, channel })
+    degrade(probe.error)
     return
   }
   const candidates = CONFIG.bootstrapTools.filter(n => probe.visible.includes(n))
   if (candidates.length === 0) {
-    logAudit(rec, 'anchor-skipped', { reason: 'no bootstrap tool visible to agent', visibleCount: probe.visible.length, channel })
+    degrade(`no bootstrap tool visible to agent (visible ${probe.visible.length})`)
     return
   }
   const scopedTools = agent.ctx && agent.ctx.tools
   if (!scopedTools || typeof scopedTools.restrict !== 'function') {
-    rec.anchorError = 'agent.ctx.tools.restrict unavailable'
-    logAudit(rec, 'anchor-failed', { error: rec.anchorError, channel })
+    degrade('agent.ctx.tools.restrict unavailable')
     return
   }
   const outcome = restrictWithCull(scopedTools, { allow: candidates })
   if (outcome.error) {
-    rec.anchorError = outcome.error
-    logAudit(rec, 'anchor-failed', { error: outcome.error, channel })
+    degrade(outcome.error)
     return
   }
   rec.restrictLift = outcome.lift
@@ -823,8 +974,8 @@ function adopt(agent, doAnchor, channel) {
     anchored: false,
     anchorChannel: null,
     anchorError: null,
+    anchorDegraded: false,
     anchorAllow: [],
-    restrictLift: null,
     requests: 0,
     messages: 0,
     toolCalls: 0,
@@ -846,12 +997,27 @@ function adopt(agent, doAnchor, channel) {
     lastState: 'stable',
     machineState: 'stable',
     driftSteps: 0,
-    specRunLen: 0,
-    bandHistory: [],
+    // P1：模型可见工具面 = 由该阶段在组装期派生（不再突变注册层）。
+    surfacePhase: 'stable',
+    surfaceNarrowedAt: null,
+    surfaceRestoredAt: null,
+    surfaceDeniedCount: 0,
+    // P3：会话内自参考偏离检验的输入与结论。
+    stepsScored: 0,
+    positiveHitSteps: 0,
+    negativeHitSteps: 0,
+    lexiconDegenerate: null,
+    narrowedSteps: 0,
+    capabilityBudgetExhausted: false,
+    lastPolicy: null,
+    lastPolicyAction: null,
+    lastPolicyP: null,
+    lastNoticeReason: null,
+    lastPolicyReason: null,
+    lastPolicySkip: null,
+    bandHistory: [],        // 审计用：personaRatio 导出的波段序列（离线回放读日志）
     driftEnteredAt: null,
-    rollbackLift: null,
     rollbackDeny: [],
-    rollbackAttempted: false,
     counterfactual: null,
     lastTurn: null,
     lastStep: null,
@@ -968,9 +1134,11 @@ function summaryOf(rec) {
     anchored: rec.anchored,
     anchorChannel: rec.anchorChannel,
     anchorError: rec.anchorError,
+    anchorDegraded: rec.anchorDegraded,
     anchorAllow: rec.anchorAllow,
     lifted: rec.lifted,
     liftReason: rec.liftReason,
+    liftError: rec.liftError,
     pendingPromote: rec.pendingPromote,
     contextSuppressed: rec.contextSuppressed,
     contextSuppressError: rec.contextSuppressError,
@@ -982,6 +1150,18 @@ function summaryOf(rec) {
     machineState: rec.machineState,
     driftSteps: rec.driftSteps,
     rollbackDeny: rec.rollbackDeny,
+    surfacePhase: rec.surfacePhase,
+    narrowedNow: rec.surfacePhase === 'narrowed',
+    narrowedSteps: rec.narrowedSteps,
+    capabilityBudgetExhausted: rec.capabilityBudgetExhausted,
+    policy: rec.lastPolicy,
+    policyAction: rec.lastPolicyAction,
+    policyP: rec.lastPolicyP,
+    policyReason: rec.lastPolicyReason,
+    lexiconDegenerate: rec.lexiconDegenerate,
+    stepsScored: rec.stepsScored,
+    positiveHitSteps: rec.positiveHitSteps,
+    negativeHitSteps: rec.negativeHitSteps,
     hasCounterfactual: rec.counterfactual !== null,
     maxTokensRewritten: rec.maxTokensRewritten,
     maxTokensStripped: rec.maxTokensStripped,
@@ -1035,12 +1215,18 @@ function buildSummary(filter) {
       bootstrapMaxTokens: CONFIG.bootstrapMaxTokens,
       specMax: CONFIG.specMax,
       reactMin: CONFIG.reactMin,
-      baselineMinSamples: CONFIG.baselineMinSamples,
-      rollbackPercentile: CONFIG.rollbackPercentile,
+      // P3 响应策略（会话内自参考偏离检验）
+      refMinSteps: CONFIG.refMinSteps,
+      testWindow: CONFIG.testWindow,
+      notifyAlpha: CONFIG.notifyAlpha,
+      actAlpha: CONFIG.actAlpha,
+      maxDriftSteps: CONFIG.maxDriftSteps,
       rollbackEnabled: CONFIG.rollbackEnabled,
+      notifyEnabled: CONFIG.notifyEnabled,
       suppressSkillCatalog: CONFIG.suppressSkillCatalog,
       rewardAnnotator: CONFIG.rewardAnnotator,
     },
+    configWarnings: configWarnings.slice(),
     listAtApply,
     tracked: recs.size,
     anchored: anchoredCount,
@@ -1059,12 +1245,17 @@ function buildSummary(filter) {
 function mergeConfig(config) {
   if (config === undefined || config === null || typeof config !== 'object') return
   for (const key of Object.keys(config)) {
-    if (!CONFIG_KEYS.has(key)) { console.error(`[${name}] unknown config key "${key}"`); continue }
+    if (!CONFIG_KEYS.has(key)) {
+      // 未知配置键：按"响亮 warn 但继续"处理（不阻断挂载）——写错的键在运行期会
+      // 静默失效，所以必须响亮且可在 anchor_status / 收尾 record 里查到。
+      noteConfigWarning(`unknown config key "${key}" — ignored (allowed: ${[...CONFIG_KEYS].sort().join(', ')})`)
+      continue
+    }
     if (key === 'lexicon') {
       const l = config[key]
       if (!l || typeof l !== 'object' ||
         typeof l.positive !== 'object' || typeof l.negative !== 'object' || typeof l.neutral !== 'object') {
-        console.error(`[${name}] invalid inline lexicon (needs positive/negative/neutral buckets); keeping current lexicon`)
+        noteConfigWarning('invalid inline lexicon (needs positive/negative/neutral buckets); keeping current lexicon')
         continue
       }
     }
@@ -1137,6 +1328,53 @@ export function apply(ctx, config) {
       }
     } catch (e) {
       // observers never throw
+    }
+  }))
+
+  // ---- system-prompt/assemble: 工具面在组装期派生（P1）+ 变更对模型可见（P4）----
+  // 每次请求重新求值：阶段回到 stable 时**下一次组装即全量**，无需任何"归还"调用。
+  // 任何异常都返回原 assembly（fail-open：本插件的 bug 绝不能吃掉用户的能力）。
+  disposers.push(ctx.on('system-prompt/assemble', async (assembly, context, next) => {
+    const out = await next()
+    try {
+      const agent = context && context.agent
+      const rec = agent && typeof agent.id === 'string' ? recs.get(agent.id) : undefined
+      if (!rec || rec.surfacePhase !== 'narrowed') {
+        if (rec && rec.noticePhase === 'narrowed') {
+          rec.noticePhase = 'stable'
+          logAudit(rec, 'notice', { phase: 'stable', text: 'tool surface restored to full catalog' })
+        }
+        return out
+      }
+      if (!CONFIG.rollbackEnabled) return out
+      const before = Array.isArray(out.tools) ? out.tools : []
+      const after = surfaceForPhase('narrowed', before, CONFIG.leanDenyPatterns)
+      const denied = before.length - after.length
+      if (rec.surfaceDeniedCount !== denied) {
+        rec.surfaceDeniedCount = denied
+        logAudit(rec, 'surface-applied', { kept: after.length, denied })
+      }
+      // P4：阶段变化时给模型一条**可见**说明（也是它不再调用已消失工具的原因）。
+      if (rec.noticePhase !== 'narrowed') {
+        rec.noticePhase = 'narrowed'
+        logAudit(rec, 'notice', { phase: 'narrowed', kept: after.length, denied })
+      }
+      const notice = {
+        name: 'trajectory-anchor:notice',
+        text: '[trajectory-anchor] Trajectory deviation detected (session-local reference test). '
+          + `The tool catalog for this turn is narrowed to ${after.length} tools (${denied} hidden). `
+          + 'Continue the task from where you left off, in plan-first style ("we will …"). '
+          + 'The full catalog returns automatically once the trajectory recovers; '
+          + 'do not call the hidden tools — they are absent this turn.',
+      }
+      return {
+        ...out,
+        tools: Array.isArray(after) ? after : out.tools,
+        sections: Array.isArray(out.sections) ? [...out.sections, notice] : out.sections,
+      }
+    } catch (e) {
+      warnOnce(`surface filter failed, exposing full catalog: ${msg(e)}`)
+      return out
     }
   }))
 
