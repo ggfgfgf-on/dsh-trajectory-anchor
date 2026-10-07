@@ -94,6 +94,20 @@ await boot({ rollbackEnabled: true })
   check('A: 参考段不足 → policy=stable / insufficient-reference',
     row.policy === 'stable' && row.policyReason === 'insufficient-reference', `${row.policy}/${row.policyReason}`)
   check('A: 未收窄', row.surfacePhase === 'stable' && row.narrowedNow === false)
+  check('A: 跳过判定也留痕（A 方案：insufficient-reference 写 policy-skipped）',
+    Array.isArray(row.auditTail) && row.auditTail.includes('policy-skipped'), JSON.stringify(row.auditTail))
+}
+
+// ── 场景 G：会话最开头（连检验窗都没有）也必须留痕 ───────────────────────
+await boot({ rollbackEnabled: true, notifyEnabled: true })
+{
+  const { session } = await adoptAndLift('sess-G')
+  // 锚定后只有 1 步：history < testWindow(4) → refLen ≤ 0 → no-observation
+  sessionEvent(session, text('let me check the output once'))
+  const row = await summaryOf('sess-G')
+  check('G: 最开头 → reason=no-observation', row.policyReason === 'no-observation', String(row.policyReason))
+  check('G: no-observation 同样写 policy-skipped（日志从第 1 步起可回溯）',
+    Array.isArray(row.auditTail) && row.auditTail.includes('policy-skipped'), JSON.stringify(row.auditTail))
 }
 
 // ── 场景 B：偏离触发 → 收窄 + 组装期派生 + notice ─────────────────────────

@@ -109,6 +109,18 @@ observations against the session's own earlier history with a one-sided
 Mann-Whitney test, so the budget lives *inside* the session and no global
 `(K, k)` pair is needed at all.
 
+**Effective warm-up is `testWindow + refMinSteps` = 16 steps (defaults).** The
+p-value needs a reference segment *outside* the test window
+(`refLen = history − testWindow ≥ refMinSteps`), so the first real decision can
+only land on step 16. The warm-up splits into two tiers; both are inert
+(`level=stable`, `action=none`) and both are written to the trajectory log as
+`policy-skipped`, so "why didn't the decision start?" is always answerable:
+
+| Tier | Condition | `policyReason` |
+|---|---|---|
+| no test window yet | `history < testWindow` (steps 1–4) | `no-observation` |
+| reference too short | `testWindow ≤ history < testWindow + refMinSteps` (steps 5–15) | `insufficient-reference` |
+
 **Every narrowed episode is bounded** by `maxDriftSteps` (exit condition
 provably reachable), and exhausting the capability budget blocks further
 narrowing until the episode genuinely ends.

@@ -130,6 +130,19 @@ if (existsSync(readmePath)) {
   else oks.push('C6 有界退出 + 安全默认（双关）+ 派生面接线：全部在位')
 }
 
+// ── C7 硬：两个"证据不足"档都必须留痕 ─────────────────────────────────────
+{
+  const lines = src.split('\n')
+  const callLine = lines.findIndex((l) => /notePolicySkipped\(rec, decision\.reason\)/.test(l))
+  const guard = callLine === -1 ? '' : lines.slice(Math.max(0, callLine - 8), callLine + 1).join('\n')
+  const hasNoObs = /no-observation/.test(guard)
+  const hasInsuff = /insufficient-reference/.test(guard)
+  if (callLine === -1) fails.push('C7 找不到 notePolicySkipped(rec, decision.reason) 调用点')
+  else if (!hasNoObs || !hasInsuff) {
+    fails.push(`C7 跳过判定的留痕不完整（no-observation=${hasNoObs} / insufficient-reference=${hasInsuff}）：两档都必须写 policy-skipped，否则"判定为何没启动"无法回溯`)
+  } else oks.push('C7 两个证据不足档都写 policy-skipped（日志从第 1 步起可回溯）')
+}
+
 // ── 输出 ────────────────────────────────────────────────────────────────
 for (const s of oks) console.log(`  OK    ${s}`)
 for (const s of debts) console.log(`  DEBT  ${s}`)

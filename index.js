@@ -698,7 +698,12 @@ function stateMachine(rec, agent) {
   rec.lastPolicyAction = decision.action
   rec.lastPolicyP = p === null ? null : round2(p)
   rec.lastPolicyReason = decision.reason
-  if (decision.reason === 'insufficient-reference') {
+  // 两个"证据不足"档都留痕（A 方案）：
+  //   no-observation         —— 连检验窗都没有（会话最开始的 testWindow 步）
+  //   insufficient-reference —— 检验窗有了，但参考段还不够长
+  // 两档的 level/action 相同（stable/none，不动能力面），差别只在**分档语义**；
+  // 但都必须能被日志看见，否则"判定为何没启动"在轨迹里无法回溯。
+  if (decision.reason === 'insufficient-reference' || decision.reason === 'no-observation') {
     notePolicySkipped(rec, decision.reason)
   } else {
     rec.lastPolicySkip = null
@@ -1163,6 +1168,9 @@ function summaryOf(rec) {
     positiveHitSteps: rec.positiveHitSteps,
     negativeHitSteps: rec.negativeHitSteps,
     hasCounterfactual: rec.counterfactual !== null,
+    // 最近审计种类摘要：让"判定为何没启动"这类问题不必翻日志就能看见
+    // （也是 policy-skipped 两档留痕的可测面）。
+    auditTail: rec.events.slice(-8).map(e => e.kind),
     maxTokensRewritten: rec.maxTokensRewritten,
     maxTokensStripped: rec.maxTokensStripped,
     reward: rec.reward,
