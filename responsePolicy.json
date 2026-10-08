@@ -1,11 +1,11 @@
 {
-  "generatedAtUtc": "2026-10-08T03:44:50.203Z",
+  "generatedAtUtc": "2026-10-08T03:53:01.174Z",
   "scope": {
     "pluginVersion": "0.5.0",
     "release": "B3-calibration",
     "taskFamily": "dsh-sessions"
   },
-  "corpusFingerprint": "sessions:128:481540007:1791431022847",
+  "corpusFingerprint": "sessions:128:482018620:1791431513534",
   "budget": {
     "targetFprPerSession": 0.05
   },
@@ -13,12 +13,31 @@
     "inaction": {
       "testWindow": 3,
       "refMinSteps": 20,
-      "capabilityEligible": true,
-      "verdict": "PASS(k=1, α=0.001)",
+      "capabilityEligible": false,
+      "verdict": "FAIL(召回不足：全 α 范围内最好 0.8% < 50%)",
       "derived": {
         "consecutive": 1,
         "alpha": 0.001,
         "sessionHitRate": 0.025974025974025976
+      },
+      "recallSide": {
+        "feasibleOperatingPoints": 8,
+        "bestRecallWithinBudget": 0.000630119722747322,
+        "bestRecallPoint": {
+          "alpha": 0.001,
+          "k": 1,
+          "precision": 0.2,
+          "chancePrecision": 0.19191235156117736
+        },
+        "bestRecallAnyAlpha": 0.008191556395715185,
+        "bestRecallAnyAlphaPoint": {
+          "alpha": 0.05,
+          "k": 1,
+          "firedSessions": 0.1864406779661017,
+          "precision": 0.07344632768361582,
+          "chancePrecision": 0.19191235156117736
+        },
+        "minRecallToAct": 0.5
       },
       "withinBudgetCandidates": [
         {
@@ -91,12 +110,31 @@
     "repetition": {
       "testWindow": 3,
       "refMinSteps": 20,
-      "capabilityEligible": true,
-      "verdict": "PASS(k=1, α=0.00001)",
+      "capabilityEligible": false,
+      "verdict": "FAIL(召回不足：全 α 范围内最好 4.3% < 50%)",
       "derived": {
         "consecutive": 1,
         "alpha": 0.00001,
         "sessionHitRate": 0
+      },
+      "recallSide": {
+        "feasibleOperatingPoints": 4,
+        "bestRecallWithinBudget": 0,
+        "bestRecallPoint": {
+          "alpha": 0.00001,
+          "k": 1,
+          "precision": null,
+          "chancePrecision": 0.19191235156117736
+        },
+        "bestRecallAnyAlpha": 0.0428481411468179,
+        "bestRecallAnyAlphaPoint": {
+          "alpha": 0.05,
+          "k": 1,
+          "firedSessions": 0.711864406779661,
+          "precision": 0.062157221206581355,
+          "chancePrecision": 0.19191235156117736
+        },
+        "minRecallToAct": 0.5
       },
       "withinBudgetCandidates": [
         {
@@ -147,6 +185,25 @@
       "capabilityEligible": false,
       "verdict": "notify-only(设计)",
       "derived": null,
+      "recallSide": {
+        "feasibleOperatingPoints": 4,
+        "bestRecallWithinBudget": 0,
+        "bestRecallPoint": {
+          "alpha": 0.00001,
+          "k": 1,
+          "precision": null,
+          "chancePrecision": 0.19191235156117736
+        },
+        "bestRecallAnyAlpha": 0.0258349086326402,
+        "bestRecallAnyAlphaPoint": {
+          "alpha": 0.05,
+          "k": 1,
+          "firedSessions": 0.6779661016949152,
+          "precision": 0.061746987951807226,
+          "chancePrecision": 0.19191235156117736
+        },
+        "minRecallToAct": 0.5
+      },
       "withinBudgetCandidates": [
         {
           "consecutive": 3,
@@ -194,13 +251,79 @@
     "observed": "unfit"
   },
   "recallSide": {
-    "status": "UNMEASURED",
-    "note": "语料里没有漂移标签（会话日志里只有\"确认性劣化\"事件，没有\"离题\"的金标准），因此召回与延迟仍未测。B4/T4 方案：用事后确认信号做**自动延迟标注**，把确认点之前 k 步标为正样本，从而算出召回/延迟与误报的联合曲线（工具：tools/drift-label-core.mjs）。"
+    "status": "MEASURED",
+    "method": "T4 事后确认的延迟标注（tools/measure-recall.mjs）：tool-error / unknown-tool / user-correction / abandoned-turn 作锚点，锚点前 lead 步内报出即命中",
+    "sessions": 59,
+    "anchors": {
+      "failure-marker": 1474,
+      "tool-error": 1317,
+      "unknown-tool": 70,
+      "user-correction": 147,
+      "abandoned-turn": 53
+    },
+    "lead": 3,
+    "perChannel": {
+      "inaction": {
+        "feasibleOperatingPoints": 8,
+        "bestRecallWithinBudget": 0.000630119722747322,
+        "bestRecallPoint": {
+          "alpha": 0.001,
+          "k": 1,
+          "precision": 0.2,
+          "chancePrecision": 0.19191235156117736
+        },
+        "bestRecallAnyAlpha": 0.008191556395715185,
+        "bestRecallAnyAlphaPoint": {
+          "alpha": 0.05,
+          "k": 1,
+          "firedSessions": 0.1864406779661017,
+          "precision": 0.07344632768361582,
+          "chancePrecision": 0.19191235156117736
+        },
+        "minRecallToAct": 0.5
+      },
+      "repetition": {
+        "feasibleOperatingPoints": 4,
+        "bestRecallWithinBudget": 0,
+        "bestRecallPoint": {
+          "alpha": 0.00001,
+          "k": 1,
+          "precision": null,
+          "chancePrecision": 0.19191235156117736
+        },
+        "bestRecallAnyAlpha": 0.0428481411468179,
+        "bestRecallAnyAlphaPoint": {
+          "alpha": 0.05,
+          "k": 1,
+          "firedSessions": 0.711864406779661,
+          "precision": 0.062157221206581355,
+          "chancePrecision": 0.19191235156117736
+        },
+        "minRecallToAct": 0.5
+      },
+      "failure": {
+        "feasibleOperatingPoints": 4,
+        "bestRecallWithinBudget": 0,
+        "bestRecallPoint": {
+          "alpha": 0.00001,
+          "k": 1,
+          "precision": null,
+          "chancePrecision": 0.19191235156117736
+        },
+        "bestRecallAnyAlpha": 0.0258349086326402,
+        "bestRecallAnyAlphaPoint": {
+          "alpha": 0.05,
+          "k": 1,
+          "firedSessions": 0.6779661016949152,
+          "precision": 0.061746987951807226,
+          "chancePrecision": 0.19191235156117736
+        },
+        "minRecallToAct": 0.5
+      }
+    },
+    "conclusion": "两条通道在**任何** α 下召回都远低于可用阈值，且精度低于随机基线 ⇒ 该信号不能驱动能力层（不是阈值问题，是信号没有判别力）"
   },
   "measurementSafe": false,
-  "verdict": "PARTIAL-PASS",
-  "capabilityEligibleChannels": [
-    "inaction",
-    "repetition"
-  ]
+  "verdict": "FAIL",
+  "capabilityEligibleChannels": []
 }

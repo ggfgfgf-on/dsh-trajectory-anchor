@@ -95,7 +95,15 @@ export function legacySeriesFromSessions(sessionsDir, opts = {}) {
  * 族错误率 1−(1−α)^N 会把单次检验的 α 放大几十倍。连续确认把独立检验的误报乘起来，
  * 把预算真正压回会话级。
  *
- * @returns { sessionsHit, total, rate, perSession: [{sid, steps, fired, firstFireStep, firedSteps}] }
+ * 返回里带上**触发步下标**（`fires`，0-based，落在序列上）：标注/召回评估要问"这一触发落在
+ * 哪个步"，只有会话级命中率是答不了的（那是 B2 空转侧的粒度）。
+ *
+ * ⚠ 约定：`firstFireStep` 是 **1-based**，且指的是**确认游程的第一步**（不是触发的下标）——
+ *   即 `fires[0] + 1 - (consecutive - 1)`。k=1 时两者重合（都等于 fires[0]+1），k>1 时
+ *   firstFireStep 会**早于** fires[0]。这个字段是历史遗留的"第几步开始有证据"口径，
+ *   做召回/延迟请一律用 `fires`（0-based、与序列下标一致），别混用两套编号。
+ *
+ * @returns { sessionsHit, total, rate, perSession: [{sid, steps, fired, firstFireStep, firedSteps, fires}] }
  */
 export function walkChannel(sessions, seriesKey, cfg) {
   const { testWindow, refMinSteps, alpha } = cfg
@@ -108,6 +116,7 @@ export function walkChannel(sessions, seriesKey, cfg) {
     let firstFireStep = null
     let firedSteps = 0
     let run = 0
+    const fires = []
     for (let i = 0; i < series.length; i++) {
       const hist = series.slice(0, i + 1)
       const refLen = hist.length - testWindow
@@ -122,6 +131,7 @@ export function walkChannel(sessions, seriesKey, cfg) {
         if (run >= consecutive) {
           fired = true
           firedSteps += 1
+          fires.push(i)
           if (firstFireStep === null) firstFireStep = i - consecutive + 2
         }
       } else {
@@ -129,7 +139,7 @@ export function walkChannel(sessions, seriesKey, cfg) {
       }
     }
     if (fired) sessionsHit += 1
-    perSession.push({ sid: s.sid, steps: series.length, fired, firstFireStep, firedSteps })
+    perSession.push({ sid: s.sid, steps: series.length, fired, firstFireStep, firedSteps, fires })
   }
   return { sessionsHit, total: sessions.length, rate: sessions.length ? sessionsHit / sessions.length : 0, perSession }
 }

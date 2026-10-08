@@ -321,39 +321,47 @@ await boot({ ...ARMED, responsePolicyPath: write('broken.json', null) })
   check('⑧ 解析失败有响亮告警', warnings.some((w) => /failed to load response policy/.test(w)), JSON.stringify(warnings.slice(0, 1)))
 }
 
-// ── ⑪ 出厂标定件必须真的能授权（端到端：标定工具产物 → 运行时加载器 → 生效参数）──
-// 守两个实测踩到的断点：
+// ── ⑪ 出厂标定件必须自洽，且"授权"这条路本身是通的（端到端）────────────────────
+// 守三个实测踩到的断点：
 //   · 标定工具以前**不产出** derived(k,α) ⇒ 反解结果永远上不了线（加载器支持但没人写）；
-//   · 标定工具以前写 measurementSafe: true ⇒ 装载即强制只观察，"有资格却永远不动手"。
+//   · 标定工具以前写 measurementSafe: true ⇒ 装载即强制只观察，"有资格却永远不动手"；
+//   · 只测空转侧就授予资格 ⇒ "把 α 压到 1e-5、从不触发"也能合格（那不是合格，是没有能力）。
+// 当前实测结论是 FAIL（两条通道在全 α 范围内最好召回 4.3%，精度低于随机基线），
+// 所以这里断言的是**自洽性 + 路径可用性**，而不是"必须有资格"。
 {
   const shipped = resolve(here, '..', 'responsePolicy.json')
   const art = JSON.parse(readFileSync(shipped, 'utf8'))
-  check('⑪ 出厂标定件存在且裁决为 PASS/PARTIAL-PASS',
-    ['PASS', 'PARTIAL-PASS'].includes(art.verdict), String(art.verdict))
+  const eligible = art.capabilityEligibleChannels || []
+  const pass = ['PASS', 'PARTIAL-PASS'].includes(art.verdict)
+  check('⑪ 出厂标定件裁决与资格自洽', (pass && eligible.length > 0) || (!pass && eligible.length === 0),
+    `verdict=${art.verdict} eligible=${JSON.stringify(eligible)}`)
   check('⑪ 出厂标定件不得自带 measurementSafe（否则装载即永久只观察）', art.measurementSafe !== true, String(art.measurementSafe))
-  check('⑪ 每个有资格通道都带 derived(k,α)',
-    (art.capabilityEligibleChannels || []).every((c) => art.channels?.[c]?.derived
-      && Number.isFinite(art.channels[c].derived.alpha) && Number.isFinite(art.channels[c].derived.consecutive)),
-    JSON.stringify(art.capabilityEligibleChannels || []))
+  check('⑪ 出厂标定件带召回侧结论（哪怕是 FAIL 也要写清原因）',
+    art.recallSide && art.recallSide.status === 'MEASURED' && typeof art.recallSide.conclusion === 'string',
+    JSON.stringify(art.recallSide && { s: art.recallSide.status, c: (art.recallSide.conclusion || '').slice(0, 40) }))
+  // 装载出厂标定件：FAIL ⇒ 只观察，且原因可见
   await boot({ rollbackEnabled: true, notifyEnabled: true, responsePolicyPath: shipped })
   const s = await statusOf()
-  check('⑪ 装载出厂标定件后卡口放行', s.capabilityGate === null, String(s.capabilityGate))
-  check('⑪ 授权通道与产物一致', JSON.stringify(s.policyArtifact?.eligibleChannels) === JSON.stringify(art.capabilityEligibleChannels),
-    JSON.stringify(s.policyArtifact?.eligibleChannels))
+  check('⑪ 装载 FAIL 标定件 ⇒ 只观察（capabilityGate=policy-REJECTED）',
+    s.capabilityGate === 'policy-REJECTED' && s.config.effectiveRollback === false, String(s.capabilityGate))
+  // 把它改成 PASS（并补上 derived）后必须真的授权——证明"路径可用"而不是"永远关着"
+  const armed = JSON.parse(JSON.stringify(art))
+  armed.verdict = 'PASS'
+  armed.capabilityEligibleChannels = ['inaction']
+  armed.channels.inaction.derived = { consecutive: 2, alpha: 0.002 }
+  const armedPath = write('armed.json', armed)
+  await boot({ rollbackEnabled: true, notifyEnabled: true, responsePolicyPath: armedPath })
+  const s2 = await statusOf()
+  check('⑪ 同一标定件改成 PASS 后卡口放行（授权路径确实通）', s2.capabilityGate === null, String(s2.capabilityGate))
+  check('⑪ 并且只授权写明的通道', JSON.stringify(s2.policyArtifact?.eligibleChannels) === JSON.stringify(['inaction']),
+    JSON.stringify(s2.policyArtifact?.eligibleChannels))
   const { session } = adoptAndLift('gate-shipped')
   deviate(session)
   const row = await rowOf('gate-shipped')
-  let ok = true
-  const seen = {}
-  for (const name of art.capabilityEligibleChannels || []) {
-    const ch = (row.channels || []).find((c) => c.name === name)
-    const d = art.channels[name].derived
-    seen[name] = ch ? { a: ch.actAlpha, k: ch.consecutive } : null
-    if (!ch || ch.actAlpha !== d.alpha || ch.consecutive !== d.consecutive) ok = false
-  }
-  check('⑪ 反解参数真正写进生效配置', ok, JSON.stringify(seen))
-  const failCh = (row.channels || []).find((c) => c.name === 'failure')
-  check('⑪ notify-only 通道未被授予资格', failCh && failCh.eligible === false, JSON.stringify(failCh && { e: failCh.eligible, a: failCh.actAlpha }))
+  const ina = (row.channels || []).find((c) => c.name === 'inaction')
+  check('⑪ 反解参数真正写进生效配置', ina && ina.actAlpha === 0.002 && ina.consecutive === 2, JSON.stringify(ina && { a: ina.actAlpha, k: ina.consecutive }))
+  const lex = (row.channels || []).find((c) => c.name === 'lexicon')
+  check('⑪ 未授权的通道保持无资格', lex && lex.eligible === false, JSON.stringify(lex && { e: lex.eligible }))
 }
 
 console.warn = origWarn

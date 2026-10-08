@@ -206,11 +206,39 @@ configuration can be picked **without re-sweeping**.
 > cases against hand-computed truth (invariant C15). Both were negative-tested:
 > breaking the turn-end exclusion or the cross-turn rule makes them fail.
 
-**Recall is still unmeasured** — the corpus contains no labelled drift — hence
-`recallSide.status = UNMEASURED` in the artifact and the capability layer stays
-off until labels exist. The label plan (T4, automatic delayed labelling from
-*after-the-fact confirmations* such as runtime tool errors, `unknown tool`, user
-corrections and abandoned turns) is what `tools/drift-label-core.mjs` exists for.
+**Recall is now measured, and it says the signal does not discriminate.** Recall was
+the missing half — a detector that never fires has a perfect false-alarm rate. Using
+T4 (automatic *delayed labelling*: after-the-fact confirmations as anchors, steps
+before them as positives) on 59 sessions / 1,587 independent anchors
+(`tools/measure-recall.mjs`, labels via `tools/drift-label-core.mjs`):
+
+| Channel | α=0.05, k=1 fires/session | recall@3 steps | precision | chance baseline |
+|---|---|---|---|---|
+| `inaction` (A′) | 3.00 | **0.8%** | 7.3% | 19.2% |
+| `repetition` (C) | 18.54 | **4.3%** | 6.2% | 19.2% |
+| `failure` (B) | 11.25 | 2.6% | 6.2% | 19.2% |
+
+The loosest threshold already fires 18 times per session and still recovers 4.3% of
+the confirmations — **and its precision (6.2%) is three times *below* the 19.2%
+chance baseline**, i.e. the fires are placed worse than at random (a repeated
+identical tool call is the signature of *normal iterative debugging*: run the test,
+fix, run it again). So the problem is not the threshold and not the budget: this
+signal has no discriminative power for confirmed degradation, and **no operating
+point on it is usable**.
+
+Two honesty caveats that bound the claim: (a) the anchors confirm *failure*, not
+"off-task" — a failing test is normal work — so the measured quantity is "does it
+predict imminent confirmed failure"; (b) anchors are dominated by `tool-error`
+(1,317 of 1,587). Measuring task-level drift needs anchors that carry drift meaning
+(`unknown-tool`, user corrections, abandoned turns) or, better, task-grounded labels
+(a benchmark prompt that states its scope makes "edited files outside the stated
+scope" objectively checkable) — which is the next step, not a threshold sweep.
+
+Consequently the shipped `responsePolicy.json` records **verdict `FAIL` with zero
+capability-eligible channels**, and the capability layer stays off. The gate is not
+"off by default and untested" — it is *closed because the only available signal was
+measured and rejected*, and the machinery to open it (artifact → eligibility →
+derived parameters → effective switches) is verified end-to-end by gate case ⑪.
 
 **Effective warm-up is `testWindow + refMinSteps` = 16 steps (defaults).** The
 p-value needs a reference segment *outside* the test window
@@ -413,22 +441,24 @@ node tools\export-layer4.mjs `
   `tools/test-anchor-contract.mjs` — 24 install-and-use / contract cases (incl. the
   "apply() with no config at all" mount and a lossless-JSON walk over live rows);
   `tools/test-response-policy.mjs` — 30 end-to-end policy cases (A…J);
-  `tools/test-policy-gate.mjs` — 46 B3 gate cases (artifact / expiry / evaluation
+  `tools/test-policy-gate.mjs` — 47 B3 gate cases (artifact / expiry / evaluation
   protection / auto-demote / two-tier counters / the shipped artifact end-to-end,
   each with its opposite direction);
+  `tools/test-drift-label.mjs` — 35 labelling cases (metrics, anchors, and the
+  circular-labelling guard proven load-bearing);
   `tools/test-ledger-semantics.mjs` — 11 hand-computed finalization cases (ground truth
   for the four ledger paths, including the two the real corpus never exercises);
   `tools/test-ledger-parity.mjs` — 14 live-vs-batch parity runs (4 synthetic streams +
   3 real sessions, every decision point compared);
   `tools/replay-interventions.mjs` — bounded episodes, compliant end reasons, replayable
-- Shipped calibration artifact: `responsePolicy.json` (verdict `PARTIAL-PASS`,
-  capability-eligible `inaction` + `repetition` with their derived `(k, α)`,
-  `withinBudgetCandidates`, corpus fingerprint, and the G3 negative control recorded).
-  It is **not auto-loaded** — `responsePolicyPath` defaults to `null`, so a fresh
-  install observes only. Point the config (or `TRAJECTORY_ANCHOR_POLICY_PATH`) at it to
-  arm the capability layer, and note that a copy with `measurementSafe: true` forces
-  observe-only (that is the evaluation-protection switch, not a property of a
-  well-formed artifact — invariant C16 fails the build if the shipped one carries it)
+- Shipped calibration artifact: `responsePolicy.json` — verdict **`FAIL`**, zero
+  capability-eligible channels, the false-alarm sweep per channel, the **measured
+  recall side** with its conclusion, the G3 negative control, and a corpus
+  fingerprint (count / bytes / newest mtime). It is **not auto-loaded**
+  (`responsePolicyPath` defaults to `null`), so a fresh install observes only; the
+  same file is the input `tools/measure-recall.mjs` reads for its α/k, and the
+  loader refuses it while the verdict is not `PASS`/`PARTIAL-PASS` (invariants C16 +
+  gate case ⑪ keep the artifact and the loader in agreement).
 - Event-sequence assertion: `adopted → anchored → context-suppressed → maxTokens-rewrite →
   gate-armed → lift(anchor-gate:minimal-like | max-steps) → context-restored →
   maxTokens-strip → score… → closed + record(incl. reward)`

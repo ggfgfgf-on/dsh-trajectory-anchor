@@ -369,16 +369,29 @@ if (existsSync(readmePath)) {
     if (art) {
       if (art.measurementSafe === true) problems.push('标定件自带 measurementSafe: true ⇒ 装载即强制只观察，"授权"这条路永远走不通')
       const eligible = Array.isArray(art.capabilityEligibleChannels) ? art.capabilityEligibleChannels : []
-      if (!['PASS', 'PARTIAL-PASS'].includes(art.verdict)) problems.push(`verdict=${art.verdict}（装载后会被判非法并只观察，等于白给）`)
+      const pass = ['PASS', 'PARTIAL-PASS'].includes(art.verdict)
+      // FAIL 是合法结果（而且是当前实测的结果），但必须自洽：FAIL ⇒ 不得声称任何通道有资格；
+      // PASS/PARTIAL-PASS ⇒ 每个有资格通道都必须带 derived(k,α)，否则反解参数到不了运行时。
+      if (!pass && eligible.length > 0) {
+        problems.push(`verdict=${art.verdict} 却声称有资格通道 [${eligible.join(', ')}]（要么改裁决，要么清空资格）`)
+      }
+      if (pass && eligible.length === 0) {
+        problems.push(`verdict=${art.verdict} 却没有任何有资格通道（装载后等价于只观察，裁决名不副实）`)
+      }
       for (const c of eligible) {
         const d = art.channels && art.channels[c] && art.channels[c].derived
         if (!d || !Number.isFinite(d.alpha) || !Number.isFinite(d.consecutive)) {
           problems.push(`有资格通道 ${c} 没有 derived(k,α) ⇒ 反解参数到不了运行时`)
         }
       }
+      // 空转侧合格而召回侧未测 ⇒ 不许给资格（"从不触发"的空转率也是 0）
+      if (pass && art.recallSide && art.recallSide.status !== 'MEASURED') {
+        problems.push('recallSide 尚未测量却已授予资格（空转侧合格可能是"从不触发"造成的）')
+      }
     }
     if (problems.length) for (const p of problems) fails.push(`C16 ${p}`)
-    else oks.push(`C16 出厂标定件可用：verdict=${art.verdict}，授权 ${(art.capabilityEligibleChannels || []).length} 个通道且都带 derived，未带 measurementSafe`)
+    else oks.push(`C16 出厂标定件自洽：verdict=${art.verdict}，授权 ${(art.capabilityEligibleChannels || []).length} 个通道，`
+      + `召回侧=${(art.recallSide && art.recallSide.status) || 'n/a'}，未带 measurementSafe`)
   }
 }
 

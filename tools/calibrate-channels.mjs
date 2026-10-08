@@ -17,7 +17,7 @@ import { walk } from './session-log-core.mjs'
 const args = process.argv.slice(2)
 // 带值选项（--out/--budget）的**值**不属于位置参数：否则 `--out <前缀>` 的值会被当成
 // 会话目录，于是"测了 0 个会话"——实测踩到（脚本正确地 fail-loud 退出，但根因是这里）。
-const FLAGS_WITH_VALUE = new Set(['--out', '--budget'])
+const FLAGS_WITH_VALUE = new Set(['--out', '--budget', '--recall', '--min-recall'])
 const positional = []
 for (let i = 0; i < args.length; i++) {
   if (FLAGS_WITH_VALUE.has(args[i])) { i += 1; continue }
@@ -27,6 +27,22 @@ for (let i = 0; i < args.length; i++) {
 const sessionsDir = resolve(positional[0] || (process.env.USERPROFILE ? `${process.env.USERPROFILE}\\.dsh\\sessions` : '.'))
 const outPrefix = resolve(args.includes('--out') ? args[args.indexOf('--out') + 1] : './response-policy')
 const budget = Number(args.includes('--budget') ? args[args.indexOf('--budget') + 1] : 0.05)
+// 召回侧报告（tools/measure-recall.mjs 的产物）。给了它，资格判定就必须**同时**过两关：
+//   ① 空转侧：会话级误触发率 ≤ budget（下面反解）；
+//   ② 召回侧：在"空转侧可行"的工作点里，最好召回 ≥ --min-recall。
+// 为什么必须有第二关：只有空转侧时，把 α 压到 1e-5 就能"合格"——因为那时它**从不触发**。
+// 一个从不触发的检测器空转率当然是 0，但那不是合格，是没有检测能力。
+// 实测（59 会话 / 41k 步）：行为通道在**最宽**的 α=0.05 下召回也只有 4.3%，
+// 且精度（6.2%）**低于随机基线**（19.2%）——即触发放置得比随便放还差。据此判定 FAIL。
+const recallPath = args.includes('--recall') ? resolve(args[args.indexOf('--recall') + 1]) : null
+const minRecall = Number(args.includes('--min-recall') ? args[args.indexOf('--min-recall') + 1] : 0.5)
+let recallReport = null
+if (recallPath) {
+  try { recallReport = JSON.parse(readFileSync(recallPath, 'utf8')) } catch (e) {
+    console.error(`读不到召回报告 ${recallPath}：${e && e.message}`)
+    process.exit(1)
+  }
+}
 
 // 通道参数（与 index.js DEFAULTS.responseChannels 对齐）
 const CHANNELS = [
@@ -75,6 +91,25 @@ for (const ch of CHANNELS) {
   for (const k of KS) for (const alpha of ALPHAS) {
     if (grid[`${k}:${alpha}`] < best.rate) { best.consecutive = k; best.alpha = alpha; best.rate = grid[`${k}:${alpha}`] }
   }
+  // ── 召回侧：在"空转侧可行"的工作点里取最好召回 ──────────────────────────────
+  // feasible = 该 (α,k) 的会话级空转率 ≤ budget
+  let recallSide = null
+  if (recallReport) {
+    const sweepRows = (recallReport.sweep && recallReport.sweep[ch.key]) || []
+    const feasible = sweepRows.filter((r) => r.firedSessions <= budget && r.recall !== null)
+    const bestRow = feasible.slice().sort((a, b) => b.recall - a.recall)[0] || null
+    const anyRow = sweepRows.slice().sort((a, b) => (b.recall ?? -1) - (a.recall ?? -1))[0] || null
+    recallSide = {
+      feasibleOperatingPoints: feasible.length,
+      bestRecallWithinBudget: bestRow ? bestRow.recall : null,
+      bestRecallPoint: bestRow ? { alpha: bestRow.alpha, k: bestRow.k, precision: bestRow.precision, chancePrecision: bestRow.chancePrecision } : null,
+      // 即便放宽到预算外，也最好不过这个数——用来区分"阈值选错了"与"信号没有判别力"
+      bestRecallAnyAlpha: anyRow ? anyRow.recall : null,
+      bestRecallAnyAlphaPoint: anyRow ? { alpha: anyRow.alpha, k: anyRow.k, firedSessions: anyRow.firedSessions, precision: anyRow.precision, chancePrecision: anyRow.chancePrecision } : null,
+      minRecallToAct: minRecall,
+    }
+  }
+  const recallOk = !recallSide || (recallSide.bestRecallAnyAlpha ?? 0) >= minRecall
   results.push({
     ...ch,
     grid,
@@ -83,8 +118,12 @@ for (const ch of CHANNELS) {
     withinBudget: KS.flatMap((k) => ALPHAS.filter((a) => grid[`${k}:${a}`] <= budget).map((a) => ({ consecutive: k, alpha: a, rate: grid[`${k}:${a}`] })))
       .sort((x, y) => (y.alpha - x.alpha) || (x.consecutive - y.consecutive)),
     floor: best,
-    capabilityEligible: !ch.notifyOnly && Boolean(chosen),
-    verdict: ch.notifyOnly ? 'notify-only(设计)' : (chosen ? `PASS(k=${chosen.consecutive}, α=${chosen.alpha})` : `FAIL(无解：最低仍 ${(best.rate * 100).toFixed(1)}%)`),
+    recallSide,
+    capabilityEligible: !ch.notifyOnly && Boolean(chosen) && recallOk,
+    verdict: ch.notifyOnly ? 'notify-only(设计)'
+      : !chosen ? `FAIL(无解：最低仍 ${(best.rate * 100).toFixed(1)}%)`
+        : !recallOk ? `FAIL(召回不足：全 α 范围内最好 ${((recallSide.bestRecallAnyAlpha ?? 0) * 100).toFixed(1)}% < ${(minRecall * 100).toFixed(0)}%)`
+          : `PASS(k=${chosen.consecutive}, α=${chosen.alpha})`,
   })
 }
 console.log('\n② 反解结果（按预算反推证据要求）')
@@ -141,6 +180,7 @@ const artifact = {
     // 之前这里只写了 testWindow/refMinSteps 与几个读数，于是"反解出来的 (k,α)"
     // 永远上不了线——标定产物与可用参数之间断了一截。
     derived: (!r.notifyOnly && r.derived) ? { consecutive: r.derived.consecutive, alpha: r.derived.alpha, sessionHitRate: r.derived.rate } : null,
+    recallSide: r.recallSide,
     // 预算内的**全部**候选，按 α 从宽到严排序（越宽越灵敏 ⇒ 召回越高、误报越贴着预算）。
     // 现在选的是最保守的那个（召回侧还没测，不能拿灵敏度换风险）；等 B4/T4 测出召回，
     // 这份候选表就是"在同预算下选召回最高者"的直接依据——不用重新扫。
@@ -153,12 +193,23 @@ const artifact = {
     expected: 'unfit',
     observed: legacyUnfit ? 'unfit' : 'fit',
   },
-  recallSide: {
-    status: 'UNMEASURED',
-    note: '语料里没有漂移标签（会话日志里只有"确认性劣化"事件，没有"离题"的金标准），'
-      + '因此召回与延迟仍未测。B4/T4 方案：用事后确认信号做**自动延迟标注**，'
-      + '把确认点之前 k 步标为正样本，从而算出召回/延迟与误报的联合曲线（工具：tools/drift-label-core.mjs）。',
-  },
+  recallSide: recallReport
+    ? {
+        status: 'MEASURED',
+        method: 'T4 事后确认的延迟标注（tools/measure-recall.mjs）：tool-error / unknown-tool / user-correction / abandoned-turn 作锚点，锚点前 lead 步内报出即命中',
+        sessions: recallReport.sessionsUsed,
+        anchors: recallReport.anchorStats,
+        lead: recallReport.lead,
+        perChannel: Object.fromEntries(results.map((r) => [r.key, r.recallSide])),
+        conclusion: results.every((r) => !r.capabilityEligible || r.notifyOnly)
+          ? '两条通道在**任何** α 下召回都远低于可用阈值，且精度低于随机基线 ⇒ 该信号不能驱动能力层（不是阈值问题，是信号没有判别力）'
+          : '至少一条通道在预算内达到了召回阈值',
+      }
+    : {
+        status: 'UNMEASURED',
+        note: '未提供召回报告（--recall <measure-recall 产物>）。只测空转侧的判定**不足以**授予资格：'
+          + '把 α 压到 1e-5 时"从不触发"也能满足预算，那不是合格而是没有检测能力。',
+      },
   // 注意（设计陷阱，实测踩到）：`measurementSafe: true` 会让装载它的**运行实例强制只观察**
   // （index.js 的标定件加载器会把它写进 CONFIG.measurementSafe ⇒ 能力层与通知层全关）。
   // 所以标定产物**绝不能**默认带上它——那样"标定件授权能力层"这条路永远走不通，
