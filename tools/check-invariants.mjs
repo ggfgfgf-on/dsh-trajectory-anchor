@@ -329,6 +329,13 @@ if (existsSync(readmePath)) {
   if (!/if \(CONFIG\.measurementSafe === true\) return false/.test(src)) {
     problems.push('评测保护未进门禁（measurementSafe 必须能强制只观察）')
   }
+  // 自动降档的分母必须是**单调**标记：narrowedSteps 会在片段恢复时被清零，
+  // 用它回答"本会话动过手吗"会系统性低估（收窄后又恢复的会话全部漏计），
+  // 安全阀因此更难触发——实测踩到（同一批会话 narrowed 被记成 0 而不是 2）。
+  if (!/sessionOutcomes\.push\(\{ narrowed: rec\.didNarrow === true \}\)/.test(src)) {
+    problems.push('自动降档仍在用非单调口径（应为 rec.didNarrow；narrowedSteps 会被 recoverRollback 清零）')
+  }
+  if (!/rec\.didNarrow = true/.test(src)) problems.push('缺少单调标记 rec.didNarrow 的置位点')
   if (problems.length) for (const p of problems) fails.push(`C13 ${p}`)
   else oks.push('C13 B3 门禁接线：CONFIG 每次挂载重播种、两级连续计数分层、肢动路径只读有效开关')
 }

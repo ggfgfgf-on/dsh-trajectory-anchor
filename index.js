@@ -149,6 +149,17 @@ const DEFAULTS = {
   // 先验的等效样本量（步）：S 越小越"信会话自己"，越大越"信族"。20 步 ≈ 默认 refMinSteps，
   // 于是"参考段刚够长时先验与数据各占一半"。
   priorStrength: 20,
+  // ── L3 第三层：结局回灌（按通道把"动了之后的结果"回灌到门限上）────────────────
+  // 默认关：它是**门限执行器**，按项目纪律这类东西必须先在真实会话里攒够样本。
+  // 打开后是**非对称**的：不产出就收紧（安全方向）、放宽需要更多样本且更高产出率、
+  // 产出极差则撤销**该通道**的资格（比全局 autoDemote 精确得多）。
+  outcomeFeedbackEnabled: false,
+  feedbackMinSessions: 5,
+  feedbackMinProductiveRate: 0.6,
+  feedbackRevokeEligibilityRate: 0.2,
+  feedbackAlphaFloorDivisor: 64,
+  // 探索步：长期无变化就周期性回升一档（防"收紧到不再触发 ⇒ 证据断流 ⇒ 永久锁死"的单向棘轮）。
+  feedbackExploreAfterSessions: 30,
   // P6 不变量：收窄态的步数硬上限（退出条件必然可达）。0 = 关闭该上限（不推荐）。
   // 到顶后本漂移片段内禁止再次收窄，直到检验不再触发（片段结束）才复位。
   // 取值来源（不是拍脑袋）：45 个历史会话 / 3299 步关上限回放得到的自然片段长度
@@ -999,10 +1010,16 @@ function stateMachine(rec, agent) {
     // 标定件反解出的 (α=1e-5, k) 语义就是"连续 k 次 p≤1e-5"。若在线改用 1e-4 计数，
     // 在线判定会比标定**更松**（1e-4 档的命中被算进连续），结果就是"离线合格、线上
     // 超标"——正是 B3 门禁要防的静默失效。（这条差异由门禁用例 ⑩ 守住。）
-    const actA = Number.isFinite(c.actAlpha) ? c.actAlpha : CONFIG.actAlpha
+    // L3 第三层：行动级门限按**结局回灌**调整（默认关 ⇒ 与标定值逐位相同）。
+    // 放在这里而不是改 CONFIG：回灌只影响"这一通道的有效门限"，不改配置本体（可审计、可解释）。
+    const baseAct = Number.isFinite(c.actAlpha) ? c.actAlpha : CONFIG.actAlpha
+    const effAct = effectiveActAlpha(c.name, baseAct)
+    const actA = Number.isFinite(effAct) ? effAct : -Infinity      // revoked ⇒ -Infinity ⇒ 永不命中
     const notA = Number.isFinite(c.notifyAlpha) ? c.notifyAlpha : CONFIG.notifyAlpha
     const hitAct = Number.isFinite(c.p) && c.p <= actA
     const hitNot = Number.isFinite(c.p) && c.p <= notA
+    if (hitAct) rec.channelActFires[c.name] = (rec.channelActFires[c.name] || 0) + 1
+    c.actAlphaEffective = Number.isFinite(effAct) ? effAct : null
     const prev = rec.fireRuns[c.name]
     const slot = prev && typeof prev === 'object'
       ? prev
@@ -1042,8 +1059,10 @@ function stateMachine(rec, agent) {
     consecutive: c.consecutive ?? 1,
     fireRun: c.fireRun ?? 0,
     notifyRun: c.fireRunNotify ?? 0,
-    // L3：该通道本次判定所用的族先验（null = 未收缩，退回固定 Jeffreys）
+    // L3 第二层：该通道本次判定所用的族先验（null = 未收缩，退回固定 Jeffreys）
     prior: c.prior ? { rate: c.prior.rate, strength: c.prior.strength, matched: c.prior.matched } : null,
+    // L3 第三层：实际生效的行动级门限（回灌后；null = 资格被撤销或不可用）
+    actAlphaEffective: Number.isFinite(c.actAlphaEffective) ? c.actAlphaEffective : null,
   }))
   rec.lastPolicy = decision.level
   rec.lastPolicyAction = decision.action
@@ -1066,7 +1085,10 @@ function stateMachine(rec, agent) {
       rec.capabilityBudgetExhausted = false
       logAudit(rec, 'capability-budget-reset', { via: 'episode-ended' })
     }
-    if (rec.machineState !== 'stable') recoverRollback(rec, decision.reason)
+    if (rec.machineState !== 'stable') {
+      rec.episodesEndedNaturally += 1
+      recoverRollback(rec, decision.reason)
+    }
     return
   }
   if (decision.action === 'narrow') {
@@ -1087,6 +1109,12 @@ function stateMachine(rec, agent) {
   if (rec.surfacePhase === 'narrowed') {
     rec.narrowedSteps += 1
     rec.driftSteps = rec.narrowedSteps
+    // **单调**的"本会话动过手"标记：与 narrowedSteps 分开记，后者会在片段结束时被清零。
+    // 实测教训：recordSessionOutcome 原先用 `narrowedSteps > 0` 判断"动过手"，而
+    // recoverRollback 会把 narrowedSteps 归零 ⇒ **收窄后又恢复的会话全不被计入**，
+    // "最近 N 个会话里动过手的比例"被系统性低估 ⇒ 自动降档更难触发（方向不安全，
+    // 而且注释里写的"只记录真的动过的会话"与实现不一致）。
+    rec.didNarrow = true
     if (CONFIG.maxDriftSteps > 0 && rec.narrowedSteps >= CONFIG.maxDriftSteps) {
       rec.capabilityBudgetExhausted = true
       logAudit(rec, 'capability-budget-exhausted', {
@@ -1622,7 +1650,7 @@ function annotateReward(rec) {
 function recordSessionOutcome(rec) {
   try {
     if (!(CONFIG.autoDemoteWindow > 0)) return
-    sessionOutcomes.push({ narrowed: rec.narrowedSteps > 0 })
+    sessionOutcomes.push({ narrowed: rec.didNarrow === true })
     while (sessionOutcomes.length > CONFIG.autoDemoteWindow) sessionOutcomes.shift()
     if (autoDemote) return
     if (sessionOutcomes.length < CONFIG.autoDemoteWindow) return
@@ -1635,6 +1663,111 @@ function recordSessionOutcome(rec) {
   } catch (e) {
     // 观测侧永不抛
   }
+}
+
+/** 每通道的结局回灌状态（L3 第三层）：只有真的触发过才记账。 */
+const channelFeedback = {}
+/** 回灌纪元：每结束一个会话 +1（用于"多久没有变化 ⇒ 该探索一次"）。 */
+let feedbackEpoch = 0
+function feedbackFor(name) {
+  if (!channelFeedback[name]) {
+    channelFeedback[name] = {
+      sessions: 0, fires: 0, productive: 0, multiplier: 1, revoked: false,
+      lastAt: null, lastRate: null, lastChangeEpoch: 0, explores: 0,
+    }
+  }
+  return channelFeedback[name]
+}
+
+/**
+ * L3 第三层：**结局回灌**——把"动了之后有没有好结果"回灌到该通道的门限上。
+ *
+ * 为什么需要（比现在的二值 autoDemote 强在哪）：现在的 autoDemote 是**全局**一刀切
+ * （超过预算就把能力层与通知层一起关掉），既粗糙又不可逆——而"哪一条通道在惹事"其实是可以分开算的。
+ *
+ * 结局代理（可观测、不需要人工标签）：
+ *   productive = 会话结束时**没有**停留在收窄态 && 本会话**没有**出现 unknown tool
+ *                && 至少有一个收窄片段是自然结束的（不是撞上 maxDriftSteps 才停）
+ * 为什么用这三项：`unknown tool` 正是本插件历史上最严重那次事故的可见症状（收窄把工具从注册表里摘掉，
+ * 之后的调用就变成 unknown tool），所以它是"越干预越糟"的直接证据；"结束时仍在收窄态"同理。
+ *
+ * **非对称**（这是安全性的关键）：
+ *   · 不产出 ⇒ 收紧（multiplier × 0.5，下限 base/64）——收紧只会让干预更少，永远是安全方向；
+ *   · 放宽（× 1.25，上限 1.0 = 标定件给的值）只在样本足够多（minSessions×4）且产出率很高（≥0.8）时；
+ *   · 产出率低于 feedbackRevokeEligibilityRate ⇒ **撤销该通道的能力层资格**（比全局降档精确得多）。
+ */
+function recordChannelFeedback(rec) {
+  try {
+    if (CONFIG.outcomeFeedbackEnabled !== true) return
+    feedbackEpoch += 1
+    const per = rec.channelActFires || null
+    const names = per ? Object.keys(per).filter((n) => per[n] > 0) : []
+    // ① 有触发的通道：按结局记账并调整（这是主路径）
+    if (names.length > 0) {
+      const endedNarrowed = rec.surfacePhase === 'narrowed' || rec.machineState === 'drift'
+      const sawUnknown = rec.sawUnknownTool === true
+      const naturalEnd = rec.episodesEndedNaturally > 0
+      const productive = !endedNarrowed && !sawUnknown && naturalEnd
+      for (const name of names) {
+        const fb = feedbackFor(name)
+        fb.sessions += 1
+        fb.fires += per[name]
+        if (productive) fb.productive += 1
+        fb.lastAt = Date.now()
+        const rate = fb.productive / fb.sessions
+        fb.lastRate = round2(rate)
+        if (rate < CONFIG.feedbackRevokeEligibilityRate && fb.sessions >= CONFIG.feedbackMinSessions && !fb.revoked) {
+          fb.revoked = true
+          fb.lastChangeEpoch = feedbackEpoch
+          warnOnce(`channel "${name}" lost capability eligibility: productive rate ${(rate * 100).toFixed(1)}% over ${fb.sessions} sessions (floor ${(CONFIG.feedbackRevokeEligibilityRate * 100).toFixed(0)}%)`)
+          logAudit(rec, 'feedback-revoke', { channel: name, sessions: fb.sessions, fires: fb.fires, rate: fb.lastRate, floor: CONFIG.feedbackRevokeEligibilityRate })
+          continue
+        }
+        const floor = 1 / Math.max(2, CONFIG.feedbackAlphaFloorDivisor)
+        if (rate < CONFIG.feedbackMinProductiveRate && fb.sessions >= CONFIG.feedbackMinSessions && fb.multiplier > floor) {
+          const before = fb.multiplier
+          fb.multiplier = Math.max(floor, fb.multiplier * 0.5)
+          fb.lastChangeEpoch = feedbackEpoch
+          logAudit(rec, 'feedback-tighten', { channel: name, sessions: fb.sessions, rate: fb.lastRate, from: before, to: fb.multiplier })
+          warnOnce(`channel "${name}" threshold tightened ×${fb.multiplier} (productive ${(rate * 100).toFixed(1)}% < ${(CONFIG.feedbackMinProductiveRate * 100).toFixed(0)}% over ${fb.sessions} sessions)`)
+        } else if (rate >= 0.8 && fb.sessions >= CONFIG.feedbackMinSessions * 4 && fb.multiplier < 1) {
+          const before = fb.multiplier
+          fb.multiplier = Math.min(1, fb.multiplier * 1.25)
+          fb.lastChangeEpoch = feedbackEpoch
+          logAudit(rec, 'feedback-relax', { channel: name, sessions: fb.sessions, rate: fb.lastRate, from: before, to: fb.multiplier })
+        }
+      }
+    }
+    // ② 探索步（**这条是测试逼出来的**）：收紧到"不再触发"之后，证据也就断了——
+    // 没有触发就没有结局数据，于是永远无法放宽。那是**单向棘轮**：门限会被锁死在一个
+    // 可能过严的点上，而且外面看起来"很安全"（从不触发）。
+    // 所以：长期没有任何变化 ⇒ 周期性把门限回升一档（仍受标定值为上限）。
+    // 代价是重新引入一些误报，所以周期长（默认 30 个会话）且每次只回升 ×1.25。
+    if (CONFIG.feedbackExploreAfterSessions > 0) {
+      for (const name of Object.keys(channelFeedback)) {
+        const fb = channelFeedback[name]
+        if (fb.revoked || fb.multiplier >= 1) continue
+        if (feedbackEpoch - fb.lastChangeEpoch < CONFIG.feedbackExploreAfterSessions) continue
+        const before = fb.multiplier
+        fb.multiplier = Math.min(1, fb.multiplier * 1.25)
+        fb.lastChangeEpoch = feedbackEpoch
+        fb.explores += 1
+        logAudit(rec, 'feedback-explore', { channel: name, from: before, to: fb.multiplier, epoch: feedbackEpoch, note: '长期无变化 ⇒ 回升一档，避免单向棘轮把门限锁死' })
+      }
+    }
+  } catch (e) {
+    warnOnce(`channel feedback failed (ignored): ${msg(e)}`)
+  }
+}
+
+/** 该通道的**有效** actAlpha：标定值 × 回灌倍数（撤销资格时返回 Infinity ⇒ 永不触发）。 */
+function effectiveActAlpha(name, base) {
+  if (CONFIG.outcomeFeedbackEnabled !== true) return base
+  const fb = channelFeedback[name]
+  if (!fb) return base
+  if (fb.revoked) return Number.POSITIVE_INFINITY
+  const v = Number.isFinite(base) ? base * fb.multiplier : base
+  return Math.max(v, (Number.isFinite(base) ? base : 0.01) / Math.max(2, CONFIG.feedbackAlphaFloorDivisor))
 }
 
 /**
@@ -1721,6 +1854,7 @@ function closeRec(rec, reason) {
     rec.pullback.claimedUnverifiedAfter = rec.codeEditsAfterVerify.length > 0 && rec.lastVerifyAt !== null
   }
   recordPullbackOutcome(rec)
+  recordChannelFeedback(rec)
   logAudit(rec, 'closed', { reason })
   recordSessionOutcome(rec)
   recs.delete(rec.sessionId)
@@ -1813,6 +1947,7 @@ function adopt(agent, doAnchor, channel) {
     negativeHitSteps: 0,
     lexiconDegenerate: null,
     narrowedSteps: 0,
+    didNarrow: false,        // 单调：本会话是否动过手（用于自动降档的正确分母）
     capabilityBudgetExhausted: false,
     lastPolicy: null,
     lastPolicyAction: null,
@@ -1843,6 +1978,10 @@ function adopt(agent, doAnchor, channel) {
     },
     // L2 重锚定状态（每会话只做一次）
     reanchor: { count: 0, lastTurn: null, lastPullbackCount: null, lastAt: null, suppressed: { alreadyDone: 0, noPriorPullback: 0, noNewEvidence: 0 } },
+    // L3 第三层：本会话各通道的行动级触发次数 + 结局代理
+    channelActFires: {},
+    sawUnknownTool: false,
+    episodesEndedNaturally: 0,
     pullbackOutcome: null,
     bandHistory: [],        // 审计用：personaRatio 导出的波段序列（离线回放读日志）
     driftEnteredAt: null,
@@ -1927,6 +2066,10 @@ function feedSessionEvent(session, event) {
     noteSessionEvent(rec, event)
   } else if (event.type === 'tool/result') {
     ledgerNoteToolResult(rec, event.data && event.data.turn, event.data && event.data.step, toolResultText(event))
+    if (/\\bunknown tool\\b|not a known tool/i.test(toolResultText(event))) {
+      rec.sawUnknownTool = true
+      logAudit(rec, 'unknown-tool', { turn: event.data && event.data.turn, step: event.data && event.data.step })
+    }
   } else if (event.type === 'turn/end') {
     // A′ 的关键排除：回合到此结束 ⇒ 最后一格"无工具调用"是合法收尾，不是停手。
     ledgerCloseTurn(rec, event.data && event.data.turn)
@@ -2188,6 +2331,7 @@ function summaryOf(rec) {
     surfacePhase: rec.surfacePhase,
     narrowedNow: rec.surfacePhase === 'narrowed',
     narrowedSteps: rec.narrowedSteps,
+    didNarrow: rec.didNarrow === true,
     capabilityBudgetExhausted: rec.capabilityBudgetExhausted,
     policy: rec.lastPolicy,
     policyAction: rec.lastPolicyAction,
@@ -2313,6 +2457,10 @@ function buildSummary(filter) {
       pullbackOutcomePath: CONFIG.pullbackOutcomePath || null,
       familyPriorPath: CONFIG.familyPriorPath || null,
       priorStrength: CONFIG.priorStrength,
+      outcomeFeedbackEnabled: CONFIG.outcomeFeedbackEnabled === true,
+      feedbackMinSessions: CONFIG.feedbackMinSessions,
+      feedbackMinProductiveRate: CONFIG.feedbackMinProductiveRate,
+      feedbackExploreAfterSessions: CONFIG.feedbackExploreAfterSessions,
       rewardAnnotator: CONFIG.rewardAnnotator,
     },
     configWarnings: configWarnings.slice(),
@@ -2322,6 +2470,8 @@ function buildSummary(filter) {
     reanchorGate: reanchorGateReason(),
     reanchorEvidence,
     familyPriors: familyPriors ? { source: familyPriors.source, families: Object.keys(familyPriors.byKey || {}).length } : null,
+    channelFeedback: Object.fromEntries(Object.entries(channelFeedback).map(([k, v]) => [k, { sessions: v.sessions, fires: v.fires, productive: v.productive, rate: v.lastRate, multiplier: v.multiplier, revoked: v.revoked, explores: v.explores }])),
+    feedbackEpoch,
     effectiveSwitches: { rollback: effectiveRollback(), notify: effectiveNotify() },
     sessionOutcomes: { window: sessionOutcomes.length, narrowed: sessionOutcomes.filter((o) => o.narrowed).length, budget: CONFIG.autoDemoteBudget },
     listAtApply,
@@ -2403,6 +2553,7 @@ export function apply(ctx, config) {
   policyArtifact = null
   reanchorEvidence = null
   familyPriors = null
+  for (const k of Object.keys(channelFeedback)) delete channelFeedback[k]
   autoDemote = null
   sessionOutcomes.length = 0
   configWarnings.length = 0
@@ -2522,6 +2673,7 @@ export function apply(ctx, config) {
       }
       if (Object.keys(byKey).length === 0) {
         familyPriors = null
+  for (const k of Object.keys(channelFeedback)) delete channelFeedback[k]
         noteConfigWarning(`family priors at "${p}" contained no usable families; shrinkage disabled`)
       } else {
         familyPriors = { source: p, byKey, generatedAtUtc: art.generatedAtUtc ?? null, corpus: art.corpus ?? null }
@@ -2529,6 +2681,7 @@ export function apply(ctx, config) {
       }
     } catch (e) {
       familyPriors = null
+  for (const k of Object.keys(channelFeedback)) delete channelFeedback[k]
       noteConfigWarning(`failed to load family priors from "${priorPath}": ${msg(e)}; shrinkage disabled (fixed Jeffreys)`)
     }
   }
