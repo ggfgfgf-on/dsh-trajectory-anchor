@@ -17,6 +17,7 @@ const here = fileURLToPath(new URL('.', import.meta.url))
 const {
   normalizePath, baseName, parseTaskAnchors, inScope, pathsFromCall, commandPaths,
   scanToolCalls, claimsFromFinalMessage, unverifiedClaim, looksLikePath, isIgnorablePath, changeInvalidatesVerification,
+  verifyCommandKind,
 } = await import(pathToFileURL(resolve(here, 'task-anchor-core.mjs')).href)
 
 let pass = 0
@@ -141,6 +142,14 @@ const ZH = '你正在接手一个本地护理/睡眠联调工程（Project2）�
   check('⑥ 无路径调用不产生路径', pathsFromCall('ping', '{"host":"x"}').length === 0)
   check('⑥ normalizePath 折叠重复斜杠', normalizePath('D:\\\\a\\\\\\b\\') === 'd:/a/b')
   check('⑥ baseName 取末段', baseName('D:\\a\\bugfix-a4') === 'bugfix-a4')
+  // 验证形态识别：既要保守（build/状态查询不算），也必须覆盖本项目自己的形态
+  // （否则"观察期"在本项目会话里永不触发——这是实测发现的问题，不是假设）。
+  check('⑥ 识别 node tools/test-*.mjs', verifyCommandKind('node tools/test-pullback.mjs') === 'node-test-file')
+  check('⑥ 识别 pnpm test / pytest / go test',
+    verifyCommandKind('pnpm test') === 'pnpm-test' && verifyCommandKind('pytest -q') === 'pytest' && verifyCommandKind('go test ./...') === 'go-test')
+  check('⑥ 保守：build / 状态查询 / 非测试脚本不算验证',
+    verifyCommandKind('node build.mjs') === null && verifyCommandKind('git status') === null
+    && verifyCommandKind('node tools/check-invariants.mjs') === null && verifyCommandKind('') === null)
 }
 
 // ── ⑦ 精度纪律：实测假阳必须被挡住（v1 在语料上刷出 62 条"越界写"，真越界为 0）──

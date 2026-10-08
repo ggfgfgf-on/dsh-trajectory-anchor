@@ -166,6 +166,9 @@ export function verifyCommandKind(cmd) {
     ['pnpm-test', /\bpnpm\s+(run\s+)?(test|check|verify)\b/],
     ['yarn-test', /\byarn\s+(run\s+)?test\b/],
     ['node-test', /\bnode\s+--test\b/],
+    // 本项目自己的验证形态：`node tools/test-xxx.mjs`。不加这条的话，形态表虽然"保守"，
+    // 却在最容易观察的地方（本项目会话）永不触发——观察期照样攒不到数据。
+    ['node-test-file', /\bnode\s+[^\s|;]*test[^\s|;]*\.(mjs|cjs|js)\b/],
     ['go-test', /\bgo\s+test\b/],
     ['cargo-test', /\bcargo\s+(test|check)\b/],
     ['dotnet-test', /\bdotnet\s+test\b/],
