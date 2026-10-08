@@ -38,7 +38,7 @@ try {
     on: (name, fn) => { handlers[name] = fn; return () => {} },
     effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {} },
   }
-  await mod.apply(ctx, { rollbackEnabled: false, notARealKey: 123 })
+  await mod.apply(ctx, { adaptiveStateEnabled: false, rollbackEnabled: false, notARealKey: 123 })
 } finally {
   console.warn = origWarn
 }
@@ -127,7 +127,12 @@ check('surface: 无 name 的条目不抛错，且按 fail-open 保留（不误�
     check('工具输出 JSON round-trip 成功', roundTrip !== null && typeof roundTrip === 'object')
 
     check('安装即用: apply() 不带 config 也能挂载', typeof tools2.anchor_status === 'object')
-    check('安装即用: 无配置告警（bundle patch 不声明任何键）', warns2.length === 0, JSON.stringify(warns2))
+    // 精确化：这里要守的是"bundle patch 不声明任何键 ⇒ 没有**配置类**告警"。
+    // 运行期告警（累积状态装载、自动降档）是**合法信息**——一个装了本插件、近 20 个会话大量收窄
+    // 的真实环境本来就该在挂载时报出来。把"零告警"当成契约会误伤正确行为（实测踩到）。
+    const configWarns2 = warns2.filter((w) => /config key|unknown config|invalid .*config/i.test(w))
+    check('安装即用: 无配置类告警（bundle patch 不声明任何键）', configWarns2.length === 0, JSON.stringify(configWarns2))
+    check('安装即用: configWarnings 为空', Array.isArray(s2.configWarnings) && s2.configWarnings.length === 0, JSON.stringify(s2.configWarnings))
     check('安装即用: 出厂即安全（双关 + 有界上限 + 锚定默认开）',
       s2.config.rollbackEnabled === false && s2.config.notifyEnabled === false
       && s2.config.maxDriftSteps > 0 && s2.config.gateEnabled === true

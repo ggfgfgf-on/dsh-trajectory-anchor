@@ -608,6 +608,59 @@ if (existsSync(readmePath)) {
   else oks.push('C20 L4 闭环：自产先验+标定件+在线证据、自门禁覆盖全部关键套件、失败即拒绝发布、且"召回未测不授权"写在源头')
 }
 
+// ── C21 硬：累积状态（记忆）持久化的纪律 ──────────────────────────────────────
+// 由来：把"累积状态"与"派生状态"混为一谈。派生状态（配置 + 产物）每次挂载必须重算——那是修过的事故；
+// 累积状态（降档窗口 / 回灌计数 / 倍率 / 纪元）是**学到的记忆**，清掉就等于"跨天自适应永远从零开始"。
+// 于是拆成两条纪律：派生状态照旧重算；累积状态**按会话落盘、挂载时装载**。
+// 下面每条守卫都对应一个真实风险。
+{
+  const problems = []
+  const toolsDir = resolve(dirname(indexPath), 'tools')
+  // 剥注释后再查（防止 `/* loadAdaptiveState() */` 这种注释满足检查——实测负向副本抓到）
+  const stripComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n')
+  const applyBody = src.match(/export function apply\(ctx, config\) \{[\s\S]*?\n\}/)
+  if (!applyBody) problems.push('找不到 apply()')
+  else {
+    const applyCode = stripComments(applyBody[0])
+    for (const need of ['CONFIG = cloneDefaults()', 'policyArtifact = null', 'reanchorEvidence = null', 'familyPriors = null']) {
+      if (!applyCode.includes(need)) problems.push(`apply() 未重置派生状态：缺 ${need}（跨挂载粘住的事故会回来）`)
+    }
+    if (!/loadAdaptiveState\(\)/.test(applyCode)) problems.push('apply() 未装载累积状态（记忆永远攒不满）')
+  }
+  const loadBody = src.match(/function loadAdaptiveState\(\) \{[\s\S]*?\n\}/)
+  if (!loadBody) problems.push('找不到 loadAdaptiveState()')
+  else {
+    const loadCode = stripComments(loadBody[0])
+    for (const need of ['delete channelFeedback[k]', 'sessionOutcomes.length = 0', 'feedbackEpoch = 0', 'autoDemote = null']) {
+      if (!loadCode.includes(need)) problems.push(`loadAdaptiveState 未自清空：缺 ${need}（重复装载会翻倍计数）`)
+    }
+    if (!/starting from empty memory/.test(loadCode)) problems.push('装载失败时没有明确退回空记忆的告警')
+    if (!/unreadable line/.test(loadCode)) problems.push('坏行没有被处理（应跳过 + 告警）')
+    if (!/recordedBase === currentBase/.test(loadCode)) problems.push('倍率恢复缺少"基准 α 匹配"守卫（换标定件后旧倍率会静默生效）')
+    if (!/multipliersDropped/.test(loadCode)) problems.push('丢弃倍率没有计数（不可观测）')
+    if (!/slice\(-window\)/.test(loadCode)) problems.push('装载没有按 adaptiveStateWindow 取尾（文件再长也不该全量装载）')
+    if (!/evaluateAutoDemote\(null\)/.test(loadCode)) problems.push('装载后未重算降档（窗口已超标却要等到下个会话）')
+  }
+  const recFn = src.match(/function sessionOutcomeRecord\(rec\) \{[\s\S]*?\n\}/)
+  if (!recFn) problems.push('找不到 sessionOutcomeRecord()')
+  else if (!/if \(!didNarrow && totalFires === 0\) return null/.test(recFn[0])) {
+    problems.push('没有"无关会话不落盘"的判据（默认全关时会凭空写文件）')
+  }
+  if (!/adaptiveStateEnabled: true/.test(src)) problems.push('缺少 adaptiveStateEnabled 开关（无法一键关闭记忆）')
+  // 测试隔离：持久化让状态跨挂载存活 ⇒ 各套件必须显式隔离（实测六个套件同时崩）
+  const suitesNeedingIsolation = ['test-anchor-contract.mjs', 'test-response-policy.mjs', 'test-policy-gate.mjs',
+    'test-reanchor.mjs', 'test-family-prior.mjs', 'test-outcome-feedback.mjs']
+  for (const s of suitesNeedingIsolation) {
+    const p = resolve(toolsDir, s)
+    if (!existsSync(p)) { problems.push(`找不到 ${s}`); continue }
+    if (!/adaptiveStateEnabled: false/.test(readFileSync(p, 'utf8'))) {
+      problems.push(`${s} 未隔离累积状态（会继承别的套件写下的记忆，互相污染）`)
+    }
+  }
+  if (problems.length) for (const p of problems) fails.push(`C21 ${p}`)
+  else oks.push('C21 记忆持久化：派生状态仍每次重算、装载自清空且 fail-safe、倍率受"基准 α 匹配"守卫、装载有界、装载后重算降档、无关会话不落盘、各套件已隔离')
+}
+
 // ── 输出 ────────────────────────────────────────────────────────────────
 for (const s of oks) console.log(`  OK    ${s}`)
 for (const s of debts) console.log(`  DEBT  ${s}`)

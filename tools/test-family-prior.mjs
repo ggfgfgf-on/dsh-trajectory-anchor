@@ -84,7 +84,7 @@ async function boot(config) {
     on: (n, fn) => { handlers[n] = fn; return () => {} },
     effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {} },
   }
-  await mod.apply(ctx, config)
+  await mod.apply(ctx, { adaptiveStateEnabled: false, ...config })   // 测试隔离：不许继承别的套件写下的累积状态
 }
 const dispatch = (name, ...args) => handlers['internal/dispatch']('x', name, args, null)
 const sessionEvent = (s, e) => dispatch('session/event', s, e)

@@ -36,7 +36,7 @@
  * TRAJECTORY_ANCHOR_LEXICON_PATH; CJK-safe term matching (no ASCII \b).
  */
 
-import { readFileSync, mkdirSync, appendFileSync } from 'node:fs'
+import { readFileSync, mkdirSync, appendFileSync, existsSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath, dirname as dirname2 } from 'node:path'
 // L1：任务锚定信号的**单一实现**（tools/task-anchor-core.mjs 是纯模块，不反向 import 本文件，
 // 因此没有循环依赖）。为什么不在这里再写一份：本项目已经两次栽在"两套规则各说各话"
@@ -146,6 +146,13 @@ const DEFAULTS = {
   reanchorEvidencePath: null,
   // 拉回效果采集：会话结束时把"说过之后行为有没有变"写成一行 JSONL（默认在 baseDir 下）。
   pullbackOutcomePath: null,
+  // ── 累积状态（记忆）的持久化 ─────────────────────────────────────────────────
+  // 与"派生状态每次重算"互补：降档窗口 / 通道回灌计数 / 倍率 是**学到的**，重启不该清零，
+  // 否则"最近 N 个会话"永远攒不满、跨天自适应永远从零开始（这是本轮修正的设计缺口）。
+  // 只有"与自适应有关的会话"（动过手或有通道触发）才落盘 ⇒ 默认全关时不产生任何文件。
+  adaptiveStateEnabled: true,
+  adaptiveStatePath: null,          // 默认 <baseDir>/.dsh-trajectory-logs/adaptive-state.jsonl
+  adaptiveStateWindow: 200,         // 装载上限（有界，文件再长也不拖慢挂载）
   // ── L3 第二层：provider/model 族先验的收缩 ──────────────────────────────────
   // `familyPriorPath` 指向 tools/family-priors.mjs 的产物（各族各通道的**每步基频**）。
   // 给了就按族做收缩（同一步偏离在不同基频的族里得到不同 p）；没给/坏了/族未知 ⇒ 退回
@@ -217,6 +224,8 @@ const INTERESTING = new Set([
 const recs = new Map()
 const finished = []
 let CONFIG = { ...DEFAULTS }
+/** 插件版本（写进累积状态记录，便于回溯"这条记忆是哪个版本学的"）；挂载时从 package.json 读。 */
+let PLUGIN_VERSION = 'unknown'
 let agentsSvc = null
 let fsSvc = null
 let spSvc = null
@@ -1650,23 +1659,35 @@ function annotateReward(rec) {
  *
  * 为什么需要：离线标定合格 ≠ 线上合格（语料会漂、模型会换、任务族会变）。
  * 这条让插件**自己发现自己超标**，而不是等人去看日志。
- * 只记录"真的动过"的会话（narrowedSteps > 0），不收窄的会话算分母。
+ * 只记录"真的动过"的会话（单调标记 rec.didNarrow），不收窄的会话算分母。
+ *
+ * ⚠ 状态分两类（这一条是本轮修正的设计缺口）：
+ *   · **派生状态**（CONFIG / policyArtifact / familyPriors / reanchorEvidence）——每次挂载重算，
+ *     必须清空（否则出现"标定件状态跨挂载粘住"，那是修过的事故）；
+ *   · **累积状态**（sessionOutcomes / channelFeedback / autoDemote / feedbackEpoch）——这是**记忆**，
+ *     清掉就等于"跨天自适应永远从零开始"：每次重启都把"最近 N 个会话"抹平，回灌与降档永远攒不满。
+ *   所以累积状态要**按会话落盘、挂载时装载**（见 adaptiveStateFor / loadAdaptiveState）。
  */
 function recordSessionOutcome(rec) {
   try {
     if (!(CONFIG.autoDemoteWindow > 0)) return
     sessionOutcomes.push({ narrowed: rec.didNarrow === true })
     while (sessionOutcomes.length > CONFIG.autoDemoteWindow) sessionOutcomes.shift()
-    if (autoDemote) return
-    if (sessionOutcomes.length < CONFIG.autoDemoteWindow) return
-    const rate = sessionOutcomes.filter((o) => o.narrowed).length / sessionOutcomes.length
-    if (rate > CONFIG.autoDemoteBudget) {
-      autoDemote = { reason: 'session-rate-over-budget', rate: round2(rate), budget: CONFIG.autoDemoteBudget, window: sessionOutcomes.length, at: Date.now() }
-      warnOnce(`auto-demoted to observe-only: ${(rate * 100).toFixed(1)}% of the last ${sessionOutcomes.length} sessions narrowed (budget ${(CONFIG.autoDemoteBudget * 100).toFixed(1)}%)`)
-      logAudit(rec, 'auto-demote', { ...autoDemote, note: '能力层与通知层即刻关闭，只保留审计' })
-    }
+    evaluateAutoDemote(rec)
   } catch (e) {
     // 观测侧永不抛
+  }
+}
+
+/** 按当前窗口重算是否需要降档（挂载时装载历史后也会调它一次）。 */
+function evaluateAutoDemote(rec) {
+  if (autoDemote) return
+  if (sessionOutcomes.length < CONFIG.autoDemoteWindow) return
+  const rate = sessionOutcomes.filter((o) => o.narrowed).length / sessionOutcomes.length
+  if (rate > CONFIG.autoDemoteBudget) {
+    autoDemote = { reason: 'session-rate-over-budget', rate: round2(rate), budget: CONFIG.autoDemoteBudget, window: sessionOutcomes.length, at: Date.now(), restored: rec ? false : true }
+    warnOnce(`auto-demoted to observe-only: ${(rate * 100).toFixed(1)}% of the last ${sessionOutcomes.length} sessions narrowed (budget ${(CONFIG.autoDemoteBudget * 100).toFixed(1)}%)`)
+    if (rec) logAudit(rec, 'auto-demote', { ...autoDemote, note: '能力层与通知层即刻关闭，只保留审计' })
   }
 }
 
@@ -1674,6 +1695,170 @@ function recordSessionOutcome(rec) {
 const channelFeedback = {}
 /** 回灌纪元：每结束一个会话 +1（用于"多久没有变化 ⇒ 该探索一次"）。 */
 let feedbackEpoch = 0
+/** 累积状态的装载摘要（供 anchor_status 说明"这些记忆从哪来"）。 */
+let adaptiveState = null
+
+/**
+ * 本会话要落盘的那条"记忆"（**单一来源**：降档用它、回灌用它、持久化也用它，
+ * 避免三处各算一遍导致口径漂移）。
+ * 只记**与自适应有关**的会话（动过手 或 有通道触发过）；默认全关时不会写任何东西。
+ */
+function sessionOutcomeRecord(rec) {
+  const fires = {}
+  let totalFires = 0
+  for (const [name, n] of Object.entries(rec.channelActFires || {})) {
+    if (n > 0) { fires[name] = n; totalFires += n }
+  }
+  const didNarrow = rec.didNarrow === true
+  if (!didNarrow && totalFires === 0) return null
+  const endedNarrowed = rec.surfacePhase === 'narrowed' || rec.machineState === 'drift'
+  const productive = !endedNarrowed && rec.sawUnknownTool !== true && rec.episodesEndedNaturally > 0
+  // 每通道的**当前基准 α**：装载时用它判断"这份倍率是在哪个工作点上学的"，
+  // 工作点变了就作废倍率（只保留计数）——否则换标定件后旧倍率会静默生效。
+  const baseAlpha = {}
+  for (const name of Object.keys(fires)) {
+    const cfg = (CONFIG.responseChannels && CONFIG.responseChannels[name]) || {}
+    baseAlpha[name] = Number.isFinite(cfg.actAlpha) ? cfg.actAlpha : CONFIG.actAlpha
+  }
+  return {
+    storeVersion: 1,
+    at: Date.now(),
+    sessionId: rec.sessionId,
+    didNarrow,
+    fires,
+    productive,
+    // 学到的倍率/撤销/探索次数（按**本会话触发过的通道**记）：装载时只在与基准 α 匹配时恢复。
+    multiplier: Number.isFinite(fbMultiplierOf(fires)) ? fbMultiplierOf(fires) : 1,
+    revoked: Object.keys(fires).some((n) => channelFeedback[n] && channelFeedback[n].revoked === true),
+    explores: Object.keys(fires).reduce((a, n) => a + ((channelFeedback[n] && channelFeedback[n].explores) || 0), 0),
+    family: rec.family ? familyKeyOf(rec).full : null,
+    baseAlpha,
+    pluginVersion: PLUGIN_VERSION,
+  }
+}
+
+/** 本会话触发过的通道里，"学到的倍率"取最小值（保守：宁可记更严的那个）。 */
+function fbMultiplierOf(fires) {
+  const names = Object.keys(fires || {})
+  if (names.length === 0) return 1
+  return names.reduce((a, n) => Math.min(a, (channelFeedback[n] && channelFeedback[n].multiplier) || 1), 1)
+}
+
+/** 累积状态文件路径（默认放在审计目录旁；可用 adaptiveStatePath 显式指定）。 */
+function adaptiveStateFile() {
+  if (typeof CONFIG.adaptiveStatePath === 'string' && CONFIG.adaptiveStatePath) {
+    return isAbsolute(CONFIG.adaptiveStatePath) ? CONFIG.adaptiveStatePath : resolvePath(baseDir || process.cwd(), CONFIG.adaptiveStatePath)
+  }
+  return resolvePath(baseDir || process.cwd(), '.dsh-trajectory-logs', 'adaptive-state.jsonl')
+}
+
+/** 追加一条记忆（fail-safe：写失败只告警，绝不影响会话）。 */
+function persistAdaptiveState(record) {
+  try {
+    if (CONFIG.adaptiveStateEnabled !== true) return
+    if (!record) return
+    const file = adaptiveStateFile()
+    mkdirSync(dirname2(file), { recursive: true })
+    appendFileSync(file, `${JSON.stringify(record)}\n`, 'utf8')
+  } catch (e) {
+    warnOnce(`adaptive state persist failed (ignored): ${msg(e)}`)
+  }
+}
+
+/**
+ * 挂载时装载累积状态（**记忆**；与"派生状态每次重算"互补）。
+ *
+ * 装载纪律（每条都对应一个真实风险）：
+ *   · 失败/坏行/缺文件 ⇒ 空状态 + 响亮告警（fail-safe，绝不阻断挂载）；
+ *   · 只取最后 adaptiveStateWindow 条（**有界**，文件再长也不会拖慢挂载）；
+ *   · **倍率与撤销只在"基准 α 未变"时恢复**：工作点变了 ⇒ 丢弃倍率（保留计数），
+ *     否则换了标定件后上一份倍率会静默生效——那正是"跨挂载粘住"的翻版；
+ *   · 装载后**重算一次自动降档**：窗口内若已超标，挂载即降档（而不是等下一个会话）。
+ */
+function loadAdaptiveState() {
+  // **自清空**：装载前先归零，消除对调用顺序的依赖。
+  // 实测教训：原先靠调用方清空，结果挂载路径解析前后各装一次 ⇒ 计数翻倍（sessions 10 变 20）。
+  // 装载必须是幂等的，这样"多装一次"最多是白做 I/O，不会悄悄把样本数算两遍。
+  for (const k of Object.keys(channelFeedback)) delete channelFeedback[k]
+  sessionOutcomes.length = 0
+  autoDemote = null
+  feedbackEpoch = 0
+  adaptiveState = { source: null, records: 0, channels: 0, multipliersKept: 0, multipliersDropped: 0, autoDemoteRecomputed: false, error: null }
+  if (CONFIG.adaptiveStateEnabled !== true) { adaptiveState.disabled = true; return }
+  const file = adaptiveStateFile()
+  adaptiveState.source = file
+  let text
+  try {
+    if (!existsSync(file)) return
+    text = readFileSync(file, 'utf8')
+  } catch (e) {
+    adaptiveState.error = msg(e)
+    warnOnce(`adaptive state unreadable (${msg(e)}); starting from empty memory`)
+    return
+  }
+  const lines = text.split('\n').filter((l) => l.trim())
+  const window = Math.max(1, CONFIG.adaptiveStateWindow)
+  const tail = lines.slice(-window)
+  const records = []
+  let badLines = 0
+  for (const line of tail) {
+    try {
+      const o = JSON.parse(line)
+      if (o && typeof o === 'object' && typeof o.didNarrow === 'boolean') records.push(o)
+      else badLines += 1
+    } catch (e) { badLines += 1 }
+  }
+  if (badLines > 0) warnOnce(`adaptive state had ${badLines} unreadable line(s) in the last ${tail.length}; ignored`)
+  adaptiveState.records = records.length
+  adaptiveState.badLines = badLines
+  if (records.length === 0) return
+
+  // ① 降档窗口：最近 autoDemoteWindow 个会话的"动过手"
+  for (const r of records.slice(-Math.max(1, CONFIG.autoDemoteWindow))) sessionOutcomes.push({ narrowed: r.didNarrow === true })
+  // ② 逐通道回灌计数
+  for (const r of records) {
+    for (const [name, n] of Object.entries(r.fires || {})) {
+      const fb = feedbackFor(name)
+      fb.sessions += 1
+      fb.fires += Number.isFinite(n) ? n : 0
+      if (r.productive === true) fb.productive += 1
+      fb.lastAt = typeof r.at === 'number' ? r.at : fb.lastAt
+      fb.lastRate = round2(fb.productive / fb.sessions)
+    }
+  }
+  adaptiveState.channels = Object.keys(channelFeedback).length
+  // ③ 倍率/撤销：只认"基准 α 未变"的那份（取最新一条该通道的记录）
+  for (const name of Object.keys(channelFeedback)) {
+    let keep = null
+    for (let i = records.length - 1; i >= 0; i--) {
+      const r = records[i]
+      if (r.fires && r.fires[name] > 0) { keep = r; break }
+    }
+    const cfg = (CONFIG.responseChannels && CONFIG.responseChannels[name]) || {}
+    const currentBase = Number.isFinite(cfg.actAlpha) ? cfg.actAlpha : CONFIG.actAlpha
+    const recordedBase = keep && keep.baseAlpha && Number.isFinite(keep.baseAlpha[name]) ? keep.baseAlpha[name] : null
+    if (keep && ((keep.multiplier != null && Number.isFinite(keep.multiplier)) || keep.revoked === true)) {
+      if (recordedBase !== null && recordedBase === currentBase) {
+        const fb = channelFeedback[name]
+        if (Number.isFinite(keep.multiplier)) fb.multiplier = keep.multiplier
+        if (keep.revoked === true) fb.revoked = true
+        if (Number.isFinite(keep.explores)) fb.explores = keep.explores
+        adaptiveState.multipliersKept += 1
+      } else {
+        adaptiveState.multipliersDropped += 1
+      }
+    }
+  }
+  if (adaptiveState.multipliersDropped > 0) {
+    warnOnce(`adaptive state: dropped ${adaptiveState.multipliersDropped} learned multiplier(s) because the operating point changed (base alpha differs); counts kept`)
+  }
+  // ④ 纪元 + 装载后立即重算降档
+  feedbackEpoch = records.length
+  const before = autoDemote
+  evaluateAutoDemote(null)
+  adaptiveState.autoDemoteRecomputed = Boolean(autoDemote && autoDemote !== before)
+  console.log(`[${name}] adaptive state loaded: ${records.length} session records, ${adaptiveState.channels} channel(s), multipliers kept ${adaptiveState.multipliersKept} / dropped ${adaptiveState.multipliersDropped}`)
+}
 function feedbackFor(name) {
   if (!channelFeedback[name]) {
     channelFeedback[name] = {
@@ -1701,7 +1886,7 @@ function feedbackFor(name) {
  *   · 放宽（× 1.25，上限 1.0 = 标定件给的值）只在样本足够多（minSessions×4）且产出率很高（≥0.8）时；
  *   · 产出率低于 feedbackRevokeEligibilityRate ⇒ **撤销该通道的能力层资格**（比全局降档精确得多）。
  */
-function recordChannelFeedback(rec) {
+function recordChannelFeedback(rec, outcomeRecord = null) {
   try {
     if (CONFIG.outcomeFeedbackEnabled !== true) return
     feedbackEpoch += 1
@@ -1709,10 +1894,10 @@ function recordChannelFeedback(rec) {
     const names = per ? Object.keys(per).filter((n) => per[n] > 0) : []
     // ① 有触发的通道：按结局记账并调整（这是主路径）
     if (names.length > 0) {
-      const endedNarrowed = rec.surfacePhase === 'narrowed' || rec.machineState === 'drift'
-      const sawUnknown = rec.sawUnknownTool === true
-      const naturalEnd = rec.episodesEndedNaturally > 0
-      const productive = !endedNarrowed && !sawUnknown && naturalEnd
+      // productive 优先取**同一条记录**里的判定（单一来源）；没有记录时才现算。
+      const productive = outcomeRecord
+        ? outcomeRecord.productive === true
+        : (!(rec.surfacePhase === 'narrowed' || rec.machineState === 'drift') && rec.sawUnknownTool !== true && rec.episodesEndedNaturally > 0)
       for (const name of names) {
         const fb = feedbackFor(name)
         fb.sessions += 1
@@ -1869,7 +2054,14 @@ function closeRec(rec, reason) {
     rec.pullback.claimedUnverifiedAfter = rec.codeEditsAfterVerify.length > 0 && rec.lastVerifyAt !== null
   }
   recordPullbackOutcome(rec)
-  recordChannelFeedback(rec)
+  // 累积状态（记忆）：**算一次，三处共用**——落盘、回灌、降档都用同一条记录，
+  // 避免三处各算一遍导致口径漂移（本项目已经栽过两次"两套规则各说各话"）。
+  const outcomeRecord = sessionOutcomeRecord(rec)
+  if (outcomeRecord) {
+    persistAdaptiveState(outcomeRecord)
+    rec.adaptiveRecord = { didNarrow: outcomeRecord.didNarrow, fires: Object.keys(outcomeRecord.fires || {}), productive: outcomeRecord.productive }
+  }
+  recordChannelFeedback(rec, outcomeRecord)
   logAudit(rec, 'closed', { reason })
   recordSessionOutcome(rec)
   recs.delete(rec.sessionId)
@@ -2531,6 +2723,9 @@ function buildSummary(filter) {
       pullbackOutcomePath: CONFIG.pullbackOutcomePath || null,
       familyPriorPath: CONFIG.familyPriorPath || null,
       priorStrength: CONFIG.priorStrength,
+      adaptiveStateEnabled: CONFIG.adaptiveStateEnabled === true,
+      adaptiveStatePath: CONFIG.adaptiveStatePath || null,
+      adaptiveStateWindow: CONFIG.adaptiveStateWindow,
       outcomeFeedbackEnabled: CONFIG.outcomeFeedbackEnabled === true,
       feedbackMinSessions: CONFIG.feedbackMinSessions,
       feedbackMinProductiveRate: CONFIG.feedbackMinProductiveRate,
@@ -2544,6 +2739,8 @@ function buildSummary(filter) {
     reanchorGate: reanchorGateReason(),
     reanchorEvidence,
     familyPriors: familyPriors ? { source: familyPriors.source, families: Object.keys(familyPriors.byKey || {}).length } : null,
+    adaptiveState,
+    feedbackEpoch,
     channelFeedback: Object.fromEntries(Object.entries(channelFeedback).map(([k, v]) => [k, { sessions: v.sessions, fires: v.fires, productive: v.productive, rate: v.lastRate, multiplier: v.multiplier, revoked: v.revoked, explores: v.explores }])),
     feedbackEpoch,
     effectiveSwitches: { rollback: effectiveRollback(), notify: effectiveNotify() },
@@ -2623,16 +2820,26 @@ function cloneDefaults() {
 }
 
 export function apply(ctx, config) {
+  // ① **派生状态**：每次挂载重算（配置 + 产物算出来的东西）——必须清空，
+  //    否则出现"标定件状态跨挂载粘住"（修过的事故）。
   CONFIG = cloneDefaults()
   policyArtifact = null
   reanchorEvidence = null
   familyPriors = null
-  for (const k of Object.keys(channelFeedback)) delete channelFeedback[k]
-  autoDemote = null
-  sessionOutcomes.length = 0
   configWarnings.length = 0
   warned.clear()
+  try {
+    PLUGIN_VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version || 'unknown'
+  } catch (e) {
+    PLUGIN_VERSION = 'unknown'
+  }
   mergeConfig(config)
+  // ② **累积状态**（记忆）：降档窗口 / 通道回灌计数 / 倍率 / 纪元——按会话落盘、挂载时装载。
+  //   为什么与派生状态分开：清掉它等于"每次重启都把最近 N 个会话抹平"，
+  //   跨天自适应永远从零开始（回灌与降档都攒不满）。
+  //   注意 baseDir 在下面才解析出来，所以这里先用默认（进程 cwd），稍后若拿到 workspaceRoot
+  //   会以同一路径规则重算；装载失败一律 fail-safe（空记忆 + 响亮告警，不阻断挂载）。
+  loadAdaptiveState()
   // 词典文件加载（在 mergeConfig 之后：lexiconPath 优先于内联 lexicon——
   // 这样"仅加 lexiconPath"即可换词典，无需删除 patch 行里内联的默认词表）
   const envLex = typeof process !== 'undefined' && process.env && process.env.TRAJECTORY_ANCHOR_LEXICON_PATH
@@ -2779,6 +2986,15 @@ export function apply(ctx, config) {
   spSvc = ctx.get('sandboxPolicy')
 
   if (spSvc && typeof spSvc.workspaceRoot === 'string' && spSvc.workspaceRoot.length > 0) baseDir = spSvc.workspaceRoot
+  // baseDir 变化会改变累积状态的默认路径 ⇒ 重新装载一次。
+  // **只有路径真的变了才重装**：否则每次挂载都会重复装载一遍（日志重复、且白做一次 I/O）。
+  if (CONFIG.adaptiveStateEnabled === true && adaptiveStateFile() !== (adaptiveState && adaptiveState.source)) {
+    for (const k of Object.keys(channelFeedback)) delete channelFeedback[k]
+    sessionOutcomes.length = 0
+    autoDemote = null
+    feedbackEpoch = 0
+    loadAdaptiveState()
+  }
 
   // ---- guaranteed perception channel ----
   disposers.push(ctx.on('internal/dispatch', (type, name, args, thisArg) => {
