@@ -173,12 +173,35 @@ await boot({ ...BASE, autoDemoteWindow: 2, autoDemoteBudget: 0.05 })   // 窗口
 {
   const many = join(dir, 'many.jsonl')
   const rows = []
-  for (let i = 0; i < 30; i++) rows.push(JSON.stringify({ storeVersion: 1, at: Date.now(), sessionId: `s${i}`, didNarrow: i % 2 === 0, fires: { repetition: 1 }, productive: false, baseAlpha: { repetition: 0.01 } }))
+  for (let i = 0; i < 30; i++) rows.push(JSON.stringify({ storeVersion: 1, at: Date.now(), sessionId: `s${i}`, didNarrow: true, fires: { repetition: 1 }, productive: false, baseAlpha: { repetition: 0.01 } }))
   writeFileSync(many, rows.join('\n') + '\n', 'utf8')
   await boot({ ...BASE, adaptiveStatePath: many, adaptiveStateWindow: 10 })
   const s = await statusOf()
   check('⑥ 只装载最后 10 条（有界）', s.adaptiveState.records === 10, JSON.stringify(s.adaptiveState))
   check('⑥ 计数相应有界（sessions=10）', s.channelFeedback?.repetition?.sessions === 10, JSON.stringify(s.channelFeedback?.repetition))
+}
+
+// ── ⑧ 记账口径：只有"真的干预过"的会话才计入回灌 ─────────────────────────────
+// 由来（自查发现的错配）：能力层关着时通道即便触发也什么都没发生，productive 必然 false；
+// 若把这些会话计入回灌，门限会被无故一路收紧、最终撤销通道。两个口径必须分开：
+//   · 降档窗口：**所有**会话（"动过手的比例"才有意义）
+//   · 通道回灌：只有干预过的会话（"我的干预有没有帮助"才有意义）
+{
+  const mixed = join(dir, 'mixed.jsonl')
+  const rows = []
+  for (let i = 0; i < 6; i++) {
+    rows.push(JSON.stringify({
+      storeVersion: 1, at: Date.now(), sessionId: `m${i}`,
+      didNarrow: i % 2 === 0,                 // 只有一半会话真的干预过
+      fires: { repetition: 1 }, productive: true, baseAlpha: { repetition: 0.01 },
+    }))
+  }
+  writeFileSync(mixed, rows.join('\n') + '\n', 'utf8')
+  await boot({ ...BASE, adaptiveStatePath: mixed, autoDemoteWindow: 20 })
+  const s = await statusOf()
+  check('⑧ 只有"干预过"的 3 个会话计入回灌（不是 6 个）', s.channelFeedback?.repetition?.sessions === 3,
+    JSON.stringify(s.channelFeedback?.repetition))
+  check('⑧ 降档窗口仍看全部 6 个会话（两个口径各自正确）', s.sessionOutcomes.window === 6, JSON.stringify(s.sessionOutcomes))
 }
 
 // ── ⑦ 反向守：派生状态仍然每次重算（不许靠装载"粘"下来）────────────────────

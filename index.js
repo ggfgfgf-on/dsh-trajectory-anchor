@@ -1814,9 +1814,16 @@ function loadAdaptiveState() {
   if (records.length === 0) return
 
   // ① 降档窗口：最近 autoDemoteWindow 个会话的"动过手"
-  for (const r of records.slice(-Math.max(1, CONFIG.autoDemoteWindow))) sessionOutcomes.push({ narrowed: r.didNarrow === true })
-  // ② 逐通道回灌计数
+  // ① 降档窗口：最近 autoDemoteWindow 个会话的"动过手"。
+  //    关闭降档（window=0）时**不填**——与 recordSessionOutcome 的早退一致，
+  //    否则会出现"降档关了却仍有一个 1 条的窗口"这种自相矛盾的状态（实测踩到）。
+  if (CONFIG.autoDemoteWindow > 0) {
+    for (const r of records.slice(-CONFIG.autoDemoteWindow)) sessionOutcomes.push({ narrowed: r.didNarrow === true })
+  }
+  // ② 逐通道回灌计数：**只计入"真的干预过"的会话**（与 recordChannelFeedback 同口径）。
+  //    载荷侧若把"没干预"的会话算进来，恢复出来的 productive 率必然偏低 ⇒ 一挂载就越收越紧。
   for (const r of records) {
+    if (r.didNarrow !== true) continue
     for (const [name, n] of Object.entries(r.fires || {})) {
       const fb = feedbackFor(name)
       fb.sessions += 1
@@ -1889,11 +1896,17 @@ function feedbackFor(name) {
 function recordChannelFeedback(rec, outcomeRecord = null) {
   try {
     if (CONFIG.outcomeFeedbackEnabled !== true) return
+    // 纪元是**时钟**：每个结束的会话都走一格——探索步（长期无变化 ⇒ 回升一档）依赖它。
+    // 别把它也限制成"只对干预过的会话"：那样门限一旦收紧到不再触发，时钟就停了，
+    // 探索永远不来，单向棘轮又回来（实测：探索用例三条全红）。
     feedbackEpoch += 1
     const per = rec.channelActFires || null
     const names = per ? Object.keys(per).filter((n) => per[n] > 0) : []
-    // ① 有触发的通道：按结局记账并调整（这是主路径）
-    if (names.length > 0) {
+    // ① 有触发的通道：**且本会话真的干预过**才记账。
+    //   为什么：回灌度量的是"我的干预有没有帮助"；能力层关着时（出厂默认）通道即便触发
+    //   也什么都没发生，那些会话的 productive 必然 false ⇒ 会把门限无故一路收紧并撤销通道。
+    //   这是"用没有干预的会话去评价干预"的错配（自查发现，不是测试抓的）。
+    if (names.length > 0 && rec.didNarrow === true) {
       // productive 优先取**同一条记录**里的判定（单一来源）；没有记录时才现算。
       const productive = outcomeRecord
         ? outcomeRecord.productive === true
