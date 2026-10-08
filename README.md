@@ -298,11 +298,12 @@ message at `agent/pre-step`:
 - **Throttled like a signal, not a stream:** at most once per turn (allostasis
   `admitPerTurn`) and at most `pullbackMaxPerSession` (3) per session, with the
   suppressions counted in `anchor_status` (`pullback.suppressed.throttled/cap/noAnchors`).
+- **Extraction must survive real command shapes.** Verification matching runs against both the decoded `command` argument *and* the raw argument text, because real sessions send multi-line PowerShell scripts with escaped quotes - a naive `"command":"..."` regex captures only a fragment, and the observed-verify signal then never fires (this was found by checking `anchor_status` in a live process, not by a test: the session had run `node tools/test-*.mjs` and still reported `anchorsMode: none`).
 - **Two sources for "verification".** The trigger for "you edited code after the last verification" no longer requires the prompt to declare a scope or a verify command: the plugin also recognises a verification command **from the session's own behaviour** (`verifyCommandKind`: pytest / npm|pnpm|yarn test / node --test / go|cargo|dotnet test / vitest|jest / run_*tests.py …). Without this, free-form long sessions - the common case - stayed silent forever, so the pull-back existed but never ran and no observation data could accumulate. The *scope* signal still requires a declared scope: "out of bounds" can only be judged relative to something the prompt actually said.
 - **Never guesses:** if the prompt has no readable scope clause, nothing fires
   (`noAnchors` increments) and `taskAnchors.parsed` stays `false`.
 
-`tools/test-pullback.mjs` (35 cases) drives a real `apply()` and asserts both
+`tools/test-pullback.mjs` (37 cases) drives a real `apply()` and asserts both
 directions for every claim: it fires on an out-of-scope write and stays silent in scope;
 it reminds after a code edit and stays silent after a documentation edit; it fires once
 per turn, stops at the session cap, stops after a re-verification, and does nothing at
@@ -622,7 +623,7 @@ node tools\export-layer4.mjs `
   `tools/test-task-anchor.mjs` — 55 task-anchor cases (clause parsing in English and
   Chinese, "never guess" on prompts without a scope clause, scope scanning, and the
   four audited false-positive classes pinned as regressions);
-  `tools/test-pullback.mjs` — 35 L1 cases (fires/stays-silent both ways, turn throttle,
+  `tools/test-pullback.mjs` — 37 L1 cases (fires/stays-silent both ways, turn throttle,
   session cap, re-verification clears the reminder, wording has no imperative verb);
   `tools/test-reanchor.mjs` — 26 L2 cases (all five gates both ways, light-before-heavy,
   once per session, persona carried verbatim, synthetic evidence rejected, outcome JSONL

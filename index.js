@@ -2209,28 +2209,54 @@ function noteTaskSignal(rec, event) {
     const turn = typeof d.turn === 'number' ? d.turn : null
     const step = typeof d.step === 'number' ? d.step : null
     const args = typeof d.arguments === 'string' ? d.arguments : (d.arguments === undefined ? '' : JSON.stringify(d.arguments))
-    const cmd = (() => {
+    // 命令文本：优先解码，抽不到就用**原始参数文本**兜底。
+    // 为什么必须有兜底（实测踩到，属于"能力其实没在跑"的那一类）：真实会话里的命令常是多行
+    // PowerShell 脚本、内含转义引号，此时 `"command"\s*:\s*"([^"]*)"` 只截到一个片段——
+    // 于是本会话明明跑了 `node tools/test-pullback.mjs`，verifyKinds 仍是空的、anchorsMode
+    // 停在 none，拉回一次都不会触发。判据本身够保守（都是明确的测试/构建形态），
+    // 所以直接在原始文本上匹配是安全的，而且对"抽不出来"免疫。
+    const cmdDecoded = (() => {
       if (d.arguments && typeof d.arguments === 'object' && typeof d.arguments.command === 'string') return d.arguments.command
+      if (typeof d.arguments === 'string') {
+        const s = d.arguments.trim()
+        if (s.startsWith('{')) {
+          try {
+            const o = JSON.parse(s)
+            if (o && typeof o.command === 'string') return o.command
+          } catch (e) { /* 落到兜底 */ }
+        } else return d.arguments
+      }
       const m = args.match(/"command"\s*:\s*"([^"]*)"/)
-      return m ? m[1] : (typeof d.arguments === 'string' && !args.trim().startsWith('{') ? d.arguments : '')
+      return m ? m[1] : ''
     })()
+    /** 参与命令形态识别的文本（解码结果 + 原始参数文本）。 */
+    const cmdTexts = [cmdDecoded, args].filter((x) => typeof x === 'string' && x.length > 0)
     // ① 验证运行——两种来源取并集：
     //    · 提示里声明的验证命令（anchors.verifyTokens，要求范围子句能解析出锚点）
     //    · **会话自身行为**里识别出的验证命令（verifyCommandKind）
     //      为什么必须有第二种：只认提示的话，自由形态的长会话（提示里没有"Work only inside X"
     //      这类子句）永远沉默，L1 就停在"存在但从不运行"，观察期也攒不到数据。
     //      而"跑过测试/构建"这件事在会话里本来就看得见，不需要提示声明。
-    const fromPrompt = Boolean(anchors) && (anchors.verifyTokens || []).some((t) => cmd && cmd.includes(t))
-    const observedKind = verifyCommandKind(cmd)
-    const isVerify = Boolean(cmd) && (fromPrompt || observedKind !== null)
+    const fromPrompt = Boolean(anchors) && (anchors.verifyTokens || []).some((t) => cmdTexts.some((c) => c.includes(t)))
+    // 形态识别对**解码文本与原始参数文本**都试一遍（对"命令抽不出来"免疫）
+    let observedKind = null
+    let observedIn = null
+    for (const c of cmdTexts) {
+      const k = verifyCommandKind(c)
+      if (k) { observedKind = k; observedIn = c === cmdDecoded ? 'decoded' : 'raw-args'; break }
+    }
+    const isVerify = cmdTexts.length > 0 && (fromPrompt || observedKind !== null)
     if (isVerify) {
       if (observedKind && !rec.verifyKinds[observedKind]) {
         rec.verifyKinds[observedKind] = 1
-        logAudit(rec, 'verify-kind', { kind: observedKind, turn, step, via: fromPrompt ? 'prompt+observed' : 'observed', cmd: String(cmd).slice(0, 120) })
+        logAudit(rec, 'verify-kind', {
+          kind: observedKind, turn, step, via: fromPrompt ? 'prompt+observed' : 'observed',
+          matchedIn: observedIn, cmd: String(cmdDecoded || args).slice(0, 120),
+        })
       }
       rec.lastVerifyAt = { turn, step }
       if (rec.codeEditsAfterVerify.length > 0) {
-        logAudit(rec, 'verify-run', { turn, step, clearedEdits: rec.codeEditsAfterVerify.length, cmd: String(cmd).slice(0, 160) })
+        logAudit(rec, 'verify-run', { turn, step, clearedEdits: rec.codeEditsAfterVerify.length, cmd: String(cmdDecoded || args).slice(0, 160) })
       }
       rec.codeEditsAfterVerify = []
       if (rec.pullback.count > 0) rec.pullback.verifiesAfter += 1

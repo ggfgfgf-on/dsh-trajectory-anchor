@@ -486,9 +486,10 @@ if (existsSync(readmePath)) {
     }
   }
   // 验证命令必须有两种来源，且"形态识别"共用 core 的一份实现。
-  // 注意：检查必须落在**调用点**上——第一版只查 `verifyCommandKind` 这个标识符，
-  // 于是 import 行就满足了它（负向副本 ② 抓到），等于没查。
-  if (!/verifyCommandKind\(cmd\)/.test(src)) problems.push('运行时没有真的调用 verifyCommandKind()（验证命令只能来自提示 ⇒ 自由会话沉默）')
+  // 注意：检查必须落在**调用点**上，且**不能写死参数名**——第一版查标识符（import 行就满足），
+  // 第二版查 `verifyCommandKind(cmd)` 这种精确形态（把变量改名就失效，实测踩到）。
+  // 现在只要求"以某个标识符为参数真实调用过"。
+  if (!/verifyCommandKind\([A-Za-z_$][\w$.]*\)/.test(src)) problems.push('运行时没有真的调用 verifyCommandKind(...)（验证命令只能来自提示 ⇒ 自由会话沉默）')
   if (!/import\s*\{[\s\S]*?verifyCommandKind[\s\S]*?\}\s*from\s*'\.\/tools\/task-anchor-core\.mjs'/.test(src)) {
     problems.push('verifyCommandKind 未从 task-anchor-core 共用（禁止在 index.js 再写一份形态表）')
   }

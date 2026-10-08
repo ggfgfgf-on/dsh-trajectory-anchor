@@ -282,6 +282,23 @@ await boot({ pullbackEnabled: true })
   check('⑬ 无范围子句 ⇒ 越界写不记为违规（范围只能来自提示）', row.pullback.scopeViolations === 0, String(row.pullback.scopeViolations))
 }
 
+{
+  // 实测踩到的形态：命令是**多行 PowerShell 脚本**且含转义引号 ⇒ 旧的"正则截取 command"
+  // 只能拿到片段，于是真实会话里明明跑了 node tools/test-*.mjs，verifyKinds 却一直是空的、
+  // anchorsMode 停在 none、拉回一次都不触发（这次是在**真实进程**里核对时才发现的）。
+  const { agent, session } = adopt('pb-multiline-cmd')
+  const script = 'cd D:\\proj\n"=== run tests ==="\nnode tools/test-pullback.mjs 2>&1 | Select-Object -Last 2\nnode tools/check-invariants.mjs | Select-Object -Last 2'
+  sessionEvent(session, human('随便改改'))
+  sessionEvent(session, { type: 'tool/call', data: { name: 'pwsh', arguments: JSON.stringify({ command: script }), turn: 1, step: 1 } })
+  sessionEvent(session, call('edit', EDIT_OK, 1, 2))
+  const d = await preStep(agent, 1, 3)
+  check('⑬ 多行脚本 + 转义引号里的验证命令仍被识别', pullbacks(d).length === 1, `n=${pullbacks(d).length}`)
+  const row = await statusOf('pb-multiline-cmd')
+  check('⑬ 形态与来源都被留痕',
+    (row.pullback.verifyKinds || []).includes('node-test-file') && row.pullback.anchorsMode === 'observed-verify',
+    JSON.stringify({ k: row.pullback.verifyKinds, m: row.pullback.anchorsMode }))
+}
+
 console.warn = origWarn
 console.log(`\n${pass} pass, ${fail} fail`)
 if (fail > 0) process.exit(1)
