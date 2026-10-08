@@ -2410,10 +2410,13 @@ function feedSessionEvent(session, event) {
     // 注意**验证运行不设这道门**：命令跑过就是跑过，即使报错/非零退出也算"验证过了"
     // （本项目早已定下的口径：报错的测试同样携带信息；要撤的是"根本没发生的事"）。
     if (toolResultFailed(event)) retractArm(rec, event)
-    // ⚠ 这里原来是 `\\bunknown tool\\b`（双重转义）⇒ 该分支**从来没匹配上过**，
-    // 只有 `not a known tool` 这一半在起作用。这正是"检查静默死掉"的那一类，
-    // 顺手修成真正的词边界（sawUnknownTool 是 L3.3 结局代理的一项）。
-    if (/\bunknown tool\b|not a known tool/i.test(toolResultText(event))) {
+    // ⚠ 判据必须**同时**满足：① 这次调用真的**失败**了（结构化标记）② 失败文本说的是 unknown tool。
+    // 只看文本会在"读到的内容里恰好写了这几个字"时误报——实测本会话有 29 次文本命中，
+    // **全是成功的 read**（读的正是本插件自己的代码与笔记，里面写着 "unknown tool" /
+    // "not a known tool"）。而 sawUnknownTool 是 L3.3 结局代理的一项、也是落盘行里的
+    // sessionLevelFields，误报会把健康会话记成"不产出" ⇒ 回灌朝错误方向收紧。
+    // 顺带：原来的 `\\bunknown tool\\b` 是双重转义 ⇒ 那一半从来没匹配过（静默死掉的分支）。
+    if (toolResultFailed(event) && /\bunknown tool\b|not a known tool/i.test(toolResultText(event))) {
       rec.sawUnknownTool = true
       logAudit(rec, 'unknown-tool', { turn: event.data && event.data.turn, step: event.data && event.data.step })
     }
@@ -2870,6 +2873,9 @@ function summaryOf(rec) {
       // 成功门：有多少次"发起了但没落地"的写被撤回（撤回不是静默忽略，必须可见）
       armRetracted: rec.armRetracted || 0,
       pendingArms: rec.pendingArms ? rec.pendingArms.size : 0,
+      // 事故症状（L3.3 结局代理的一项，也是落盘行的 sessionLevelFields）：必须可见，
+      // 否则"这一项为什么是 true"只能靠翻日志。
+      sawUnknownTool: rec.sawUnknownTool === true,
     },
     // L2 重锚定：状态、门与在线证据
     reanchor: {

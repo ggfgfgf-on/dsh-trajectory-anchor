@@ -484,6 +484,15 @@ if (existsSync(readmePath)) {
   if (!/function retractArm\(rec, event\)/.test(src)) problems.push('缺少 retractArm（撤回必须单一实现）')
   if (!/logAudit\(rec, 'arm-retracted'/.test(src)) problems.push('撤回没有审计留痕（静默忽略不可接受）')
   if (!/armRetracted/.test(src)) problems.push('撤回没有计数（撤回不可见）')
+  // 事故症状 sawUnknownTool：必须**同时**要求"调用失败"与"文本命中"。只看文本会误报——
+  // 实测本会话 29 次文本命中**全是成功的 read**（读的正是本插件自己的代码与笔记，
+  // 里面写着 "unknown tool"），而它是 L3.3 结局代理的一项、也是落盘行的 sessionLevelFields。
+  if (!/toolResultFailed\(event\) && \/\\bunknown tool\\b\|not a known tool\/i\.test\(toolResultText\(event\)\)/.test(src)) {
+    problems.push('sawUnknownTool 判据没有同时要求"调用失败"（成功的 read 里含该词即误报）')
+  }
+  if (!/sawUnknownTool: rec\.sawUnknownTool === true/.test(src)) {
+    problems.push('sawUnknownTool 不在状态里可见（"这一项为什么是 true"只能靠翻日志）')
+  }
   {
     const gate = (src.match(/export function toolResultFailed\([\s\S]*?\n\}/) || [''])[0]
     if (!gate) problems.push('取不到 toolResultFailed 的函数体（检查模式串失配）')

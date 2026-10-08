@@ -385,6 +385,28 @@ const callWithId = (name, args, turn, step, callId) => ({ type: 'tool/call', dat
   check('⑭ 反向对照：这次没有撤回（文本不参与判定）', row.pullback.armRetracted === 0, String(row.pullback.armRetracted))
 }
 
+{
+  // 事故症状 sawUnknownTool：判据要**同时**要求"调用失败"与"文本是 unknown tool"。
+  // 只看文本会误报——实测本会话 29 次文本命中全是**成功的 read**（读的正是本插件自己的
+  // 代码与笔记，里面写着 "unknown tool"/"not a known tool"）；而它是 L3.3 结局代理的一项，
+  // 也会写进落盘行的 sessionLevelFields ⇒ 误报会把健康会话记成"不产出"。
+  const { agent, session } = adopt('pb-unknown-tool-read')
+  sessionEvent(session, human(PROMPT))
+  sessionEvent(session, callWithId('read', { file_path: 'notes.md' }, 1, 1, 'c-read'))
+  sessionEvent(session, toolResult('read', 1, 1, 'c-read', false,
+    'The code handles unknown tool errors by restoring the tool surface; also see "not a known tool".'))
+  const row = await statusOf('pb-unknown-tool-read')
+  check('⑭ 反向对照：**成功的 read** 里含 "unknown tool" 不算事故症状', row.pullback.sawUnknownTool === false, String(row.pullback.sawUnknownTool))
+}
+{
+  const { agent, session } = adopt('pb-unknown-tool-real')
+  sessionEvent(session, human(PROMPT))
+  sessionEvent(session, callWithId('pwsh', { command: 'x' }, 1, 1, 'c-ut'))
+  sessionEvent(session, toolResult('pwsh', 1, 1, 'c-ut', true, 'Error: unknown tool "anchor_status"'))
+  const row = await statusOf('pb-unknown-tool-real')
+  check('⑭ 真正失败的调用 + unknown tool 文本 ⇒ 记为事故症状', row.pullback.sawUnknownTool === true, String(row.pullback.sawUnknownTool))
+}
+
 console.warn = origWarn
 console.log(`\n${pass} pass, ${fail} fail`)
 if (fail > 0) process.exit(1)
