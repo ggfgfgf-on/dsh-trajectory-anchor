@@ -229,10 +229,45 @@ point on it is usable**.
 Two honesty caveats that bound the claim: (a) the anchors confirm *failure*, not
 "off-task" — a failing test is normal work — so the measured quantity is "does it
 predict imminent confirmed failure"; (b) anchors are dominated by `tool-error`
-(1,317 of 1,587). Measuring task-level drift needs anchors that carry drift meaning
-(`unknown-tool`, user corrections, abandoned turns) or, better, task-grounded labels
-(a benchmark prompt that states its scope makes "edited files outside the stated
-scope" objectively checkable) — which is the next step, not a threshold sweep.
+(1,317 of 1,587).
+
+**Task-anchored signals (L0-e) — the drift kind that has ground truth.** Since the
+statistical channels were rejected, the next signals come from constraints written
+into the prompt itself ("Work only inside bugfix-a4", "工作区仅限 … 目录 … 不要读取、
+搜索或依赖 workspace 外", "Report ONE line: PASS=<n>/7"), which makes
+*out-of-scope writes* and *unverified completion claims* facts rather than
+probabilities (`tools/task-anchor-core.mjs`, 55 cases, and
+`tools/measure-task-signal.mjs`). The parser **never guesses**: if no scope clause
+can be read it returns `parsed: false` and emits nothing.
+
+Measured on 42 sessions whose prompts are parseable:
+
+| Label kind | v1 | after fixing false positives (v2) |
+|---|---|---|
+| out-of-scope write | 62 | **0** |
+| out-of-scope read | 0 | 0 |
+| unverified completion claim | 8 | **0** |
+
+Both versions of the number are informative. v1's 62 "violations" were all false
+positives — temp scripts (`AppData\Local\Temp`), virtualenv interpreters
+(`.venv312\Scripts\python`), toolchains (`C:\Espressif\python_env`) and URL-shaped
+tokens — because the scanner was reading paths out of shell *commands*; it now reads
+only tool-argument path fields, ignores temp/venv/cache locations, and records what
+it ignored. v1's 8 unverified claims were then **audited by hand: 0 of 8 were real**,
+for four distinct reasons — a multi-command pipeline's `[exit code: 1]` next to
+"all public tests passed"; `PASS=n/m` matching the *historical* value instead of the
+last one; documentation-only edits (`.md`) being treated as invalidating prior
+verification; and verification launched as a **background job**. All four are fixed
+and pinned as regression fixtures, including the counter-case ("a *code* edit after
+the last verification must still report") so the signal cannot be silenced into
+uselessness. One deliberate refusal: "background job launched, result never polled"
+is *not* labelled, because DSH delivers job results as messages — not polling does
+not imply not consuming.
+
+Result: **this corpus contains no labelable task-level drift at all.** That is the
+honest state of the world, and it has a direct consequence for the intervention
+work: the pull-back's *mechanism* can be verified (injected drift must fire it), but
+its *efficacy* cannot be measured from this corpus — there is nothing to pull back.
 
 Consequently the shipped `responsePolicy.json` records **verdict `FAIL` with zero
 capability-eligible channels**, and the capability layer stays off. The gate is not
@@ -446,6 +481,9 @@ node tools\export-layer4.mjs `
   each with its opposite direction);
   `tools/test-drift-label.mjs` — 35 labelling cases (metrics, anchors, and the
   circular-labelling guard proven load-bearing);
+  `tools/test-task-anchor.mjs` — 55 task-anchor cases (clause parsing in English and
+  Chinese, "never guess" on prompts without a scope clause, scope scanning, and the
+  four audited false-positive classes pinned as regressions);
   `tools/test-ledger-semantics.mjs` — 11 hand-computed finalization cases (ground truth
   for the four ledger paths, including the two the real corpus never exercises);
   `tools/test-ledger-parity.mjs` — 14 live-vs-batch parity runs (4 synthetic streams +
