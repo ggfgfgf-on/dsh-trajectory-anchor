@@ -506,6 +506,38 @@ if (existsSync(readmePath)) {
   else oks.push('C18 L2 门禁：默认关 + 在线证据件（PASS-online/未过期）+ 先轻后重 + 每会话一次 + 措辞建议式 + 效果采集在位')
 }
 
+// ── C19 硬：L3 族先验收缩的接线（默认不收缩、fail-safe、族键只来自事件流）────────
+// 由来：① 先验是"外部数据进入判定"，拿不到必须**退回**固定 Jeffreys（fail-safe），
+//       而不是让 p 变 NaN 或静默关掉通道；② 族键必须来自真实事件流
+//       （request/header 的 provider/model + session 的 agentPreset），不许猜；
+//       ③ 收缩必须"先验与本会话数据共同估计"（公式里必须同时出现 refHits 与 refLen），
+//       否则就是拿族均值替代会话自己的观测——那会把"会话内自参考"这个立身之本换掉。
+{
+  const problems = []
+  if (!/familyPriorPath: null/.test(src)) problems.push('familyPriorPath 默认必须是 null（出厂不收缩）')
+  if (!/priorStrength: 20/.test(src)) problems.push('缺少 priorStrength（先验等效样本量必须可配）')
+  if (!/function priorForFamily\(rec, channelName\)/.test(src)) problems.push('缺少 priorForFamily()')
+  if (!/function familyKeyOf\(rec\)/.test(src)) problems.push('缺少 familyKeyOf()')
+  if (!/let familyPriors = null/.test(src)) problems.push('先验状态必须初始为 null（未装载 ⇒ 不收缩）')
+  const bl = src.match(/export function binomialLowerP\([\s\S]*?\n\}/)
+  if (!bl) problems.push('找不到 binomialLowerP')
+  else {
+    if (!/refHits \+ r \* pseudo\.strength/.test(bl[0]) || !/refLen \+ pseudo\.strength/.test(bl[0])) {
+      problems.push('收缩公式未同时使用 refHits 与 refLen（会退化成拿族均值替代会话观测）')
+    }
+    if (!/Math\.min\(0\.999, Math\.max\(0\.001, pseudo\.rate\)\)/.test(bl[0])) problems.push('先验 rate 未被夹紧（非法值会污染 p）')
+  }
+  if (!/event\.data\.header\.config/.test(src)) problems.push('未从 request/header 事件读取 provider/model（族键必须来自事件流）')
+  if (!/d\.agentPreset/.test(src)) problems.push('未从 session 事件读取 agentPreset')
+  if (!/shrinkage disabled \(fixed Jeffreys\)/.test(src)) problems.push('先验加载失败时没有明确退回固定 Jeffreys 的告警')
+  if (!/contained no usable families/.test(src)) problems.push('先验表为空时没有明确告警（会静默不收缩）')
+  if (!/prior: c\.prior \? \{ rate: c\.prior\.rate, strength: c\.prior\.strength, matched: c\.prior\.matched \} : null/.test(src)) {
+    problems.push('通道行未暴露本次判定所用的先验')
+  }
+  if (problems.length) for (const p of problems) fails.push(`C19 ${p}`)
+  else oks.push('C19 L3 族先验：默认不收缩、先验与本会话数据共同估计、族键只来自事件流、加载失败明确退回、先验可见')
+}
+
 // ── 输出 ────────────────────────────────────────────────────────────────
 for (const s of oks) console.log(`  OK    ${s}`)
 for (const s of debts) console.log(`  DEBT  ${s}`)

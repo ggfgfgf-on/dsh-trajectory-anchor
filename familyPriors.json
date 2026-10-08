@@ -1,0 +1,194 @@
+{
+  "generatedAtUtc": "2026-10-08T04:28:05.732Z",
+  "corpus": {
+    "sessionsScanned": 128,
+    "sessionsUsed": 77
+  },
+  "axes": {
+    "modelFamilies": [
+      {
+        "key": "deepseek-official/deepseek-v4-flash",
+        "sessions": 11
+      },
+      {
+        "key": "deepseek-official/deepseek-v4-pro",
+        "sessions": 45
+      },
+      {
+        "key": "huoshan/ark-code-latest",
+        "sessions": 5
+      },
+      {
+        "key": "deepseek-official/deepseek-v4-flash-vision-exp",
+        "sessions": 13
+      },
+      {
+        "key": "vision-toolkit-deepseek-official/deepseek-v4-pro",
+        "sessions": 2
+      },
+      {
+        "key": "vision-toolkit-huoshan/ark-code-latest",
+        "sessions": 1
+      }
+    ],
+    "presets": [
+      {
+        "key": "(none)",
+        "sessions": 77
+      }
+    ]
+  },
+  "families": [
+    {
+      "key": "deepseek-official/deepseek-v4-pro @ no-preset @ none",
+      "provider": "deepseek-official",
+      "model": "deepseek-v4-pro",
+      "preset": null,
+      "scope": "none",
+      "sessions": 33,
+      "steps": 20593,
+      "meanSteps": 624,
+      "baseRates": {
+        "inaction": 0.002,
+        "repetition": 0.0542,
+        "failure": 0.0377
+      }
+    },
+    {
+      "key": "deepseek-official/deepseek-v4-flash-vision-exp @ no-preset @ none",
+      "provider": "deepseek-official",
+      "model": "deepseek-v4-flash-vision-exp",
+      "preset": null,
+      "scope": "none",
+      "sessions": 13,
+      "steps": 13403,
+      "meanSteps": 1031,
+      "baseRates": {
+        "inaction": 0.0017,
+        "repetition": 0.0413,
+        "failure": 0.027
+      }
+    },
+    {
+      "key": "deepseek-official/deepseek-v4-pro @ no-preset @ workspace",
+      "provider": "deepseek-official",
+      "model": "deepseek-v4-pro",
+      "preset": null,
+      "scope": "workspace",
+      "sessions": 12,
+      "steps": 971,
+      "meanSteps": 81,
+      "baseRates": {
+        "inaction": 0,
+        "repetition": 0.0268,
+        "failure": 0.0391
+      }
+    },
+    {
+      "key": "deepseek-official/deepseek-v4-flash @ no-preset @ none",
+      "provider": "deepseek-official",
+      "model": "deepseek-v4-flash",
+      "preset": null,
+      "scope": "none",
+      "sessions": 9,
+      "steps": 5600,
+      "meanSteps": 622,
+      "baseRates": {
+        "inaction": 0.0002,
+        "repetition": 0.0362,
+        "failure": 0.0364
+      }
+    },
+    {
+      "key": "huoshan/ark-code-latest @ no-preset @ workspace",
+      "provider": "huoshan",
+      "model": "ark-code-latest",
+      "preset": null,
+      "scope": "workspace",
+      "sessions": 4,
+      "steps": 249,
+      "meanSteps": 62,
+      "baseRates": {
+        "inaction": 0,
+        "repetition": 0.0361,
+        "failure": 0.0884
+      }
+    },
+    {
+      "key": "vision-toolkit-deepseek-official/deepseek-v4-pro @ no-preset @ none",
+      "provider": "vision-toolkit-deepseek-official",
+      "model": "deepseek-v4-pro",
+      "preset": null,
+      "scope": "none",
+      "sessions": 2,
+      "steps": 806,
+      "meanSteps": 403,
+      "baseRates": {
+        "inaction": 0,
+        "repetition": 0.0645,
+        "failure": 0.0261
+      }
+    },
+    {
+      "key": "deepseek-official/deepseek-v4-flash @ no-preset @ bugfix-a1",
+      "provider": "deepseek-official",
+      "model": "deepseek-v4-flash",
+      "preset": null,
+      "scope": "bugfix-a1",
+      "sessions": 1,
+      "steps": 10,
+      "meanSteps": 10,
+      "baseRates": {
+        "inaction": 0,
+        "repetition": 0,
+        "failure": 0.1
+      }
+    },
+    {
+      "key": "huoshan/ark-code-latest @ no-preset @ none",
+      "provider": "huoshan",
+      "model": "ark-code-latest",
+      "preset": null,
+      "scope": "none",
+      "sessions": 1,
+      "steps": 19,
+      "meanSteps": 19,
+      "baseRates": {
+        "inaction": 0,
+        "repetition": 0,
+        "failure": 0.0526
+      }
+    },
+    {
+      "key": "deepseek-official/deepseek-v4-flash @ no-preset @ workspace",
+      "provider": "deepseek-official",
+      "model": "deepseek-v4-flash",
+      "preset": null,
+      "scope": "workspace",
+      "sessions": 1,
+      "steps": 201,
+      "meanSteps": 201,
+      "baseRates": {
+        "inaction": 0,
+        "repetition": 0.0647,
+        "failure": 0.1144
+      }
+    },
+    {
+      "key": "vision-toolkit-huoshan/ark-code-latest @ no-preset @ none",
+      "provider": "vision-toolkit-huoshan",
+      "model": "ark-code-latest",
+      "preset": null,
+      "scope": "none",
+      "sessions": 1,
+      "steps": 13,
+      "meanSteps": 13,
+      "baseRates": {
+        "inaction": 0,
+        "repetition": 0,
+        "failure": 0
+      }
+    }
+  ],
+  "note": "族键 = provider/model @ agentPreset @ 任务范围名。baseRates 是各行为通道在该族的**每步命中率**（收缩先验用）。"
+}

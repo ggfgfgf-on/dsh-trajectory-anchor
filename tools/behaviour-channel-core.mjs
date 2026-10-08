@@ -125,7 +125,7 @@ export function walkChannel(sessions, seriesKey, cfg) {
       const reference = hist.slice(0, hist.length - testWindow)
       const observed = test.reduce((a, b) => a + b, 0)
       const refHits = reference.reduce((a, b) => a + b, 0)
-      const p = observed === 0 ? 1 : binomialLowerP(observed, testWindow, refHits, reference.length)
+      const p = observed === 0 ? 1 : binomialLowerP(observed, testWindow, refHits, reference.length, cfg.prior || 0.5)
       if (p <= alpha) {
         run += 1
         if (run >= consecutive) {

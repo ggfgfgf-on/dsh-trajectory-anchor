@@ -127,6 +127,7 @@ agent/disposed: RewardAnnotator process reward + trajectory JSONL final archive
 | `pullbackEnabled` / `pullbackMaxPerSession` | **`false`** / `3` | the informational pull-back (L1): advisories near the point of action when an out-of-scope write or an unverified code change is detected. Off by default because its mechanism is verified while its *effect* is not measurable from this corpus (there is no labelable drift in it) |
 | `reanchorEnabled` / `reanchorEvidencePath` | **`false`** / `null` | re-anchoring (L2): puts the first-round Minimal payload back near the point of action. Requires an online-evidence artifact (`verdict: PASS-online`, unexpired, non-synthetic) **and** that L1 already spoke; once per session |
 | `pullbackOutcomePath` | `null` (defaults under the audit dir) | where the per-session pull-back outcome JSONL goes — the input `analyze-pullback-outcomes.mjs` needs before the L2 gate can ever open |
+| `familyPriorPath` / `priorStrength` | `null` / `20` | L3 family-prior shrinkage: point at `familyPriors.json` (per-`provider/model` base rates) and the channel tests estimate the null rate from *both* the family prior and this session's own reference (`pHat = (refHits + rate·S) / (refLen + S)`). Unset / unreadable / unknown family ⇒ falls back to the fixed Jeffreys pseudo-count |
 | `measurementSafe` | `false` | evaluation protection: `true` forces observe-only (both layers), so a measured score cannot be attributed to the plugin |
 | `leanDenyPatterns` | 28 entries | the set hidden while `surfacePhase === 'narrowed'` (`*` prefix wildcards); count is asserted against the source by `tools/check-invariants.mjs` |
 | `rewardAnnotator` | `default` | Layer-4 process reward; pluggable extension point |
@@ -360,6 +361,37 @@ only land on step 16. The warm-up splits into two tiers; both are inert
 provably reachable), and exhausting the capability budget blocks further
 narrowing until the episode genuinely ends.
 
+**Family-prior shrinkage (L3, second layer).** The *first* layer is the session-local
+self-reference test above; the second says "unusual" is relative to the model, not to a
+global constant. `tools/family-priors.mjs` measures per-family base rates from real
+sessions — family key = `provider/model @ agentPreset @ declared-scope`:
+
+| family | sessions | steps | repetition base rate | failure base rate |
+|---|---|---|---|---|
+| `deepseek-official/deepseek-v4-pro` | 45 | 20,546 | 0.0543 | 0.0376 |
+| `…/deepseek-v4-flash-vision-exp` | 13 | 13,403 | 0.0413 | 0.0270 |
+| `…/deepseek-v4-flash` | 11 | 5,600 | 0.0362 | 0.0364 |
+| `huoshan/ark-code-latest @ workspace` | 4 | 249 | 0.0361 | **0.0884** |
+| `vision-toolkit-…/deepseek-v4-pro` | 2 | 806 | 0.0645 | 0.0261 |
+
+Failure base rates differ by **3.4×** across families, so "2 failures in 3 steps" is not
+equally surprising everywhere. With `familyPriorPath` set, the null rate is estimated from
+*both* sources (`pHat = (refHits + rate·S) / (refLen + S)`, `S = priorStrength`) — proper
+shrinkage: early in a session the family dominates, and as the session's own reference grows
+its data takes over. Unreadable, unknown-family and empty-table cases fall back to the fixed
+Jeffreys pseudo-count, verified to be **bit-identical** to pre-prior behaviour, and every
+channel row exposes the prior it actually used. `agentPreset` is `(none)` throughout this
+corpus: the axis exists but carries no information today — recorded rather than assumed.
+
+Measured effect at α=0.01 (session hit rate): repetition 31.2% → **33.8%**, failure
+41.6% → **45.5%**, inaction 14.3% → 14.3%. The shrinkage makes these tests *more* sensitive
+here because the families' base rates sit below the Jeffreys-implied null rate — which is
+exactly why **α must be re-derived once the prior is active**. `familyPriorPath` ships as
+`null`, so shipped behaviour is unchanged and that re-derivation is a separate step. The
+mechanism test avoids depending on displayed precision: with α placed *between* the two
+p-values, the same session shape narrows in the low-base-rate family and does not in the
+high-base-rate one.
+
 **Switches default OFF because the calibration says so.**
 `tools/calibrate-response-policy.mjs` replays the historical corpus through the
 runtime's own pure functions (`mannWhitneyLowerP`, `policyDecision`):
@@ -558,6 +590,9 @@ node tools\export-layer4.mjs `
   `tools/test-reanchor.mjs` — 26 L2 cases (all five gates both ways, light-before-heavy,
   once per session, persona carried verbatim, synthetic evidence rejected, outcome JSONL
   written only when a pull-back actually happened);
+  `tools/test-family-prior.mjs` — 20 L3 cases (higher-base-rate family ⇒ strictly larger p,
+  the decision flips when α sits between the two p's, and unknown-family / broken-file /
+  empty-table all fall back to *bit-identical* pre-prior behaviour);
   `tools/test-ledger-semantics.mjs` — 11 hand-computed finalization cases (ground truth
   for the four ledger paths, including the two the real corpus never exercises);
   `tools/test-ledger-parity.mjs` — 14 live-vs-batch parity runs (4 synthetic streams +

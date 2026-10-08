@@ -141,6 +141,14 @@ const DEFAULTS = {
   reanchorEvidencePath: null,
   // 拉回效果采集：会话结束时把"说过之后行为有没有变"写成一行 JSONL（默认在 baseDir 下）。
   pullbackOutcomePath: null,
+  // ── L3 第二层：provider/model 族先验的收缩 ──────────────────────────────────
+  // `familyPriorPath` 指向 tools/family-priors.mjs 的产物（各族各通道的**每步基频**）。
+  // 给了就按族做收缩（同一步偏离在不同基频的族里得到不同 p）；没给/坏了/族未知 ⇒ 退回
+  // 固定的 Jeffreys 伪计数（即今天的行为）——fail-safe 而不是 fail-open。
+  familyPriorPath: null,
+  // 先验的等效样本量（步）：S 越小越"信会话自己"，越大越"信族"。20 步 ≈ 默认 refMinSteps，
+  // 于是"参考段刚够长时先验与数据各占一半"。
+  priorStrength: 20,
   // P6 不变量：收窄态的步数硬上限（退出条件必然可达）。0 = 关闭该上限（不推荐）。
   // 到顶后本漂移片段内禁止再次收窄，直到检验不再触发（片段结束）才复位。
   // 取值来源（不是拍脑袋）：45 个历史会话 / 3299 步关上限回放得到的自然片段长度
@@ -244,6 +252,42 @@ let autoDemote = null
 const sessionOutcomes = []
 /** L2：已装载的在线证据件摘要（null = 未提供）。 */
 let reanchorEvidence = null
+/** L3：已装载的族先验（null = 未提供/不可用 ⇒ 退回固定 Jeffreys）。 */
+let familyPriors = null
+
+/**
+ * 取本次会话所属族的先验（L3 第二层）。
+ * 族键 = `${provider}/${model}`，可选再带 scope（任务族）。族不存在或未装载 ⇒ null（不收缩）。
+ * @returns {{rate:number, strength:number, key:string, matched:string}|null}
+ */
+function priorForFamily(rec, channelName) {
+  if (!familyPriors || !familyPriors.byKey) return null
+  const key = familyKeyOf(rec)
+  if (!key) return null
+  for (const candidate of [key.full, key.modelOnly]) {
+    const fam = familyPriors.byKey[candidate]
+    if (fam && fam.baseRates && Number.isFinite(fam.baseRates[channelName])) {
+      return { rate: fam.baseRates[channelName], strength: CONFIG.priorStrength, key: key.full, matched: candidate }
+    }
+  }
+  return null
+}
+
+/** 会话的族键：模型来自 request/header 事件，任务范围来自首条人类消息。 */
+function familyKeyOf(rec) {
+  const provider = rec.family && rec.family.provider ? rec.family.provider : 'unknown'
+  const model = rec.family && rec.family.model ? rec.family.model : 'unknown'
+  const preset = rec.family && rec.family.preset ? rec.family.preset : 'no-preset'
+  const anchors = rec.taskAnchors
+  let scope = 'none'
+  if (anchors && anchors.parsed) {
+    scope = (anchors.scopeNames && anchors.scopeNames[0])
+      || ((anchors.scopeDirs && anchors.scopeDirs[0]) ? String(anchors.scopeDirs[0]).split('/').filter(Boolean).pop() : null)
+      || 'scope'
+  }
+  const modelOnly = `${provider}/${model}`
+  return { full: `${modelOnly} @ ${preset} @ ${scope}`, modelOnly }
+}
 
 /**
  * 能力层**有效**开关（决策路径必须用这个，而不是直接读 CONFIG.rollbackEnabled）：
@@ -721,15 +765,31 @@ function binomLogPmf(k, n, p) {
  * 与词表通道的曼-惠特尼检验是同一件事的两种测量标度：都拿**本会话自己的历史**
  * 当零假设，检验"当前窗是否异常"；区别只是标度是连续值 vs 二值命中。
  *
- * pHat 用 Jeffreys 伪计数（a=0.5）估计：否则"历史 0 命中 → p̂=0 → 任何一次命中
- * 都无限显著"。数值示例（参考 20 步全干净、窗 3、命中 2）：p̂=0.0238 → p≈0.0016。
+ * pHat 的估计有两种来源（L3 第二层）：
+ *   · `pseudo`（数值，默认 0.5 = Jeffreys 伪计数）：否则"历史 0 命中 → p̂=0 → 任何一次命中
+ *     都无限显著"。数值示例（参考 20 步全干净、窗 3、命中 2）：p̂=0.0238 → p≈0.0016。
+ *   · `prior`（{rate, strength}，来自 provider/model 族先验）：等价于"先验 S 步里命中 rate·S 次"
+ *     与本次会话的参考段一起估计：
+ *         pHat = (refHits + rate·S) / (refLen + S)
+ *     于是**同一段偏离在基频不同的族里得到不同的 p**（这才是"适配不同模型"的机制）；
+ *     且随着 refLen 增长，会话自己的数据逐步主导（收缩的正确行为：早借先验、晚信自己）。
+ *     方向不是想当然的：先验均值高 ⇒ 同样的命中数更不意外（p 更大）；但 S 同时决定
+ *     "数据能推翻先验的速度"——实测（见 tools/family-priors.mjs --eval）两者的净效应是
+ *     高基频族的 p 更大、低基频族更小，差距随 refLen 收敛。
  *
  * @returns 上侧尾概率 P(Binom(m, p̂) ≥ observed)，[0,1]；样本不足返回 1（无证据）。
  */
 export function binomialLowerP(observed, m, refHits, refLen, pseudo = 0.5) {
   if (!Number.isFinite(observed) || !Number.isFinite(m) || m <= 0) return 1
   if (!Number.isFinite(refHits) || !Number.isFinite(refLen) || refLen <= 0) return 1
-  const pHat = (refHits + pseudo) / (refLen + 2 * pseudo)
+  let pHat
+  if (pseudo && typeof pseudo === 'object' && Number.isFinite(pseudo.rate) && Number.isFinite(pseudo.strength) && pseudo.strength > 0) {
+    const r = Math.min(0.999, Math.max(0.001, pseudo.rate))
+    pHat = (refHits + r * pseudo.strength) / (refLen + pseudo.strength)
+  } else {
+    const ps = Number.isFinite(pseudo) ? pseudo : 0.5
+    pHat = (refHits + ps) / (refLen + 2 * ps)
+  }
   const k0 = Math.max(0, Math.min(m, Math.round(observed)))
   let logTail = -Infinity
   for (let k = k0; k <= m; k++) {
@@ -982,6 +1042,8 @@ function stateMachine(rec, agent) {
     consecutive: c.consecutive ?? 1,
     fireRun: c.fireRun ?? 0,
     notifyRun: c.fireRunNotify ?? 0,
+    // L3：该通道本次判定所用的族先验（null = 未收缩，退回固定 Jeffreys）
+    prior: c.prior ? { rate: c.prior.rate, strength: c.prior.strength, matched: c.prior.matched } : null,
   }))
   rec.lastPolicy = decision.level
   rec.lastPolicyAction = decision.action
@@ -1325,8 +1387,8 @@ function channelSeries(rec) {
   }
 }
 
-/** 单通道的二值检验输入。 */
-function channelTest(name, series) {
+/** 单通道的二值检验输入。`prior`（可选）是 L3 的族先验，用不上就退回 Jeffreys。 */
+function channelTest(name, series, prior = null) {
   const cfg = (CONFIG.responseChannels && CONFIG.responseChannels[name]) || {}
   const base = {
     name,
@@ -1334,6 +1396,7 @@ function channelTest(name, series) {
     actAlpha: Number.isFinite(cfg.actAlpha) ? cfg.actAlpha : CONFIG.actAlpha,
     notifyAlpha: Number.isFinite(cfg.notifyAlpha) ? cfg.notifyAlpha : CONFIG.notifyAlpha,
     consecutive: Math.max(1, cfg.consecutive ?? 1),
+    prior: prior ? { rate: prior.rate, strength: prior.strength, matched: prior.matched } : null,
   }
   if (cfg.enabled === false) return { ...base, p: null, refLen: 0, capabilityEligible: false, blockedBy: 'channel-disabled' }
   const m = cfg.testWindow || CONFIG.testWindow
@@ -1345,7 +1408,7 @@ function channelTest(name, series) {
   const reference = series.slice(0, series.length - m)
   const observed = test.reduce((a, b) => a + b, 0)
   const refHits = reference.reduce((a, b) => a + b, 0)
-  const p = binomialLowerP(observed, m, refHits, reference.length)
+  const p = binomialLowerP(observed, m, refHits, reference.length, prior ? { rate: prior.rate, strength: prior.strength } : 0.5)
   return {
     ...base,
     p,
@@ -1381,7 +1444,7 @@ function channelTests(rec) {
     })
   }
   const series = channelSeries(rec)
-  for (const name of ['inaction', 'repetition', 'failure']) out.push(channelTest(name, series[name] || []))
+  for (const name of ['inaction', 'repetition', 'failure']) out.push(channelTest(name, series[name] || [], priorForFamily(rec, name)))
   return out
 }
 
@@ -1858,6 +1921,10 @@ function feedSessionEvent(session, event) {
     }
   } else if (event.type === 'user/message') {
     noteHumanMessage(rec, event)
+  } else if (event.type === 'request/header') {
+    noteRequestHeader(rec, event)
+  } else if (event.type === 'session') {
+    noteSessionEvent(rec, event)
   } else if (event.type === 'tool/result') {
     ledgerNoteToolResult(rec, event.data && event.data.turn, event.data && event.data.step, toolResultText(event))
   } else if (event.type === 'turn/end') {
@@ -1906,6 +1973,37 @@ function safeGet(service, id) {
 }
 
 // ---------- status tool ----------
+
+/** L3：从会话事件流采集族信息（provider/model 来自 request/header，预设来自 session 事件）。 */
+function noteRequestHeader(rec, event) {
+  try {
+    const cfg = event && event.data && event.data.header && event.data.header.config
+    if (!cfg) return
+    if (!rec.family) rec.family = { provider: null, model: null, preset: null, at: null }
+    let changed = false
+    if (typeof cfg.provider === 'string' && rec.family.provider !== cfg.provider) { rec.family.provider = cfg.provider; changed = true }
+    if (typeof cfg.model === 'string' && rec.family.model !== cfg.model) { rec.family.model = cfg.model; changed = true }
+    if (changed) {
+      rec.family.at = Date.now()
+      logAudit(rec, 'family', { provider: rec.family.provider, model: rec.family.model, preset: rec.family.preset, key: familyKeyOf(rec).full })
+    }
+  } catch (e) {
+    warnOnce(`family note (request/header) failed (ignored): ${msg(e)}`)
+  }
+}
+function noteSessionEvent(rec, event) {
+  try {
+    const d = event && event.data
+    if (!d || typeof d.agentPreset !== 'string') return
+    if (!rec.family) rec.family = { provider: null, model: null, preset: null, at: null }
+    if (rec.family.preset !== d.agentPreset) {
+      rec.family.preset = d.agentPreset
+      logAudit(rec, 'family', { provider: rec.family.provider, model: rec.family.model, preset: rec.family.preset, key: familyKeyOf(rec).full })
+    }
+  } catch (e) {
+    warnOnce(`family note (session) failed (ignored): ${msg(e)}`)
+  }
+}
 
 /** 收第一条人类消息（= 任务陈述），从中解析任务锚点。读不出范围就 parsed:false——绝不猜。 */
 function noteHumanMessage(rec, event) {
@@ -2099,6 +2197,10 @@ function summaryOf(rec) {
     channels: rec.channels,
     channelWindows,
     ledgerSize: rec.ledger.length,
+    // L3 族信息（模型/预设/任务范围 + 实际匹配到的族键）
+    family: rec.family
+      ? { provider: rec.family.provider, model: rec.family.model, preset: rec.family.preset, key: familyKeyOf(rec).full }
+      : null,
     // L1 任务锚定拉回：状态与留痕全部可见（"为什么没说/说了几次/依据是什么"）。
     taskAnchors: rec.taskAnchors
       ? {
@@ -2209,6 +2311,8 @@ function buildSummary(filter) {
       reanchorEnabled: CONFIG.reanchorEnabled === true,
       reanchorEvidencePath: CONFIG.reanchorEvidencePath || null,
       pullbackOutcomePath: CONFIG.pullbackOutcomePath || null,
+      familyPriorPath: CONFIG.familyPriorPath || null,
+      priorStrength: CONFIG.priorStrength,
       rewardAnnotator: CONFIG.rewardAnnotator,
     },
     configWarnings: configWarnings.slice(),
@@ -2217,6 +2321,7 @@ function buildSummary(filter) {
     capabilityGate: capabilityGateReason(),
     reanchorGate: reanchorGateReason(),
     reanchorEvidence,
+    familyPriors: familyPriors ? { source: familyPriors.source, families: Object.keys(familyPriors.byKey || {}).length } : null,
     effectiveSwitches: { rollback: effectiveRollback(), notify: effectiveNotify() },
     sessionOutcomes: { window: sessionOutcomes.length, narrowed: sessionOutcomes.filter((o) => o.narrowed).length, budget: CONFIG.autoDemoteBudget },
     listAtApply,
@@ -2297,6 +2402,7 @@ export function apply(ctx, config) {
   CONFIG = cloneDefaults()
   policyArtifact = null
   reanchorEvidence = null
+  familyPriors = null
   autoDemote = null
   sessionOutcomes.length = 0
   configWarnings.length = 0
@@ -2393,6 +2499,37 @@ export function apply(ctx, config) {
     } catch (e) {
       reanchorEvidence = { source: evidencePath, verdict: 'REJECTED', rejectReason: msg(e) }
       noteConfigWarning(`failed to load re-anchor evidence from "${evidencePath}": ${msg(e)}; re-anchor stays off`)
+    }
+  }
+
+  // L3 族先验加载（tools/family-priors.mjs 的产物）。fail-safe：任何一步不通过 ⇒ **不收缩**
+  // （退回固定 Jeffreys 伪计数，即本轮之前的行为），并留响亮告警。
+  const envPriors = typeof process !== 'undefined' && process.env && process.env.TRAJECTORY_ANCHOR_FAMILY_PRIORS
+  const priorPath = (config && typeof config.familyPriorPath === 'string' && config.familyPriorPath) || envPriors || ''
+  if (priorPath) {
+    try {
+      const p = isAbsolute(priorPath) ? priorPath : resolvePath(process.cwd(), priorPath)
+      const art = JSON.parse(readFileSync(p, 'utf8'))
+      const byKey = {}
+      for (const fam of (Array.isArray(art && art.families) ? art.families : [])) {
+        if (!fam || typeof fam.key !== 'string' || !fam.baseRates) continue
+        const rates = {}
+        for (const ch of ['inaction', 'repetition', 'failure']) {
+          const v = fam.baseRates[ch]
+          if (Number.isFinite(v)) rates[ch] = v
+        }
+        if (Object.keys(rates).length > 0) byKey[fam.key] = { key: fam.key, sessions: fam.sessions ?? null, steps: fam.steps ?? null, baseRates: rates }
+      }
+      if (Object.keys(byKey).length === 0) {
+        familyPriors = null
+        noteConfigWarning(`family priors at "${p}" contained no usable families; shrinkage disabled`)
+      } else {
+        familyPriors = { source: p, byKey, generatedAtUtc: art.generatedAtUtc ?? null, corpus: art.corpus ?? null }
+        console.log(`[${name}] family priors loaded from ${p} (${Object.keys(byKey).length} families)`)
+      }
+    } catch (e) {
+      familyPriors = null
+      noteConfigWarning(`failed to load family priors from "${priorPath}": ${msg(e)}; shrinkage disabled (fixed Jeffreys)`)
     }
   }
 
