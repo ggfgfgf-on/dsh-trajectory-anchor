@@ -68,6 +68,20 @@ Both are **safe off**: with them disabled the plugin observes and audits only, a
 code path can remove a tool from the registry (asserted by C3, and enumerated: with
 both switches off `policyDecision` can only return `action: 'none'`).
 
+Turning them on is not enough either, by design: the capability layer additionally
+needs a passing calibration artifact, is suspended outright under
+`measurementSafe` (so a measured score is never attributable to the plugin), and
+demotes **itself** to observe-only if the live narrowed-session rate exceeds the
+budget. See "Runtime gate (B3)" below.
+
+## Version lineage
+
+`package.json` is the single source of truth: **0.5.0** = B1 behavioural channels +
+B2 budget-derived calibration + B3 runtime gate. Earlier commits described B1/B2 in
+their messages as 0.4.8/0.4.9 while `package.json` still said 0.4.7 — a silent drift
+of exactly the kind this project hunts, so the numbering was reconciled here and each
+later change must bump `package.json` in the same commit.
+
 ## Lifecycle
 
 ```
@@ -103,8 +117,11 @@ agent/disposed: RewardAnnotator process reward + trajectory JSONL final archive
 | `lexicon` / `ratioWeights` | monitor-calibrated | weighted lexicon scoring (we/let's/we'll/"we need"/our vs "let me"; neutral i will/i'll/i need/check/verify) |
 | `specMax` / `reactMin` | `0.2` / `0.5` | persona_ratio band boundaries (spec/mixed/react) |
 | `refMinSteps` / `testWindow` | `12` / `4` | **session-local reference test**: the last `testWindow` observations are compared against the session's own earlier history |
-| `responseChannels` | 4 channels, all `capabilityEligible: false` | per-channel overrides (`refMinSteps`, `testWindow`, `window`, `minRepeats`, `capabilityEligible`). Merged **per channel** — overriding one channel never wipes the others |
-| `actAlpha` / `notifyAlpha` | `0.01` / `0.05` | budgets for the capability layer / notification layer (one-sided Mann-Whitney p-value thresholds) |
+| `responseChannels` | 4 channels, all `capabilityEligible: false` | per-channel overrides (`refMinSteps`, `testWindow`, `window`, `minRepeats`, `consecutive`, `capabilityEligible`). Merged **per channel** — overriding one channel never wipes the others |
+| `actAlpha` / `notifyAlpha` | `0.01` / `0.05` | budgets for the capability layer / notification layer (one-sided Mann-Whitney p-value thresholds for the lexicon channel; exact one-sided binomial for the behavioural channels) |
+| `responsePolicyPath` | `null` | calibration artifact (`responsePolicy.json`) that decides which channels may act; `TRAJECTORY_ANCHOR_POLICY_PATH` is an equivalent source. Missing / unparseable / expired / `verdict ≠ PASS` ⇒ observe-only |
+| `measurementSafe` | `false` | evaluation protection: `true` forces observe-only (both layers), so a measured score cannot be attributed to the plugin |
+| `autoDemoteWindow` / `autoDemoteBudget` | `20` / `0.05` | online self-check: if more than `autoDemoteBudget` of the last `autoDemoteWindow` finished sessions narrowed, the plugin demotes **itself** to observe-only and writes an `auto-demote` audit event |
 | `maxDriftSteps` | `12` | hard bound on any narrowed episode — the exit condition that is **provably reachable**. Derived, not guessed: replaying 45 sessions / 3,299 steps with the bound off gives natural episode lengths p50=5, p75=9, **p90=12**, p95=19, max=22, so 12 = the p90 of what an episode naturally lasts (it truncates 5 of 53 episodes). The value is a *safety bound*; the real budget lever is the false-trigger rate (G1 gate). A calibration artifact may recompute and override it by the same quantile method |
 | `rollbackEnabled` / `notifyEnabled` | **`false` / `false`** | capability / notification switches. Both default OFF (observe-only) because the calibration measured the lexicon signal's session-level false-trigger rate at 15.9% (α=0.001) / 43.2% (α=0.01) — far above a 5% budget. See "Response policy" below |
 | `leanDenyPatterns` | 28 entries | the set hidden while `surfacePhase === 'narrowed'` (`*` prefix wildcards); count is asserted against the source by `tools/check-invariants.mjs` |
@@ -208,6 +225,63 @@ signal replaces the lexical one).
 keep: no episode exceeds the bound, no episode ends for an unexpected reason,
 and replaying the same series twice yields identical decisions.
 
+### Runtime gate (B3): the capability layer has to earn permission, every mount
+
+Offline qualification is not online qualification: corpora drift, models change,
+task families change. So three independent gates sit in front of the capability
+layer, and **each one fails safe** (observe-only) rather than open — a capability
+surface is not a tool surface, and "exposing the full catalog" is the right
+failure only for the latter.
+
+| Gate | Trigger | Effect | Visible as |
+|---|---|---|---|
+| **Calibration artifact** | `responsePolicyPath` (or `TRAJECTORY_ANCHOR_POLICY_PATH`) points at a JSON file that is not an object, cannot be parsed, is expired (`expiresAtUtc`), or whose `verdict` is not `PASS`/`PARTIAL-PASS` | capability layer off; a loud one-shot warning records why | `capabilityGate: 'policy-REJECTED'`, `policyArtifact.rejectReason` |
+| **Evaluation protection** | the artifact declares `measurementSafe: true`, or config sets `measurementSafe: true` | **both** layers off — a benchmark score must not be attributable to this plugin | `capabilityGate: 'measurement-safe'` |
+| **Online auto-demote** | in the last `autoDemoteWindow` finished sessions, the share that narrowed at least once exceeds `autoDemoteBudget` | capability **and** notification off for the rest of the process, with an `auto-demote` audit event | `capabilityGate: 'auto-demoted:<reason>'`, `sessionOutcomes` |
+
+A passing artifact grants eligibility **per channel** (`capabilityEligibleChannels`)
+and may carry re-derived parameters (`channels.<name>.derived.{alpha, consecutive}`),
+which are written into the live channel config — so the same deviation shape can
+narrow under one calibration and only notify under another. The artifact gates the
+**capability** layer only: notification is instrumentation, it changes neither the
+tool surface nor the context, and it keeps working (under its own `notifyAlpha`
+budget) while the capability layer is barred. Every effective value is visible in
+`anchor_status` — `effectiveSwitches`, `capabilityGate`, `policyArtifact`, and per
+channel `actAlpha` / `notifyAlpha` / `consecutive` / `fireRun` / `notifyRun`.
+
+Three failure modes found and fixed while building this gate (all three now
+asserted, and each assertion is negative-tested against a deliberately broken
+copy under `D:\DSHwork\scratch\inv-neg-b3\`):
+
+1. **Sticky state across mounts.** `apply()` used to keep the module-level
+   `CONFIG` from the previous mount, and `{ ...DEFAULTS }` is a *shallow* copy —
+   so loading an artifact mutated `DEFAULTS` itself, and an artifact's
+   `measurementSafe` / eligibility / derived α survived into the next mount
+   ("I removed the artifact and the behaviour did not change"). `apply()` now
+   re-seeds `CONFIG` from `DEFAULTS` (deep) and clears the gate state.
+2. **Two-tier counter mixing.** The consecutive-confirmation counter was
+   incremented at `notifyAlpha` but used to guard the `actAlpha` capability
+   tier — i.e. the online decision was *looser* than the offline calibration,
+   which counts runs at a single α (`behaviour-channel-core.mjs walkChannel`).
+   That is precisely "passes offline, exceeds budget online". The counters are
+   now kept per tier (`fireRun` at `actAlpha`, `notifyRun` at `notifyAlpha`).
+3. **Decision-relevant p was unreadable.** `round2()` printed both `3e-3` and
+   `9e-6` as `0`, so with α at `1e-5` the audit could not say *why* a step acted.
+   Probabilities now keep two significant digits below `0.001` (`roundP`).
+
+`tools/test-policy-gate.mjs` (39 assertions) drives real `apply()` for all five
+must-observe cases plus the auto-demote path, and keeps **both directions** of
+every claim: the same synthetic deviation narrows with a permissive artifact and
+only notifies with a derived `α = 1e-5`; a `k = 3` requirement neither fires
+early nor never fires; a mixed-tier counter fails while a per-tier counter holds.
+`tools/check-invariants.mjs` asserts the wiring statically as **C13** (re-seed
+present, `hitAct` measured at `actAlpha`, `strong` requiring action-tier
+confirmation, and no raw `CONFIG.rollbackEnabled` / `CONFIG.notifyEnabled` read
+outside the gate functions), and pins the version lineage as **C14** (the README
+must name the `package.json` version — the drift that motivated it was commits
+advertising 0.4.8/0.4.9 while `package.json` still said 0.4.7). Both C13 and C14
+were verified against deliberately violated copies, not just against the good one.
+
 
 ## Ablation guidance (calibration vs core)
 
@@ -305,7 +379,21 @@ node tools\export-layer4.mjs `
   plus append-only chunk files `anchor-<agentId>.jsonl.<n>` (the buffer drains to an
   immutable chunk when it crosses the event-count or byte-budget threshold —
   `auditChunkEvents` / `auditChunkBytes` — so long runs lose no events)
-- Live state: the `anchor_status` tool (globally registered, read-only)
+- Live state: the `anchor_status` tool (globally registered, read-only). Beyond the
+  per-agent rows it reports the plugin-level gate state: `capabilityGate`,
+  `effectiveSwitches`, `policyArtifact`, `autoDemote`, `sessionOutcomes`,
+  `configWarnings`, `policy` / `policyAction` / `policyP` / `policyReason` per session,
+  and the per-channel snapshot (`channels`, `channelWindows`) with the effective
+  `actAlpha` / `notifyAlpha` / `consecutive` and the two live run counters
+- Assertion suites (all must stay green; each is run against `index.js` by path):
+  `tools/check-invariants.mjs` — 14 static invariants (C1–C14), 0 debt;
+  `tools/test-runtime-lexicon.mjs` — 64 pure-function cases;
+  `tools/test-anchor-contract.mjs` — 24 install-and-use / contract cases (incl. the
+  "apply() with no config at all" mount and a lossless-JSON walk over live rows);
+  `tools/test-response-policy.mjs` — 30 end-to-end policy cases (A…J);
+  `tools/test-policy-gate.mjs` — 39 B3 gate cases (artifact / expiry / evaluation
+  protection / auto-demote / two-tier counters, each with its opposite direction);
+  `tools/replay-interventions.mjs` — bounded episodes, compliant end reasons, replayable
 - Event-sequence assertion: `adopted → anchored → context-suppressed → maxTokens-rewrite →
   gate-armed → lift(anchor-gate:minimal-like | max-steps) → context-restored →
   maxTokens-strip → score… → closed + record(incl. reward)`

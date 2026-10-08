@@ -111,7 +111,7 @@ await boot({ rollbackEnabled: true, notifyEnabled: true })
 }
 
 // ── 场景 B：偏离触发 → 收窄 + 组装期派生 + notice ─────────────────────────
-await boot({ rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 3, responseChannels: { lexicon: { capabilityEligible: true } } })
+await boot({ rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 3, responseChannels: { lexicon: { capabilityEligible: true, actAlpha: 0.01, notifyAlpha: 0.05 } } })
 {
   const { session } = await adoptAndLift('sess-B')
   for (let i = 0; i < 16; i++) sessionEvent(session, text('We will run the full build and verify each artifact carefully.'))
@@ -180,7 +180,7 @@ await boot({ rollbackEnabled: true, notifyEnabled: true })
 }
 
 // ── 场景 E：轨迹恢复 → 回到 stable ───────────────────────────────────────
-await boot({ rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 50, responseChannels: { lexicon: { capabilityEligible: true } } })
+await boot({ rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 50, responseChannels: { lexicon: { capabilityEligible: true, actAlpha: 0.01, notifyAlpha: 0.05 } } })
 {
   const { session } = await adoptAndLift('sess-E')
   for (let i = 0; i < 16; i++) sessionEvent(session, text('We will run the full build and verify each artifact carefully.'))
@@ -245,7 +245,7 @@ await boot({ rollbackEnabled: true, notifyEnabled: true, responseChannels: { ina
 }
 
 // ── 场景 I：C 重复调用（有资格）→ 收窄 ─────────────────────────────────
-await boot({ rollbackEnabled: true, notifyEnabled: true, responseChannels: { repetition: { capabilityEligible: true } } })
+await boot({ rollbackEnabled: true, notifyEnabled: true, responseChannels: { repetition: { capabilityEligible: true, actAlpha: 0.01, notifyAlpha: 0.05 } } })
 {
   const { session } = await adoptAndLift('sess-I')
   cleanSteps(session, 1, 1, 24)

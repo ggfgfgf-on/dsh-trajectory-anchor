@@ -76,20 +76,39 @@ const DEFAULTS = {
   // 秩检验），预算直接落在会话内；离线语料只用来回答"该信号有没有判别力"。
   refMinSteps: 12,      // 参考段最少步数（全局默认；每通道可在 responseChannels 覆盖）
   testWindow: 4,        // 检验窗长度（全局默认；每通道可覆盖）
-  notifyAlpha: 0.05,    // 通知预算（p ≤ 该值 → 通知，不动能力）
-  actAlpha: 0.01,       // 能力层预算（更严；还需通道有资格 + 开关打开）
+  notifyAlpha: 0.05,    // 通知预算（全局默认；每通道可覆盖）
+  actAlpha: 0.01,       // 能力层预算（全局默认；每通道可覆盖）
+  // ── B3 运行时门禁 ────────────────────────────────────────────────────────
+  // 标定件路径（responsePolicy.json）。给了就按它决定"哪些通道有资格动能力面"；
+  // 没给 / 过期 / 不匹配 / verdict≠PASS → **一律只观察**（fail-safe，绝不默认放开）。
+  // 环境变量 TRAJECTORY_ANCHOR_POLICY_PATH 可作为等价来源（与词典的 env 一致）。
+  responsePolicyPath: null,
+  // 评测保护：true ⇒ 强制只观察（能力层与通知层都关），用于"分数归因不被插件污染"。
+  // 可由标定件的 measurementSafe 或配置直接置位。
+  measurementSafe: false,
+  // 在线自动降档：最近 autoDemoteWindow 个已结束会话里，出现过收窄的比例超过
+  // autoDemoteBudget ⇒ 自动降为只观察并留审计（防止"离线合格、线上超标"）。
+  autoDemoteWindow: 20,
+  autoDemoteBudget: 0.05,
   // ── 行为通道（B1）────────────────────────────────────────────────────────
   // 为什么加：词表信号实测无判别力（会话级误触发 15.9%–43.2%，预算 5%）；行为通道
-  //   的实测空转侧：A′ 中途停手 0/26 会话、C 重复调用 0/26、B 工具失败 12/26（46%）。
-  //   → A′/C 够格驱动能力层，B 只做通知（见 docs/community-reference-matrix.md）。
+  //   的空转侧在**全语料**（77 会话 / 41731 步）上实测如下（tools/calibrate-channels.mjs）：
+  //     α=0.01, k=1 → A′ 27.3%、C 32.5%、B 41.6%（远超 5% 预算）
+  //     按预算反解 → k=1, α=1e-5 → A′ 2.6%、C 0.0%、B 0.0%；k=2 时 A′ 0.0%
+  //   根因：α 是**单次检验**的误报率，而预算是**每会话**的（会话几百步，族错误率
+  //   1−(1−α)^N 会放大几十倍）。所以默认就用反解值：actAlpha=1e-5、k=1（可配 k=2）。
   // A′ 的定义**必须**带"回合未结束"硬条件：实测 67 个"无工具调用"步 100% 是回合末步
-  //   （代理干完活回答了），不分回合末步就是 100% 误判。
-  // capabilityEligible 默认全 false：由标定件（responsePolicy.json）按预算翻转。
+  //   （代理干完活回答了），不分回合末步就是 100% 误判（G3 反向对照门常驻验证）。
+  // capabilityEligible 默认全 false：由标定件按预算翻转。
   responseChannels: {
-    inaction: { enabled: true, refMinSteps: 20, testWindow: 3, capabilityEligible: false },
-    repetition: { enabled: true, refMinSteps: 20, testWindow: 3, window: 5, minRepeats: 2, capabilityEligible: false },
-    failure: { enabled: true, refMinSteps: 20, testWindow: 3, capabilityEligible: false },
-    lexicon: { enabled: true, refMinSteps: 12, testWindow: 4, capabilityEligible: false },
+    inaction: { enabled: true, refMinSteps: 20, testWindow: 3, actAlpha: 1e-5, notifyAlpha: 1e-4, consecutive: 1, capabilityEligible: false },
+    repetition: { enabled: true, refMinSteps: 20, testWindow: 3, window: 5, minRepeats: 2, actAlpha: 1e-5, notifyAlpha: 1e-4, consecutive: 1, capabilityEligible: false },
+    failure: { enabled: true, refMinSteps: 20, testWindow: 3, actAlpha: 1e-5, notifyAlpha: 1e-4, consecutive: 1, capabilityEligible: false },
+    // 词表通道：α **必须各自标定**——行为通道反解出的 1e-5 不能套到它头上（两者标度不同）。
+    // 它的会话级空转率实测 15.9%（α=1e-3）～43.2%（α=0.01），按 5% 预算同样需要 ~1e-5；
+    // 但它的能力层资格本就是 false（标定 FAIL），所以这里保留历史值 0.01/0.05 并在
+    // 标定件接入后按各自的反解值覆盖。
+    lexicon: { enabled: true, refMinSteps: 12, testWindow: 4, actAlpha: 0.01, notifyAlpha: 0.05, consecutive: 1, capabilityEligible: false },
   },
   // P6 不变量：收窄态的步数硬上限（退出条件必然可达）。0 = 关闭该上限（不推荐）。
   // 到顶后本漂移片段内禁止再次收窄，直到检验不再触发（片段结束）才复位。
@@ -185,8 +204,55 @@ function noteConfigWarning(message) {
   warnOnce(message)
 }
 
+// ---------- B3：运行时门禁状态（标定件 / 自动降档 / 评测保护）----------
+/** 已装载的标定件摘要（null = 未提供）。 */
+let policyArtifact = null
+/** 在线自动降档状态（一旦置位即保持，直到进程重启或人工清空）。 */
+let autoDemote = null
+/** 最近已结束会话的"是否收窄过"记录（在线超预算自动降档用）。 */
+const sessionOutcomes = []
+
+/**
+ * 能力层**有效**开关（决策路径必须用这个，而不是直接读 CONFIG.rollbackEnabled）：
+ * 配置开关 ∧ 标定件允许 ∧ 未被自动降档 ∧ 不在评测保护下。
+ * 任何一项不满足 → 只观察。这是"默认安全"的最后一道闸门。
+ */
+function effectiveRollback() {
+  if (CONFIG.measurementSafe === true) return false
+  if (autoDemote) return false
+  if (policyArtifact && policyArtifact.verdict !== 'PASS' && policyArtifact.verdict !== 'PARTIAL-PASS') return false
+  return CONFIG.rollbackEnabled === true
+}
+/** 通知层的有效开关：同样受评测保护与自动降档约束（降档后连通知也停，只留审计）。 */
+function effectiveNotify() {
+  if (CONFIG.measurementSafe === true) return false
+  if (autoDemote) return false
+  return CONFIG.notifyEnabled === true
+}
+/** 卡口为何关闭（可观测：让人一眼知道"为什么没动手"）。 */
+function capabilityGateReason() {
+  if (CONFIG.measurementSafe === true) return 'measurement-safe'
+  if (autoDemote) return `auto-demoted:${autoDemote.reason}`
+  if (policyArtifact && policyArtifact.verdict !== 'PASS' && policyArtifact.verdict !== 'PARTIAL-PASS') return `policy-${policyArtifact.verdict}`
+  if (CONFIG.rollbackEnabled !== true) return 'switch-off'
+  return null
+}
+
 function round2(n) {
   return Math.round(n * 100) / 100
+}
+
+/**
+ * 概率的显示精度：α 现在是 1e-5 量级，round2 会把 3e-3 与 9e-6 一并印成 0，
+ * 于是"为什么动手 / 为什么没动手"在审计与 anchor_status 里根本无法回答
+ * （实测：p=0.003 的行动级判定与 p=1e-9 的判定在报告里长得一模一样）。
+ * 小值保留 2 位有效数字（0.003、1.2e-7），大值仍按两位小数。
+ */
+function roundP(p) {
+  if (!Number.isFinite(p)) return null
+  if (p === 0) return 0
+  if (p < 0.001) return Number(p.toPrecision(2))
+  return round2(p)
 }
 
 function bump(channel) {
@@ -652,7 +718,7 @@ export function evaluateChannels(input) {
       usable.push(c)
     }
   }
-  const none = { channel: null, p: null, perChannel: chans.map((c) => ({ name: c.name, p: Number.isFinite(c.p) ? round2(c.p) : null })) }
+  const none = { channel: null, p: null, perChannel: chans.map((c) => ({ name: c.name, p: roundP(c.p) })) }
   if (usable.length === 0) {
     return {
       ...none,
@@ -662,8 +728,19 @@ export function evaluateChannels(input) {
     }
   }
   const byP = usable.slice().sort((a, b) => a.p - b.p)
-  const strong = byP.filter((c) => c.p <= input.actAlpha)
-  const weak = byP.filter((c) => c.p <= input.notifyAlpha)
+  const actA = (c) => (Number.isFinite(c.actAlpha) ? c.actAlpha : input.actAlpha)
+  const notifyA = (c) => (Number.isFinite(c.notifyAlpha) ? c.notifyAlpha : input.notifyAlpha)
+  // 连续确认 k：与离线核心同语义——连续 k 次检验都命中才算一次触发（观测单位迟滞）。
+  // fireRun / fireRunNotify 由运行时逐通道维护（各自的门限见 stateMachine）；
+  // 直接调用本函数的场景（兼容 façade、回归用例）未跟踪连续计数时按 1 处理
+  // = "单次检验即触发"（B3 之前的行为，向后兼容）。
+  const runOf = (c, tier) => {
+    const v = tier === 'act' ? c.fireRun : c.fireRunNotify
+    return Number.isFinite(v) ? v : 1
+  }
+  const confirmed = (c, tier) => runOf(c, tier) >= Math.max(1, c.consecutive ?? 1)
+  const strong = byP.filter((c) => c.p <= actA(c) && confirmed(c, 'act'))
+  const weak = byP.filter((c) => c.p <= notifyA(c) && confirmed(c, 'notify'))
   const notice = input.notifyEnabled === true ? 'notice' : 'none'
   if (strong.length > 0) {
     // OR 入口的正确语义：**任一"有资格"的通道够强即可收窄**。
@@ -672,19 +749,19 @@ export function evaluateChannels(input) {
     const strongEligible = strong.filter((c) => c.capabilityEligible === true)
     const pick = strongEligible.length > 0 ? strongEligible[0] : strong[0]
     if (input.rollbackEnabled !== true) {
-      return { ...none, level: 'narrowed', action: notice, reason: input.notifyEnabled === true ? 'capability-disabled' : 'observe-only', channel: pick.name, p: round2(pick.p) }
+      return { ...none, level: 'narrowed', action: notice, reason: input.notifyEnabled === true ? 'capability-disabled' : 'observe-only', channel: pick.name, p: roundP(pick.p) }
     }
     if (strongEligible.length === 0) {
-      return { ...none, level: 'narrowed', action: notice, reason: pick.blockedBy || 'channel-not-eligible', channel: pick.name, p: round2(pick.p) }
+      return { ...none, level: 'narrowed', action: notice, reason: pick.blockedBy || 'channel-not-eligible', channel: pick.name, p: roundP(pick.p) }
     }
     if (input.budgetExhausted === true) {
-      return { ...none, level: 'narrowed', action: notice, reason: 'capability-budget-exhausted', channel: pick.name, p: round2(pick.p) }
+      return { ...none, level: 'narrowed', action: notice, reason: 'capability-budget-exhausted', channel: pick.name, p: roundP(pick.p) }
     }
-    return { ...none, level: 'narrowed', action: 'narrow', reason: 'deviation', channel: pick.name, p: round2(pick.p) }
+    return { ...none, level: 'narrowed', action: 'narrow', reason: 'deviation', channel: pick.name, p: roundP(pick.p) }
   }
   if (weak.length > 0) {
     const pick = weak[0]
-    return { ...none, level: 'watch', action: notice, reason: input.notifyEnabled === true ? 'deviation-weak' : 'observe-only', channel: pick.name, p: round2(pick.p) }
+    return { ...none, level: 'watch', action: notice, reason: input.notifyEnabled === true ? 'deviation-weak' : 'observe-only', channel: pick.name, p: roundP(pick.p) }
   }
   return { ...none, level: 'stable', action: 'none', reason: 'within-reference' }
 }
@@ -717,7 +794,7 @@ export function lexiconDegenerate(positiveHitSteps, stepsScored, minSteps) {
 }
 
 function applyRollback(rec, via, p) {
-  if (!CONFIG.rollbackEnabled) return
+  if (!effectiveRollback()) return
   if (!rec.anchored || !rec.lifted) return
   if (rec.surfacePhase === 'narrowed') return
   if (CONFIG.leanDenyPatterns.length === 0) {
@@ -797,18 +874,45 @@ function stateMachine(rec, agent) {
   // 多通道：词表（曼-惠特尼，会话内自参考）+ 行为（中途停手 / 重复 / 失败，二值精确二项）。
   // 入口是 OR——任一通道成立即可；不做跨通道"与"（"与"会继承每个通道的盲区）。
   const perChannel = channelTests(rec)
+  // 连续确认计数（每通道独立）：p 命中则该通道 run+1，否则清零。
+  // 与离线核心 behaviour-channel-core.mjs 的 walkChannel 同语义，否则"离线标定"
+  // 与"在线判定"会对不上。
+  if (!rec.fireRuns || typeof rec.fireRuns !== 'object') rec.fireRuns = {}
+  for (const c of perChannel) {
+    // 连续确认计数**按层级各自维护**，且必须与门限同层：
+    //   行动级连续计数用 actAlpha，通知级用 notifyAlpha。
+    // 为什么不能让"通知级命中"去凑行动级的 k：离线标定（calibrate-channels.mjs →
+    // behaviour-channel-core.mjs 的 walkChannel(alpha)）是在**单一 α** 上数连续的，
+    // 标定件反解出的 (α=1e-5, k) 语义就是"连续 k 次 p≤1e-5"。若在线改用 1e-4 计数，
+    // 在线判定会比标定**更松**（1e-4 档的命中被算进连续），结果就是"离线合格、线上
+    // 超标"——正是 B3 门禁要防的静默失效。（这条差异由门禁用例 ⑩ 守住。）
+    const actA = Number.isFinite(c.actAlpha) ? c.actAlpha : CONFIG.actAlpha
+    const notA = Number.isFinite(c.notifyAlpha) ? c.notifyAlpha : CONFIG.notifyAlpha
+    const hitAct = Number.isFinite(c.p) && c.p <= actA
+    const hitNot = Number.isFinite(c.p) && c.p <= notA
+    const prev = rec.fireRuns[c.name]
+    const slot = prev && typeof prev === 'object'
+      ? prev
+      : { act: Number.isFinite(prev) ? prev : 0, notify: Number.isFinite(prev) ? prev : 0 }
+    slot.act = hitAct ? slot.act + 1 : 0
+    slot.notify = hitNot ? slot.notify + 1 : 0
+    rec.fireRuns[c.name] = slot
+    c.fireRun = slot.act
+    c.fireRunNotify = slot.notify
+  }
   const decision = evaluateChannels({
     perChannel,
     refMinSteps: CONFIG.refMinSteps,
     notifyAlpha: CONFIG.notifyAlpha,
     actAlpha: CONFIG.actAlpha,
     budgetExhausted: Boolean(rec.capabilityBudgetExhausted),
-    rollbackEnabled: Boolean(CONFIG.rollbackEnabled),
-    notifyEnabled: Boolean(CONFIG.notifyEnabled),
+    // 决策路径一律用**有效开关**（含标定件门禁 / 自动降档 / 评测保护）
+    rollbackEnabled: effectiveRollback(),
+    notifyEnabled: effectiveNotify(),
   })
   rec.channels = perChannel.map((c) => ({
     name: c.name,
-    p: Number.isFinite(c.p) ? round2(c.p) : null,
+    p: roundP(c.p),
     // 注意：短参考/被关闭的通道没有 observed/window/refHits —— 必须落成 null，
     // 不能留 undefined。DSH 的工具输出校验要求无损 JSON，undefined 会让
     // anchor_status 直接报 "value is not lossless JSON"（本轮踩过）。
@@ -818,10 +922,17 @@ function stateMachine(rec, agent) {
     refHits: c.refHits ?? null,
     eligible: c.capabilityEligible === true,
     blockedBy: c.blockedBy ?? null,
+    // 生效门限（含标定件反解值）必须可见：否则"为什么没动手"无法从审计里回答——
+    // 同一形状的偏离在 α=0.01 下动手、在 α=1e-5 下不动手，差别只能从这里看出来。
+    actAlpha: Number.isFinite(c.actAlpha) ? c.actAlpha : null,
+    notifyAlpha: Number.isFinite(c.notifyAlpha) ? c.notifyAlpha : null,
+    consecutive: c.consecutive ?? 1,
+    fireRun: c.fireRun ?? 0,
+    notifyRun: c.fireRunNotify ?? 0,
   }))
   rec.lastPolicy = decision.level
   rec.lastPolicyAction = decision.action
-  rec.lastPolicyP = decision.p === null || decision.p === undefined ? null : round2(decision.p)
+  rec.lastPolicyP = decision.p === null || decision.p === undefined ? null : roundP(decision.p)
   rec.lastPolicyReason = decision.reason
   rec.lastPolicyChannel = decision.channel || null
   // 两个"证据不足"档都留痕（A 方案）：
@@ -991,11 +1102,18 @@ function channelSeries(rec) {
 /** 单通道的二值检验输入。 */
 function channelTest(name, series) {
   const cfg = (CONFIG.responseChannels && CONFIG.responseChannels[name]) || {}
-  if (cfg.enabled === false) return { name, p: null, refLen: 0, refMinSteps: cfg.refMinSteps || CONFIG.refMinSteps, capabilityEligible: false, blockedBy: 'channel-disabled' }
+  const base = {
+    name,
+    refMinSteps: cfg.refMinSteps || CONFIG.refMinSteps,
+    actAlpha: Number.isFinite(cfg.actAlpha) ? cfg.actAlpha : CONFIG.actAlpha,
+    notifyAlpha: Number.isFinite(cfg.notifyAlpha) ? cfg.notifyAlpha : CONFIG.notifyAlpha,
+    consecutive: Math.max(1, cfg.consecutive ?? 1),
+  }
+  if (cfg.enabled === false) return { ...base, p: null, refLen: 0, capabilityEligible: false, blockedBy: 'channel-disabled' }
   const m = cfg.testWindow || CONFIG.testWindow
   const refLen = series.length - m
   if (refLen < 1) {
-    return { name, p: null, refLen, refMinSteps: cfg.refMinSteps || CONFIG.refMinSteps, capabilityEligible: cfg.capabilityEligible === true }
+    return { ...base, p: null, refLen, capabilityEligible: cfg.capabilityEligible === true }
   }
   const test = series.slice(series.length - m)
   const reference = series.slice(0, series.length - m)
@@ -1003,10 +1121,9 @@ function channelTest(name, series) {
   const refHits = reference.reduce((a, b) => a + b, 0)
   const p = binomialLowerP(observed, m, refHits, reference.length)
   return {
-    name,
+    ...base,
     p,
     refLen: reference.length,
-    refMinSteps: cfg.refMinSteps || CONFIG.refMinSteps,
     capabilityEligible: cfg.capabilityEligible === true,
     observed,
     window: m,
@@ -1029,6 +1146,9 @@ function channelTests(rec) {
       p,
       refLen,
       refMinSteps: lexCfg.refMinSteps || CONFIG.refMinSteps,
+      actAlpha: Number.isFinite(lexCfg.actAlpha) ? lexCfg.actAlpha : CONFIG.actAlpha,
+      notifyAlpha: Number.isFinite(lexCfg.notifyAlpha) ? lexCfg.notifyAlpha : CONFIG.notifyAlpha,
+      consecutive: Math.max(1, lexCfg.consecutive ?? 1),
       // 词典退化 → 该通道失去能力层资格（不是全局闸门：行为通道不受影响）
       capabilityEligible: lexCfg.capabilityEligible === true && !rec.lexiconDegenerate,
       blockedBy: rec.lexiconDegenerate ? 'lexicon-degenerate' : undefined,
@@ -1202,6 +1322,32 @@ function annotateReward(rec) {
   }
 }
 
+/**
+ * 在线自动降档（B3）：会话结束时记录"本会话是否收窄过"，并在最近
+ * autoDemoteWindow 个会话里计算实际比例；超过 autoDemoteBudget 即降档。
+ *
+ * 为什么需要：离线标定合格 ≠ 线上合格（语料会漂、模型会换、任务族会变）。
+ * 这条让插件**自己发现自己超标**，而不是等人去看日志。
+ * 只记录"真的动过"的会话（narrowedSteps > 0），不收窄的会话算分母。
+ */
+function recordSessionOutcome(rec) {
+  try {
+    if (!(CONFIG.autoDemoteWindow > 0)) return
+    sessionOutcomes.push({ narrowed: rec.narrowedSteps > 0 })
+    while (sessionOutcomes.length > CONFIG.autoDemoteWindow) sessionOutcomes.shift()
+    if (autoDemote) return
+    if (sessionOutcomes.length < CONFIG.autoDemoteWindow) return
+    const rate = sessionOutcomes.filter((o) => o.narrowed).length / sessionOutcomes.length
+    if (rate > CONFIG.autoDemoteBudget) {
+      autoDemote = { reason: 'session-rate-over-budget', rate: round2(rate), budget: CONFIG.autoDemoteBudget, window: sessionOutcomes.length, at: Date.now() }
+      warnOnce(`auto-demoted to observe-only: ${(rate * 100).toFixed(1)}% of the last ${sessionOutcomes.length} sessions narrowed (budget ${(CONFIG.autoDemoteBudget * 100).toFixed(1)}%)`)
+      logAudit(rec, 'auto-demote', { ...autoDemote, note: '能力层与通知层即刻关闭，只保留审计' })
+    }
+  } catch (e) {
+    // 观测侧永不抛
+  }
+}
+
 function closeRec(rec, reason) {
   if (rec.closed) return
   if (rec.anchored && !rec.lifted) lift(rec, 'close:' + reason)
@@ -1216,6 +1362,7 @@ function closeRec(rec, reason) {
   annotateReward(rec)
   rec.closed = true
   logAudit(rec, 'closed', { reason })
+  recordSessionOutcome(rec)
   recs.delete(rec.sessionId)
   if (finished.length >= 50) finished.shift()
   finished.push(rec)
@@ -1317,6 +1464,7 @@ function adopt(agent, doAnchor, channel) {
     // B1 行为通道台账：每步一格（定稿后才参与判定）+ 近期调用指纹（重复检测）
     ledger: [],
     recentCalls: [],
+    fireRuns: {},
     channels: null,
     bandHistory: [],        // 审计用：personaRatio 导出的波段序列（离线回放读日志）
     driftEnteredAt: null,
@@ -1450,7 +1598,7 @@ function summaryOf(rec) {
     channelWindows = {}
     for (const nm of ['inaction', 'repetition', 'failure']) {
       const t = channelTest(nm, live[nm] || [])
-      channelWindows[nm] = { observed: t.observed ?? null, window: t.window ?? null, refLen: t.refLen, p: Number.isFinite(t.p) ? round2(t.p) : null }
+      channelWindows[nm] = { observed: t.observed ?? null, window: t.window ?? null, refLen: t.refLen, p: roundP(t.p) }
     }
   } catch (e) { channelWindows = { error: msg(e) } }
   return {
@@ -1555,10 +1703,19 @@ function buildSummary(filter) {
       maxDriftSteps: CONFIG.maxDriftSteps,
       rollbackEnabled: CONFIG.rollbackEnabled,
       notifyEnabled: CONFIG.notifyEnabled,
+      responsePolicyPath: CONFIG.responsePolicyPath || null,
+      measurementSafe: CONFIG.measurementSafe === true,
+      effectiveRollback: effectiveRollback(),
+      effectiveNotify: effectiveNotify(),
       suppressSkillCatalog: CONFIG.suppressSkillCatalog,
       rewardAnnotator: CONFIG.rewardAnnotator,
     },
     configWarnings: configWarnings.slice(),
+    policyArtifact,
+    autoDemote,
+    capabilityGate: capabilityGateReason(),
+    effectiveSwitches: { rollback: effectiveRollback(), notify: effectiveNotify() },
+    sessionOutcomes: { window: sessionOutcomes.length, narrowed: sessionOutcomes.filter((o) => o.narrowed).length, budget: CONFIG.autoDemoteBudget },
     listAtApply,
     tracked: recs.size,
     anchored: anchoredCount,
@@ -1615,7 +1772,31 @@ function mergeConfig(config) {
   }
 }
 
+/**
+ * 从 DEFAULTS 深拷贝一份运行时配置。
+ *
+ * 为什么必须深拷贝 + 每次挂载重播种（实测踩到的静默降级）：
+ *   ① `{ ...DEFAULTS }` 是浅拷贝 ⇒ `CONFIG.responseChannels` 与
+ *      `DEFAULTS.responseChannels` 是**同一个对象**；标定件装载时执行
+ *      `CONFIG.responseChannels[ch] = {...}` 会就地改掉 DEFAULTS，
+ *      于是"默认值"在第一次装标定件后就不再是默认值了。
+ *   ② `apply` 可能在同一个进程内被**再次调用**（热重载 / 改配置后重挂载）。
+ *      若沿用上一轮的 CONFIG，标定件写入的 `measurementSafe=true`、
+ *      `capabilityEligible=true`、反解出来的 `actAlpha` 会**粘住**：表现为
+ *      "明明删了标定件/改了配置，行为却不变"，且找不到原因。
+ * 因此每次挂载都从 DEFAULTS 重新播种，并把本插件自己的运行期门禁状态一并清空。
+ */
+function cloneDefaults() {
+  return JSON.parse(JSON.stringify(DEFAULTS))
+}
+
 export function apply(ctx, config) {
+  CONFIG = cloneDefaults()
+  policyArtifact = null
+  autoDemote = null
+  sessionOutcomes.length = 0
+  configWarnings.length = 0
+  warned.clear()
   mergeConfig(config)
   // 词典文件加载（在 mergeConfig 之后：lexiconPath 优先于内联 lexicon——
   // 这样"仅加 lexiconPath"即可换词典，无需删除 patch 行里内联的默认词表）
@@ -1633,6 +1814,51 @@ export function apply(ctx, config) {
       console.error(`[${name}] failed to load lexicon from "${lexiconPath}": ${e && e.message}; keeping default lexicon`)
     }
   }
+  // 标定件加载（B3 门禁）：给了路径就按它决定"哪些通道有资格动能力面"。
+  // 任何一步不通过都**只观察**——fail-safe 而不是 fail-open（能力面不同于工具面：
+  // 工具面出错要暴露全量，能力面出错必须不动手）。
+  const envPolicy = typeof process !== 'undefined' && process.env && process.env.TRAJECTORY_ANCHOR_POLICY_PATH
+  const policyPath = (config && typeof config.responsePolicyPath === 'string' && config.responsePolicyPath) || envPolicy || ''
+  if (policyPath) {
+    try {
+      const p = isAbsolute(policyPath) ? policyPath : resolvePath(process.cwd(), policyPath)
+      const art = JSON.parse(readFileSync(p, 'utf8'))
+      const reject = (why) => {
+        policyArtifact = { source: p, verdict: 'REJECTED', rejectReason: why, eligibleChannels: [] }
+        noteConfigWarning(`response policy rejected (${why}); capability layer stays off (observe-only)`)
+      }
+      if (!art || typeof art !== 'object') reject('not an object')
+      else if (art.measurementSafe === true) {
+        policyArtifact = { source: p, verdict: art.verdict ?? 'UNKNOWN', eligibleChannels: [], measurementSafe: true }
+        CONFIG.measurementSafe = true
+        noteConfigWarning('response policy declares measurementSafe; forcing observe-only')
+      } else if (typeof art.expiresAtUtc === 'string' && Date.parse(art.expiresAtUtc) < Date.now()) { // time-ok: artifact-expiry
+        reject(`expired at ${art.expiresAtUtc}`)
+      } else if (art.verdict !== 'PASS' && art.verdict !== 'PARTIAL-PASS') {
+        reject(`verdict=${art.verdict}`)
+      } else {
+        const eligible = Array.isArray(art.capabilityEligibleChannels) ? art.capabilityEligibleChannels : []
+        const applied = []
+        for (const chName of eligible) {
+          if (!CONFIG.responseChannels[chName]) continue
+          const derived = (art.channels && art.channels[chName] && art.channels[chName].derived) || null
+          CONFIG.responseChannels[chName] = {
+            ...CONFIG.responseChannels[chName],
+            capabilityEligible: true,
+            ...(derived && Number.isFinite(derived.consecutive) ? { consecutive: derived.consecutive } : {}),
+            ...(derived && Number.isFinite(derived.alpha) ? { actAlpha: derived.alpha } : {}),
+          }
+          applied.push(chName)
+        }
+        policyArtifact = { source: p, verdict: art.verdict, eligibleChannels: applied, corpusFingerprint: art.corpusFingerprint ?? null, generatedAtUtc: art.generatedAtUtc ?? null }
+        console.log(`[${name}] response policy loaded from ${p} (verdict=${art.verdict}; eligible: ${applied.join(', ') || '(none)'})`)
+      }
+    } catch (e) {
+      policyArtifact = { source: policyPath, verdict: 'REJECTED', rejectReason: msg(e), eligibleChannels: [] }
+      noteConfigWarning(`failed to load response policy from "${policyPath}": ${msg(e)}; capability layer stays off`)
+    }
+  }
+
   agentsSvc = ctx.get('agents')
   fsSvc = ctx.get('fs')
   spSvc = ctx.get('sandboxPolicy')
@@ -1698,7 +1924,7 @@ export function apply(ctx, config) {
         }
         return out
       }
-      if (!CONFIG.rollbackEnabled) return out
+      if (!effectiveRollback()) return out
       const before = Array.isArray(out.tools) ? out.tools : []
       const after = surfaceForPhase('narrowed', before, CONFIG.leanDenyPatterns)
       const denied = before.length - after.length

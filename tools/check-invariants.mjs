@@ -148,12 +148,18 @@ if (existsSync(readmePath)) {
   const problems = []
   if (/setTimeout\s*\(|setInterval\s*\(/.test(src)) problems.push('出现 setTimeout/setInterval（策略不得用计时器）')
   const nowLines = src.split('\n').filter((l) => /Date\.now\(\)/.test(l) && !/^\s*(\/\/|\*)/.test(l))
-  const arithmetic = nowLines.filter((l) => /[<>]=?|Date\.now\(\)\s*[-+]|[-+]\s*Date\.now\(\)/.test(l.replace(/=>/g, '')))
+  // 合法例外必须**显式声明**：该行带 `time-ok: <理由>` 注释。目前只有一处——标定件过期
+  // 检查（那测的是"有效期/事件缺失"，时间在那里才是正确单位，不是策略节奏）。
+  const enforced = nowLines.filter((l) => !/time-ok:/.test(l))
+  const arithmetic = enforced.filter((l) => /[<>]=?|Date\.now\(\)\s*[-+]|[-+]\s*Date\.now\(\)/.test(l.replace(/=>/g, '')))
   for (const l of arithmetic) problems.push(`Date.now() 参与比较/算术：${l.trim().slice(0, 80)}`)
-  const setters = nowLines.filter((l) => !/(t|at|From|At|time)\s*:\s*Date\.now\(\)|=\s*Date\.now\(\),?\s*$/.test(l))
+  const setters = enforced.filter((l) => !/(t|at|From|At|time)\s*:\s*Date\.now\(\)|=\s*Date\.now\(\),?\s*$/.test(l))
   for (const l of setters) problems.push(`Date.now() 出现在非时间戳位置：${l.trim().slice(0, 80)}`)
   if (problems.length) for (const p of problems) fails.push(`C10 ${p}`)
-  else oks.push(`C10 零墙钟决策：无计时器，${nowLines.length} 处 Date.now() 全部只是时间戳`)
+  else {
+    const exempt = nowLines.length - enforced.length
+    oks.push(`C10 零墙钟决策：无计时器，${nowLines.length} 处 Date.now() 全部只是时间戳${exempt ? `（其中 ${exempt} 处为显式声明的例外）` : ''}`)
+  }
 }
 
 // ── C11 硬：决策路径不得读 band（band 只喂审计与离线标定）───────────────────
@@ -238,6 +244,89 @@ if (existsSync(readmePath)) {
   if (!hasExclusion || !hasTurnEnd || !hasLedgerClose) {
     fails.push(`C9 中途停手通道缺少"回合末步"排除（midTurnInaction=${hasExclusion} turn/end=${hasTurnEnd} ledgerCloseTurn=${hasLedgerClose}）：实测不分回合末步就是 100% 误判（67 个无工具调用步全部是回合收尾）`)
   } else oks.push('C9 A′ 通道带回合末步排除（下一步推进 + turn/end 双判）')
+}
+
+// ── C13 硬：B3 运行时门禁接线（能力层必须走"有效开关"，且不得跨挂载粘住）────
+// 由来（都是本轮真实的失败模式）：
+//   ① `apply` 不重播种 CONFIG ⇒ 标定件写入的 measurementSafe / capabilityEligible /
+//      反解 α 会在下一次挂载里**粘住**，表现为"改了配置行为不变"的静默降级；
+//      而且 `{ ...DEFAULTS }` 是浅拷贝，装载标定件会**就地改掉 DEFAULTS**。
+//   ② 连续确认计数用 notifyAlpha 计数、却把守 actAlpha 的行动级 ⇒ 在线比离线标定更松
+//      （离线 walkChannel 是在单一 α 上数连续的），正是"离线合格、线上超标"。
+//   ③ 决策路径若直接读 CONFIG.rollbackEnabled（而不是 effectiveRollback()），
+//      标定件门禁与自动降档会被绕过。
+{
+  const problems = []
+  if (!/CONFIG = cloneDefaults\(\)/.test(src)) {
+    problems.push('apply() 未从 DEFAULTS 重新播种 CONFIG（标定件写入的 measurementSafe/资格/α 会跨挂载粘住）')
+  }
+  if (!/function cloneDefaults\(\)/.test(src)) problems.push('缺少 cloneDefaults()（浅拷贝会让 DEFAULTS 被就地改写）')
+  if (!/const hitAct = Number\.isFinite\(c\.p\) && c\.p <= actA/.test(src)) {
+    problems.push('行动级连续计数未用 actAlpha（用 notifyAlpha 计数会让在线比离线标定更松）')
+  }
+  if (!/const hitNot = Number\.isFinite\(c\.p\) && c\.p <= notA/.test(src)) {
+    problems.push('通知级连续计数未用 notifyAlpha')
+  }
+  if (!/confirmed\(c, 'act'\)/.test(src) || !/confirmed\(c, 'notify'\)/.test(src)) {
+    problems.push('两级未分别确认（strong 必须用行动级连续计数、weak 用通知级）')
+  }
+  if (!/const strong = byP\.filter\(\(c\) => c\.p <= actA\(c\) && confirmed\(c, 'act'\)\)/.test(src)) {
+    problems.push('strong 入口未同时要求 actAlpha 与行动级连续确认')
+  }
+  // 决策/肢动路径不得直接读原始开关：合法位置是**门禁函数体内部**（结构判定，
+  // 不是字符串白名单——否则新增一行读取照样漏过）与 summaryOf 的回显行。
+  const bodySpan = (fnName) => {
+    const start = src.indexOf(`function ${fnName}()`)
+    if (start === -1) return null
+    const open = src.indexOf('{', start)
+    if (open === -1) return null
+    let depth = 0
+    for (let i = open; i < src.length; i++) {
+      if (src[i] === '{') depth += 1
+      else if (src[i] === '}') {
+        depth -= 1
+        if (depth === 0) return [start, i]
+      }
+    }
+    return null
+  }
+  const lineOf = (idx) => src.slice(0, idx).split('\n').length
+  const gateSpans = ['effectiveRollback', 'effectiveNotify', 'capabilityGateReason']
+    .map(bodySpan).filter(Boolean).map(([a, b]) => [lineOf(a), lineOf(b)])
+  const inGateBody = (lineNo) => gateSpans.some(([a, b]) => lineNo >= a && lineNo <= b)
+  const rawSwitchLines = src.split('\n')
+    .map((l, i) => ({ l: l.trim(), i: i + 1 }))
+    .filter(({ l }) => !/^\s*(\/\/|\*)/.test(l) && /CONFIG\.(rollbackEnabled|notifyEnabled)/.test(l))
+    .filter(({ i }) => !inGateBody(i))
+    .filter(({ l }) => !/^\s*(rollbackEnabled|notifyEnabled):\s*CONFIG\.(rollbackEnabled|notifyEnabled),?$/.test(l))
+  if (rawSwitchLines.length) {
+    for (const { l, i } of rawSwitchLines) problems.push(`第 ${i} 行在门禁之外直接读原始开关（应走 effectiveRollback()/effectiveNotify()）：${l.slice(0, 80)}`)
+  }
+  if (!/function effectiveRollback\(\)/.test(src) || !/function effectiveNotify\(\)/.test(src)) {
+    problems.push('缺少 effectiveRollback()/effectiveNotify()（能力层与通知层必须经门禁）')
+  }
+  if (!/if \(CONFIG\.measurementSafe === true\) return false/.test(src)) {
+    problems.push('评测保护未进门禁（measurementSafe 必须能强制只观察）')
+  }
+  if (problems.length) for (const p of problems) fails.push(`C13 ${p}`)
+  else oks.push('C13 B3 门禁接线：CONFIG 每次挂载重播种、两级连续计数分层、肢动路径只读有效开关')
+}
+
+// ── C14 硬：版本号单一来源（README 必须写 package.json 的版本）──────────────
+// 由来：提交文案里的 v0.4.8 / v0.4.9（B1/B2）与 package.json 长期停在 0.4.7 漂移，
+// 即"文档说的版本不是装的版本"。README 已声明 package.json 是唯一来源，这里守住它。
+{
+  const pkgPath = resolve(dirname(indexPath), 'package.json')
+  if (!existsSync(pkgPath)) warns.push(`C14 找不到 package.json（${pkgPath}）`)
+  else if (!existsSync(readmePath)) warns.push(`C14 找不到 README（${readmePath}）`)
+  else {
+    const version = JSON.parse(readFileSync(pkgPath, 'utf8')).version
+    const readme = readFileSync(readmePath, 'utf8')
+    if (!version) fails.push('C14 package.json 没有 version 字段')
+    else if (!readme.includes(version)) {
+      fails.push(`C14 README 未出现 package.json 的版本号 ${version}（版本口径必须单一来源：提交文案曾与 package.json 漂移）`)
+    } else oks.push(`C14 版本一致：package.json = ${version}，README 同步声明`)
+  }
 }
 
 // ── 输出 ────────────────────────────────────────────────────────────────
