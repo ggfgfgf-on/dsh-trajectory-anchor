@@ -108,6 +108,24 @@ check('surface: 无 name 的条目不抛错，且按 fail-open 保留（不误�
     }
     await mod.apply(ctx2)                     // ← 无 config 参数
     const s2 = await tools2.anchor_status.execute({})
+
+    // 平台契约：工具输出必须是**无损 JSON**——不能有 undefined / NaN / Infinity / 函数。
+    // 本轮踩过：channels 里短参考通道的 observed 是 undefined，anchor_status 直接报
+    // "value is not lossless JSON"（测试没抓到，因为校验发生在 DSH 工具层）。
+    const badPaths = []
+    const walk = (v, path) => {
+      if (v === undefined) { badPaths.push(`${path}=undefined`); return }
+      if (typeof v === 'number' && !Number.isFinite(v)) { badPaths.push(`${path}=${v}`); return }
+      if (typeof v === 'function') { badPaths.push(`${path}=function`); return }
+      if (Array.isArray(v)) { v.forEach((x, i) => walk(x, `${path}[${i}]`)); return }
+      if (v && typeof v === 'object') { for (const k of Object.keys(v)) walk(v[k], `${path}.${k}`) }
+    }
+    walk(s2, 'summary')
+    check('工具输出可无损 JSON 序列化（无 undefined/NaN/function）', badPaths.length === 0, badPaths.slice(0, 5).join(', '))
+    let roundTrip = null
+    try { roundTrip = JSON.parse(JSON.stringify(s2)) } catch (e) { roundTrip = null }
+    check('工具输出 JSON round-trip 成功', roundTrip !== null && typeof roundTrip === 'object')
+
     check('安装即用: apply() 不带 config 也能挂载', typeof tools2.anchor_status === 'object')
     check('安装即用: 无配置告警（bundle patch 不声明任何键）', warns2.length === 0, JSON.stringify(warns2))
     check('安装即用: 出厂即安全（双关 + 有界上限 + 锚定默认开）',

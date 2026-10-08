@@ -809,11 +809,15 @@ function stateMachine(rec, agent) {
   rec.channels = perChannel.map((c) => ({
     name: c.name,
     p: Number.isFinite(c.p) ? round2(c.p) : null,
-    observed: c.observed,
-    window: c.window,
-    refLen: c.refLen,
-    refHits: c.refHits,
+    // 注意：短参考/被关闭的通道没有 observed/window/refHits —— 必须落成 null，
+    // 不能留 undefined。DSH 的工具输出校验要求无损 JSON，undefined 会让
+    // anchor_status 直接报 "value is not lossless JSON"（本轮踩过）。
+    observed: c.observed ?? null,
+    window: c.window ?? null,
+    refLen: c.refLen ?? null,
+    refHits: c.refHits ?? null,
     eligible: c.capabilityEligible === true,
+    blockedBy: c.blockedBy ?? null,
   }))
   rec.lastPolicy = decision.level
   rec.lastPolicyAction = decision.action

@@ -278,5 +278,23 @@ await boot({ rollbackEnabled: true, notifyEnabled: true })
     row.policyAction !== 'narrow' && row.surfacePhase === 'stable', `${row.policyAction}/${row.policyReason}`)
 }
 
+// ── 平台契约：被驱动过的会话，其 anchor_status 行必须是无损 JSON ────────────
+// 本轮踩过：channels 里短参考通道的 observed 是 undefined → anchor_status 报
+// "value is not lossless JSON"。这类错误只有在**会话被驱动过**（stateMachine 跑过、
+// rec.channels 被写入）时才会暴露，所以必须在这里测（只 apply() 的契约测试测不到）。
+{
+  const row = await summaryOf('sess-J')
+  const bad = []
+  const walk = (v, path) => {
+    if (v === undefined) { bad.push(`${path}=undefined`); return }
+    if (typeof v === 'number' && !Number.isFinite(v)) { bad.push(`${path}=${v}`); return }
+    if (typeof v === 'function') { bad.push(`${path}=function`); return }
+    if (Array.isArray(v)) { v.forEach((x, i) => walk(x, `${path}[${i}]`)); return }
+    if (v && typeof v === 'object') for (const k of Object.keys(v)) walk(v[k], `${path}.${k}`)
+  }
+  walk(row, 'row')
+  check('驱动过的会话行可无损 JSON 序列化（无 undefined/NaN/function）', bad.length === 0, bad.slice(0, 6).join(', '))
+}
+
 console.log(`\n${pass} pass, ${fail} fail`)
 if (fail > 0) process.exit(1)
