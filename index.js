@@ -38,6 +38,12 @@
 
 import { readFileSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
+// L1：任务锚定信号的**单一实现**（tools/task-anchor-core.mjs 是纯模块，不反向 import 本文件，
+// 因此没有循环依赖）。为什么不在这里再写一份：本项目已经两次栽在"两套规则各说各话"
+// （台账定稿 51 倍偏差、两级连续计数混层），所以本轮一律共用一份实现。
+import {
+  parseTaskAnchors, inScope, isIgnorablePath, changeInvalidatesVerification, pathsFromCallStrict, isWriteTool,
+} from './tools/task-anchor-core.mjs'
 
 const DEFAULTS = {
   anchorEnabled: true,
@@ -118,6 +124,14 @@ const DEFAULTS = {
     // 标定件接入后按各自的反解值覆盖。
     lexicon: { enabled: true, refMinSteps: 12, testWindow: 4, actAlpha: 0.01, notifyAlpha: 0.05, consecutive: 1, capabilityEligible: false },
   },
+  // ── L1 任务锚定拉回（信息型，默认关）──────────────────────────────────────────
+  // 它是**第一个把话直接说给模型听**的动作。机制已验证（注入漂移必须触发、措辞/节流/豁免合规），
+  // 但**效果**只能靠在线对照或真实长会话积累——离线语料里"可客观标注的漂移"实测为 0
+  // （tools/measure-task-signal.mjs：42 个可解析会话里越界写 0、未验证声明 0；
+  //   曾经报出的 8 条经人工审计全为假阳）。所以先关、先审计。
+  pullbackEnabled: false,
+  // 每会话最多说几次（节流见 allostasis 的 admitPerTurn：同一 turn 至多一次）。
+  pullbackMaxPerSession: 3,
   // P6 不变量：收窄态的步数硬上限（退出条件必然可达）。0 = 关闭该上限（不推荐）。
   // 到顶后本漂移片段内禁止再次收窄，直到检验不再触发（片段结束）才复位。
   // 取值来源（不是拍脑袋）：45 个历史会话 / 3299 步关上限回放得到的自然片段长度
@@ -1647,6 +1661,16 @@ function adopt(agent, doAnchor, channel) {
     recentCalls: [],
     fireRuns: {},
     channels: null,
+    // ── L1 任务锚定拉回（默认关）────────────────────────────────────────────
+    // anchors 从**首条人类消息**解析（读不出就 parsed:false，绝不猜）；下列状态全部为审计可见。
+    taskAnchors: null,
+    anchorsFromMessage: null,
+    lastVerifyAt: null,
+    codeEditsAfterVerify: [],
+    scopeViolations: [],
+    /** 待发出的拉回原因（工具调用时置位，pre-step 时消费；保证"触发点=说出口的点"）。 */
+    pendingPullback: null,
+    pullback: { count: 0, lastTurn: null, lastReason: null, lastAt: null, suppressed: { throttled: 0, cap: 0, noAnchors: 0 } },
     bandHistory: [],        // 审计用：personaRatio 导出的波段序列（离线回放读日志）
     driftEnteredAt: null,
     rollbackDeny: [],
@@ -1711,6 +1735,7 @@ function feedSessionEvent(session, event) {
     }
     ledgerNoteToolCall(rec, event.data && event.data.turn, event.data && event.data.step, name, event.data && event.data.arguments)
     logAudit(rec, 'tool-call', { name, turn: event.data && event.data.turn, step: event.data && event.data.step })
+    noteTaskSignal(rec, event)
     if (rec.anchored && !rec.lifted) {
       if (CONFIG.gateEnabled) {
         if (!rec.pendingPromote) {
@@ -1721,6 +1746,8 @@ function feedSessionEvent(session, event) {
         lift(rec, 'first-tool-call')
       }
     }
+  } else if (event.type === 'user/message') {
+    noteHumanMessage(rec, event)
   } else if (event.type === 'tool/result') {
     ledgerNoteToolResult(rec, event.data && event.data.turn, event.data && event.data.step, toolResultText(event))
   } else if (event.type === 'turn/end') {
@@ -1770,6 +1797,146 @@ function safeGet(service, id) {
 
 // ---------- status tool ----------
 
+/** 收第一条人类消息（= 任务陈述），从中解析任务锚点。读不出范围就 parsed:false——绝不猜。 */
+function noteHumanMessage(rec, event) {
+  try {
+    const d = event && event.data
+    if (!d || !d.source || d.source.kind !== 'user') return
+    if (rec.anchorsFromMessage !== null) return          // 只认第一条人类消息
+    const blocks = Array.isArray(d.content) ? d.content : []
+    const text = blocks.filter((b) => b && b.type === 'text').map((b) => b.text || '').join('\n')
+    rec.anchorsFromMessage = text.slice(0, 4000)
+    const anchors = parseTaskAnchors(text)
+    rec.taskAnchors = anchors
+    logAudit(rec, 'task-anchors', {
+      parsed: anchors.parsed === true,
+      reason: anchors.reason || null,
+      scopeNames: anchors.scopeNames || [],
+      scopeDirs: anchors.scopeDirs || [],
+      outsideForbidden: anchors.outsideForbidden === true,
+      verifyTokens: anchors.verifyTokens || [],
+      reportFormat: anchors.reportFormat || null,
+    })
+  } catch (e) {
+    // 观测侧永不抛：解析失败不许影响会话
+    warnOnce(`task-anchor parse failed (ignored): ${msg(e)}`)
+  }
+}
+
+/**
+ * L1：把一次工具调用折算成"任务锚定信号"。
+ *   · 命中验证命令 ⇒ 记 lastVerifyAt 并清空"验证后的代码改动"
+ *   · 越界写（提示声明的范围之外，且不属于临时/venv/缓存）⇒ 置 pendingPullback='scope'
+ *   · 范围内的**代码**改动 ⇒ 记入 codeEditsAfterVerify（文档类改动不记，见
+ *     changeInvalidatesVerification 的实测来由）；若此前已验证过 ⇒ 置 pendingPullback='unverified'
+ * 判据一律保守：认不出范围/认不出文件类型就什么都不做（宁可漏检也不误报）。
+ */
+function noteTaskSignal(rec, event) {
+  try {
+    const anchors = rec.taskAnchors
+    if (!anchors || anchors.parsed !== true) return
+    const d = event && event.data
+    if (!d) return
+    const name = typeof d.name === 'string' ? d.name : ''
+    const turn = typeof d.turn === 'number' ? d.turn : null
+    const step = typeof d.step === 'number' ? d.step : null
+    const args = typeof d.arguments === 'string' ? d.arguments : (d.arguments === undefined ? '' : JSON.stringify(d.arguments))
+    const cmd = (() => {
+      if (d.arguments && typeof d.arguments === 'object' && typeof d.arguments.command === 'string') return d.arguments.command
+      const m = args.match(/"command"\s*:\s*"([^"]*)"/)
+      return m ? m[1] : (typeof d.arguments === 'string' && !args.trim().startsWith('{') ? d.arguments : '')
+    })()
+    // ① 验证运行
+    const isVerify = (anchors.verifyTokens || []).some((t) => cmd && cmd.includes(t))
+    if (isVerify) {
+      rec.lastVerifyAt = { turn, step }
+      if (rec.codeEditsAfterVerify.length > 0) {
+        logAudit(rec, 'verify-run', { turn, step, clearedEdits: rec.codeEditsAfterVerify.length, cmd: String(cmd).slice(0, 160) })
+      }
+      rec.codeEditsAfterVerify = []
+      // 重新验证会**解决**"未验证"这件事 ⇒ 必须同时清掉待发的提醒，否则会说出过期的提醒。
+      // （实测：验证→改码→再验证 之后仍注入了提醒，测试用例 ⑥ 抓出来的。）
+      if (rec.pendingPullback && rec.pendingPullback.reason === 'unverified') rec.pendingPullback = null
+      return
+    }
+    // ② 文件改动（**只把写当信号**：越界读是另一类弱信号，本轮刻意不用）
+    if (!isWriteTool(name)) return
+    for (const path of pathsFromCallStrict(name, d.arguments)) {
+      if (isIgnorablePath(path)) continue
+      if (!inScope(path, anchors)) {
+        const v = { turn, step, tool: name, path, at: Date.now() }
+        rec.scopeViolations.push(v)
+        if (rec.scopeViolations.length > 50) rec.scopeViolations.shift()
+        rec.pendingPullback = { reason: 'scope', turn, step, path, tool: name }
+        logAudit(rec, 'scope-violation', { turn, step, tool: name, path, note: '写操作落在提示声明的范围之外' })
+        continue
+      }
+      if (changeInvalidatesVerification(path)) {
+        rec.codeEditsAfterVerify.push({ turn, step, path, tool: name })
+        if (rec.codeEditsAfterVerify.length > 50) rec.codeEditsAfterVerify.shift()
+        if (rec.lastVerifyAt) {
+          rec.pendingPullback = { reason: 'unverified', turn, step, path, lastVerifyAt: rec.lastVerifyAt }
+        }
+      }
+    }
+  } catch (e) {
+    warnOnce(`task-signal scan failed (ignored): ${msg(e)}`)
+  }
+}
+
+/**
+ * L1 拉回文本：**建议式**、带证据、带明确豁免。
+ *
+ * 措辞纪律来自社区实测（dsh-anchored-monitor 的 hint_templates，实验 E1/E1.5）：
+ * "仅中性声明/建议式，**禁止命令式**（must/first/follow），命令式会把 we 轨迹打回 let me"。
+ * 也就是说：命令式的"拉回"会**加剧**我们要检测的那个信号。所以这里：
+ *   · 只陈述事实（谁在什么时候改了什么、上次验证在哪一步）
+ *   · 只给建议（"可以考虑…"），不给命令
+ *   · 明确写出豁免（文档改动不算、临时文件不算），免得代理为了讨好提醒而不敢正常做事
+ *   · 自报"这是本会话第 N 次"，重复出现时不是纯噪音
+ */
+export function pullbackText(reason, info, count) {
+  const head = count > 1 ? `（第 ${count} 次）` : ''
+  if (reason === 'scope') {
+    return `[trajectory-anchor] 范围提醒${head}：上一步的 ${info.tool} 写到了提示声明的范围之外（${info.path}）。`
+      + '如果这是有意的（例如生成临时脚本或改动工具链），说明一句即可；'
+      + '否则建议把它改回声明的范围内。注意：临时目录/虚拟环境/包缓存不算越界，这里只标了声明的范围之外。'
+  }
+  if (reason === 'unverified') {
+    const at = info.lastVerifyAt ? `（上次验证在 turn ${info.lastVerifyAt.turn} step ${info.lastVerifyAt.step}）` : ''
+    return `[trajectory-anchor] 验证提醒${head}：你在上次验证之后又改了代码（${info.path}）${at}。`
+      + '在宣布完成之前，建议重新跑一次验证命令并引用它的输出。'
+      + '注意：只改文档、注释或说明文件不算——这里只在**代码**改动晚于验证时提醒。'
+  }
+  return null
+}
+
+/**
+ * L1：是否该在**本步**说一句，以及说什么。返回 null 表示不说。
+ * 节流：同一 turn 至多一次（社区 allostasis 的 admitPerTurn + monitor 的分级冷却），
+ * 以及每会话硬上限（pullbackMaxPerSession）——"按需出现"是它作为信号的前提。
+ */
+function pullbackDecision(rec, turn) {
+  if (CONFIG.pullbackEnabled !== true) return null
+  const anchors = rec.taskAnchors
+  if (!anchors || anchors.parsed !== true) { rec.pullback.suppressed.noAnchors += 1; return null }
+  const pending = rec.pendingPullback
+  if (!pending) return null
+  if (rec.pullback.count >= CONFIG.pullbackMaxPerSession) {
+    rec.pullback.suppressed.cap += 1
+    rec.pendingPullback = null
+    return null
+  }
+  if (rec.pullback.lastTurn !== null && rec.pullback.lastTurn === turn) {
+    rec.pullback.suppressed.throttled += 1
+    rec.pendingPullback = null
+    return null
+  }
+  const text = pullbackText(pending.reason, pending, rec.pullback.count + 1)
+  if (!text) { rec.pendingPullback = null; return null }
+  return { reason: pending.reason, text, info: pending }
+}
+
 function summaryOf(rec) {
   // 行为通道的**实时**窗口（与判定走同一套 channelTest；`channels` 是上次判定时的快照，
   // 而台账在 turn/end 之后还会被定稿，所以两者会短暂不同——这里把"现在"也暴露出来）。
@@ -1816,6 +1983,29 @@ function summaryOf(rec) {
     channels: rec.channels,
     channelWindows,
     ledgerSize: rec.ledger.length,
+    // L1 任务锚定拉回：状态与留痕全部可见（"为什么没说/说了几次/依据是什么"）。
+    taskAnchors: rec.taskAnchors
+      ? {
+          parsed: rec.taskAnchors.parsed === true,
+          reason: rec.taskAnchors.reason || null,
+          scopeNames: rec.taskAnchors.scopeNames || [],
+          scopeDirs: rec.taskAnchors.scopeDirs || [],
+          outsideForbidden: rec.taskAnchors.outsideForbidden === true,
+          verifyTokens: rec.taskAnchors.verifyTokens || [],
+          evidence: rec.taskAnchors.evidence || {},
+        }
+      : null,
+    pullback: {
+      enabled: CONFIG.pullbackEnabled === true,
+      count: rec.pullback.count,
+      lastReason: rec.pullback.lastReason,
+      lastTurn: rec.pullback.lastTurn,
+      maxPerSession: CONFIG.pullbackMaxPerSession,
+      scopeViolations: rec.scopeViolations.length,
+      pendingCodeEdits: rec.codeEditsAfterVerify.length,
+      lastVerifyAt: rec.lastVerifyAt,
+      suppressed: { ...rec.pullback.suppressed },
+    },
     lexiconDegenerate: rec.lexiconDegenerate,
     stepsScored: rec.stepsScored,
     positiveHitSteps: rec.positiveHitSteps,
@@ -1889,6 +2079,8 @@ function buildSummary(filter) {
       effectiveRollback: effectiveRollback(),
       effectiveNotify: effectiveNotify(),
       suppressSkillCatalog: CONFIG.suppressSkillCatalog,
+      pullbackEnabled: CONFIG.pullbackEnabled === true,
+      pullbackMaxPerSession: CONFIG.pullbackMaxPerSession,
       rewardAnnotator: CONFIG.rewardAnnotator,
     },
     configWarnings: configWarnings.slice(),
@@ -2183,6 +2375,38 @@ export function apply(ctx, config) {
       }
       const decision = await next()
       if (decision && decision.kind === 'reject') return decision
+      // ── L1 任务锚定拉回：在**近因位置**追加一条独立消息 ───────────────────────
+      // 为什么挂 pre-step 而不是 system prompt 前缀（社区 allostasis 的原文理由）：
+      // 固定前缀离输出最远，长会话里纠偏信号会被近因压过去；这条必须落在近因位置。
+      // 为什么是 messages 追加而不是改写 system：不改写基线语义，且天然可逆（只有这一条）。
+      const pull = pullbackDecision(rec, typeof payload.turn === 'number' ? payload.turn : null)
+      if (pull && decision && Array.isArray(decision.messages)) {
+        rec.pullback.count += 1
+        rec.pullback.lastTurn = typeof payload.turn === 'number' ? payload.turn : null
+        rec.pullback.lastReason = pull.reason
+        rec.pullback.lastAt = Date.now()
+        rec.pendingPullback = null
+        logAudit(rec, 'pullback', {
+          reason: pull.reason, turn: payload.turn, step: payload.step,
+          count: rec.pullback.count, path: pull.info.path || null, text: pull.text,
+        })
+        const injected = {
+          source: { kind: 'trajectory-anchor-pullback' },
+          content: [{ type: 'text', text: pull.text }],
+        }
+        const withPullback = { ...decision, messages: [...decision.messages, injected] }
+        if (!CONFIG.suppressSkillCatalog || !(rec.anchored && !rec.lifted)) return withPullback
+        // 若同一步还要做 bootstrap 期的 skill-catalog 抑制，两件事一起做完再返回
+        const kept = withPullback.messages.filter((m) => {
+          const kind = m && m.source && m.source.kind
+          return !(typeof kind === 'string' && CONFIG.suppressedSources.includes(kind))
+        })
+        if (kept.length !== withPullback.messages.length) {
+          rec.skillCatalogSeen = true
+          logAudit(rec, 'skill-catalog-suppressed', { removed: withPullback.messages.length - kept.length, turn: payload.turn, step: payload.step })
+        }
+        return { ...withPullback, messages: kept }
+      }
       if (!CONFIG.suppressSkillCatalog || !(rec.anchored && !rec.lifted)) return decision
       if (!decision || !Array.isArray(decision.messages)) return decision
       const kept = decision.messages.filter(m => {

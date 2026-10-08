@@ -35,11 +35,32 @@ if (!existsSync(indexPath)) {
 const src = readFileSync(indexPath, 'utf8')
 
 // ── C1 硬：源码引用的每个 CONFIG.<key> 都必须在 DEFAULTS 里定义 ──────────────
+// 注意：键的提取必须按**花括号深度**判断是不是顶层键，不能按缩进。
+// 由来（实测踩到）：`pullbackEnabled` 曾被插到 responseChannels 字面量内部、但用了 2 空格缩进，
+// 于是按缩进的旧实现把它当成 DEFAULTS 顶层键，C1 放过了"引用了一个只存在于嵌套对象里的键"——
+// 而运行期 CONFIG.pullbackEnabled 是 undefined。缩进是排版，深度才是结构。
+const topLevelKeys = (block) => {
+  const keys = new Set()
+  let depth = 0
+  let i = 0
+  while (i < block.length) {
+    const ch = block[i]
+    if (ch === '{' || ch === '[') { depth += 1; i += 1; continue }
+    if (ch === '}' || ch === ']') { depth -= 1; i += 1; continue }
+    if (ch === '/' && block[i + 1] === '/') { while (i < block.length && block[i] !== '\n') i += 1; continue }
+    if (depth === 0) {
+      const m = /^([A-Za-z_][A-Za-z0-9_]*)\s*:/.exec(block.slice(i))
+      if (m) { keys.add(m[1]); i += m[0].length; continue }
+    }
+    i += 1
+  }
+  return keys
+}
 const defaultsBlock = src.match(/const DEFAULTS = \{([\s\S]*?)\n\}/)
 if (!defaultsBlock) {
   fails.push('C1 找不到 DEFAULTS 定义块')
 } else {
-  const defined = new Set([...defaultsBlock[1].matchAll(/^\s{2}([A-Za-z_][A-Za-z0-9_]*):/gm)].map((m) => m[1]))
+  const defined = topLevelKeys(defaultsBlock[1])
   const referenced = new Set([...src.matchAll(/CONFIG\.([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]))
   const missing = [...referenced].filter((k) => !defined.has(k))
   if (missing.length) {
@@ -393,6 +414,55 @@ if (existsSync(readmePath)) {
     else oks.push(`C16 出厂标定件自洽：verdict=${art.verdict}，授权 ${(art.capabilityEligibleChannels || []).length} 个通道，`
       + `召回侧=${(art.recallSide && art.recallSide.status) || 'n/a'}，未带 measurementSafe`)
   }
+}
+
+// ── C17 硬：L1 任务锚定拉回的接线与**措辞纪律** ──────────────────────────────
+// 由来：① 拉回是第一个"把话直接说给模型听"的动作，默认必须关（只有机制验证过、效果未测）；
+//       ② 措辞必须**建议式**——社区实测（dsh-anchored-monitor 实验 E1/E1.5）"命令式（must/first/
+//          follow）会把 we 轨迹打回 let me"，也就是说命令式提醒会**加剧**我们要修的信号；
+//       ③ 任务锚定的解析/判定必须共用 tools/task-anchor-core.mjs 一份实现（本项目已两次栽在
+//          "两套规则各说各话"：台账定稿 51 倍偏差、两级连续计数混层）。
+{
+  const problems = []
+  if (!/pullbackEnabled: false/.test(src)) problems.push('pullbackEnabled 默认必须是 false（效果尚未测量）')
+  if (!/if \(CONFIG\.pullbackEnabled !== true\) return null/.test(src)) {
+    problems.push('拉回未受 pullbackEnabled 门控（默认关必须真的关得住）')
+  }
+  if (!/import\s*\{[^}]*parseTaskAnchors[^}]*\}\s*from\s*'\.\/tools\/task-anchor-core\.mjs'/.test(src)) {
+    problems.push('运行时未共用 tools/task-anchor-core.mjs（禁止在 index.js 里再写一份解析/判定）')
+  }
+  if (/function parseTaskAnchors\(/.test(src)) problems.push('index.js 里又出现了一份 parseTaskAnchors（应共用单一实现）')
+  // 措辞纪律：文本模板里不得出现命令式措辞
+  const textFn = src.match(/export function pullbackText\([\s\S]*?\n\}/)
+  if (!textFn) problems.push('找不到 pullbackText（拉回文本必须集中在一处，便于审计措辞）')
+  else {
+    const body = textFn[0]
+    const forbidden = ['必须', '务必', '禁止', 'do not', "don't", 'never', 'shall', 'first,', 'follow']
+    const hit = forbidden.filter((w) => body.includes(w))
+    if (hit.length) problems.push(`拉回文本出现命令式措辞 [${hit.join(', ')}]（社区实测会加剧信号，应为建议式）`)
+    // **按分支**检查（整体检查会被"另一个分支还有豁免"骗过——反向验证抓出来的）
+    // 注意匹配用 `[trajectory-anchor]` 本身：写成 `= \`[trajectory-anchor\]` 会因为源码里是
+    // `return \`[…` 而**永远匹配不上**，于是整段检查被跳过（这是第二轮负向验证抓出来的）。
+    const chunks = body.split(/if \(reason === '/).slice(1)
+    if (chunks.length === 0) problems.push('pullbackText 里没有可识别的分支')
+    let checkedBranches = 0
+    for (const chunk of chunks) {
+      const label = (chunk.match(/^([a-z-]+)'/) || [])[1] || '?'
+      if (!/\[trajectory-anchor\]/.test(chunk)) continue
+      checkedBranches += 1
+      if (!/建议|可以参考|可以考虑|说明一句即可/.test(chunk)) problems.push(`分支 ${label} 缺少建议式表述`)
+      if (!/不算|豁免/.test(chunk)) problems.push(`分支 ${label} 缺少明确豁免（否则代理会为讨好提醒而不敢正常做事）`)
+    }
+    if (checkedBranches === 0) problems.push('pullbackText 的分支一个都没被检查到（模式串失配）')
+  }
+  // 节流：检查**代码**而不是注释（"节流见 allostasis 的 admitPerTurn"这句注释曾骗过检查）
+  {
+    const codeNoComments = src.split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n')
+    if (!/rec\.pullback\.lastTurn === turn/.test(codeNoComments)) problems.push('缺少"同一 turn 至多一次"的节流条件（代码里找不到）')
+    if (!/rec\.pullback\.count >= CONFIG\.pullbackMaxPerSession/.test(codeNoComments)) problems.push('缺少每会话上限判定（代码里找不到）')
+  }
+  if (problems.length) for (const p of problems) fails.push(`C17 ${p}`)
+  else oks.push('C17 L1 拉回接线：默认关、受门控、共用单一锚定实现、措辞为建议式且带豁免、turn 级节流 + 会话上限')
 }
 
 // ── 输出 ────────────────────────────────────────────────────────────────

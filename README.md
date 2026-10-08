@@ -124,6 +124,8 @@ agent/disposed: RewardAnnotator process reward + trajectory JSONL final archive
 | `autoDemoteWindow` / `autoDemoteBudget` | `20` / `0.05` | online self-check: if more than `autoDemoteBudget` of the last `autoDemoteWindow` finished sessions narrowed, the plugin demotes **itself** to observe-only and writes an `auto-demote` audit event |
 | `maxDriftSteps` | `12` | hard bound on any narrowed episode — the exit condition that is **provably reachable**. Derived, not guessed: replaying 45 sessions / 3,299 steps with the bound off gives natural episode lengths p50=5, p75=9, **p90=12**, p95=19, max=22, so 12 = the p90 of what an episode naturally lasts (it truncates 5 of 53 episodes). The value is a *safety bound*; the real budget lever is the false-trigger rate (G1 gate). A calibration artifact may recompute and override it by the same quantile method |
 | `rollbackEnabled` / `notifyEnabled` | **`false` / `false`** | capability / notification switches. Both default OFF (observe-only) because the calibration measured the lexicon signal's session-level false-trigger rate at 15.9% (α=0.001) / 43.2% (α=0.01) — far above a 5% budget. See "Response policy" below |
+| `pullbackEnabled` / `pullbackMaxPerSession` | **`false`** / `3` | the informational pull-back (L1): advisories near the point of action when an out-of-scope write or an unverified code change is detected. Off by default because its mechanism is verified while its *effect* is not measurable from this corpus (there is no labelable drift in it) |
+| `measurementSafe` | `false` | evaluation protection: `true` forces observe-only (both layers), so a measured score cannot be attributed to the plugin |
 | `leanDenyPatterns` | 28 entries | the set hidden while `surfacePhase === 'narrowed'` (`*` prefix wildcards); count is asserted against the source by `tools/check-invariants.mjs` |
 | `rewardAnnotator` | `default` | Layer-4 process reward; pluggable extension point |
 
@@ -268,6 +270,39 @@ Result: **this corpus contains no labelable task-level drift at all.** That is t
 honest state of the world, and it has a direct consequence for the intervention
 work: the pull-back's *mechanism* can be verified (injected drift must fire it), but
 its *efficacy* cannot be measured from this corpus — there is nothing to pull back.
+
+### The pull-back itself (L1): near-term, advisory, throttled, off by default
+
+`pullbackEnabled` (default **`false`**) adds the first action that speaks to the model
+directly. It fires on the two signals that survived L0 — an out-of-scope **write**, and
+a **code** edit that postdates the last verification — and it injects one independent
+message at `agent/pre-step`:
+
+- **Near-term position, not the prompt prefix.** Community reason (allostasis): a fixed
+  prefix is the furthest thing from the output, and in long sessions the corrective
+  signal is overrun by recency. Allostasis appends at `agent/pre-step` for this reason;
+  so does this.
+- **Advisory wording, never imperative.** dsh-anchored-monitor's hint templates carry an
+  experimental discipline (E1/E1.5): *imperative* phrasing (`must`/`first`/`follow`)
+  pushes a `we` trajectory back to `let me` — that is, a badly-worded pull-back makes the
+  very signal it is trying to fix worse. Every branch of `pullbackText()` states facts and
+  suggests, and invariant **C17** fails the build on imperative wording, on a missing
+  suggestion, or on a missing exemption **per branch**.
+- **Explicit exemptions**, because a nag that punishes normal work is worse than silence:
+  temp/venv/cache paths are not scope violations, and documentation-only edits do not
+  invalidate a verification (that was exactly the audited false-positive class).
+- **Throttled like a signal, not a stream:** at most once per turn (allostasis
+  `admitPerTurn`) and at most `pullbackMaxPerSession` (3) per session, with the
+  suppressions counted in `anchor_status` (`pullback.suppressed.throttled/cap/noAnchors`).
+- **Never guesses:** if the prompt has no readable scope clause, nothing fires
+  (`noAnchors` increments) and `taskAnchors.parsed` stays `false`.
+
+`tools/test-pullback.mjs` (28 cases) drives a real `apply()` and asserts both
+directions for every claim: it fires on an out-of-scope write and stays silent in scope;
+it reminds after a code edit and stays silent after a documentation edit; it fires once
+per turn, stops at the session cap, stops after a re-verification, and does nothing at
+all when disabled or when the prompt has no scope clause — plus that the injected text
+contains evidence and exemption and **no** imperative verb.
 
 Consequently the shipped `responsePolicy.json` records **verdict `FAIL` with zero
 capability-eligible channels**, and the capability layer stays off. The gate is not
@@ -471,7 +506,7 @@ node tools\export-layer4.mjs `
   and the per-channel snapshot (`channels`, `channelWindows`) with the effective
   `actAlpha` / `notifyAlpha` / `consecutive` and the two live run counters
 - Assertion suites (all must stay green; each is run against `index.js` by path):
-  `tools/check-invariants.mjs` — 16 static invariants (C1–C16), 0 debt;
+  `tools/check-invariants.mjs` — 17 static invariants (C1–C17), 0 debt;
   `tools/test-runtime-lexicon.mjs` — 64 pure-function cases;
   `tools/test-anchor-contract.mjs` — 24 install-and-use / contract cases (incl. the
   "apply() with no config at all" mount and a lossless-JSON walk over live rows);
@@ -484,6 +519,8 @@ node tools\export-layer4.mjs `
   `tools/test-task-anchor.mjs` — 55 task-anchor cases (clause parsing in English and
   Chinese, "never guess" on prompts without a scope clause, scope scanning, and the
   four audited false-positive classes pinned as regressions);
+  `tools/test-pullback.mjs` — 28 L1 cases (fires/stays-silent both ways, turn throttle,
+  session cap, re-verification clears the reminder, wording has no imperative verb);
   `tools/test-ledger-semantics.mjs` — 11 hand-computed finalization cases (ground truth
   for the four ledger paths, including the two the real corpus never exercises);
   `tools/test-ledger-parity.mjs` — 14 live-vs-batch parity runs (4 synthetic streams +

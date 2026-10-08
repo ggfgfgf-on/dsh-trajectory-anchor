@@ -149,6 +149,9 @@ export function inScope(path, anchors) {
 const WRITE_TOOLS = new Set(['edit', 'write', 'str_replace_editor', 'notebook_edit', 'apply_patch'])
 /** 只读工具（读取/搜索）。 */
 const READ_TOOLS = new Set(['read', 'grep', 'glob', 'read_image'])
+/** 运行时也要用同一套分类：越界**写**是信号，越界读不是（本轮口径）。 */
+export const isWriteTool = (name) => WRITE_TOOLS.has(typeof name === 'string' ? name : '')
+export const isReadTool = (name) => READ_TOOLS.has(typeof name === 'string' ? name : '')
 
 /**
  * 与"任务范围"无关的路径：临时目录、虚拟环境、包缓存、系统解释器。
