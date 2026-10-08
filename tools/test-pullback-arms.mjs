@@ -222,6 +222,64 @@ await boot({ pullbackEnabled: false, pullbackControlRate: 1, pullbackOutcomePath
   check('⑦ 行可无损 JSON 往返', JSON.stringify(round) === JSON.stringify(all), `${all.length} 行`)
 }
 
+// ── ⑧⑨ 采样规则两臂相同：预算与节流不再只算干预 ────────────────────────────
+// 为什么单独守这条：干预有"每会话 N 次 + 每回合一次"的限制，对照触发以前**不受限**
+// ⇒ 干预预算用尽后仍在产生对照单元，而那些单元窗口更短（会话剩下的时间更少）、
+// verifiesAfterPullback 系统性偏低 ⇒ 对照臂被做差，朝"干预更好"的方向偏。
+// 与①同一类：效应是测量/采样口径造出来的。
+await boot({ pullbackEnabled: true, pullbackControlRate: 1, pullbackOutcomePath: OUT })
+{
+  const sid = 'arms-throttle'
+  const { agent, session: s } = adopt(sid)
+  sessionEvent(s, human(PROMPT))
+  sessionEvent(s, call('edit', EDIT_OUT, 1, 1))
+  await preStepWithRandom(agent, 1, 2, 0)          // 触发 1（对照臂）
+  sessionEvent(s, call('edit', EDIT_OUT, 1, 3))    // 同一回合内再次置位
+  await preStepWithRandom(agent, 1, 4, 0)          // 应被"每回合一次"节流拦下
+  const row = await statusOf(sid)
+  check('⑧ 同一回合内第二次触发被节流（对照也受节流；旧实现只节流干预）',
+    row.pullback.triggers === 1 && row.pullback.suppressed.throttled === 1,
+    JSON.stringify({ t: row.pullback.triggers, th: row.pullback.suppressed.throttled }))
+  sessionEvent(s, call('edit', EDIT_OUT, 2, 1))
+  await preStepWithRandom(agent, 2, 2, 0)          // 换一个回合 ⇒ 可以再触发
+  const row2 = await statusOf(sid)
+  check('⑧ 反向对照：跨回合仍能触发（节流不是"永久闭嘴"）', row2.pullback.triggers === 2, String(row2.pullback.triggers))
+  dispatch('agent/disposed', { agent })
+}
+{
+  // 预算：maxPerSession=2 且全部走**对照**臂 ⇒ 第 3 次必须被 cap 拦下
+  await boot({ pullbackEnabled: true, pullbackControlRate: 1, pullbackMaxPerSession: 2, pullbackOutcomePath: OUT })
+  const sid = 'arms-cap-control'
+  const { agent, session: s } = adopt(sid)
+  sessionEvent(s, human(PROMPT))
+  for (const turn of [1, 2, 3]) {
+    sessionEvent(s, call('edit', EDIT_OUT, turn, 1))
+    await preStepWithRandom(agent, turn, 2, 0)
+  }
+  const row = await statusOf(sid)
+  check('⑨ 预算对对照臂同样生效（第 3 次被 cap 拦下）',
+    row.pullback.triggers === 2 && row.pullback.triggersByArm.control === 2 && row.pullback.suppressed.cap === 1,
+    JSON.stringify({ t: row.pullback.triggers, by: row.pullback.triggersByArm, cap: row.pullback.suppressed.cap }))
+  dispatch('agent/disposed', { agent })
+  check('⑨ 落盘同样只有 2 行（预算在"采样"这步就生效，不是只拦说话）', rowsFor(sid).length === 2, `rows=${rowsFor(sid).length}`)
+}
+{
+  // 反向对照：全部走**干预**臂，同一预算下同样只剩 2 次 ⇒ 两条臂规则一致
+  await boot({ pullbackEnabled: true, pullbackControlRate: 0, pullbackMaxPerSession: 2, pullbackOutcomePath: OUT })
+  const sid = 'arms-cap-intervened'
+  const { agent, session: s } = adopt(sid)
+  sessionEvent(s, human(PROMPT))
+  for (const turn of [1, 2, 3]) {
+    sessionEvent(s, call('edit', EDIT_OUT, turn, 1))
+    await preStepWithRandom(agent, turn, 2, 0.99)
+  }
+  const row = await statusOf(sid)
+  check('⑨ 反向对照：干预臂在同一预算下也是 2 次（两臂采样规则一致）',
+    row.pullback.triggers === 2 && row.pullback.triggersByArm.intervened === 2 && row.pullback.suppressed.cap === 1,
+    JSON.stringify({ t: row.pullback.triggers, by: row.pullback.triggersByArm, cap: row.pullback.suppressed.cap }))
+  dispatch('agent/disposed', { agent })
+}
+
 console.warn = origWarn
 try { rmSync(dir, { recursive: true, force: true }) } catch { /* 清理失败不影响判定 */ }
 console.log(`\n${pass} pass, ${fail} fail`)

@@ -2297,6 +2297,9 @@ function adopt(agent, doAnchor, channel) {
     pendingPullback: null,
     pullback: {
       count: 0, lastTurn: null, lastReason: null, lastAt: null, lastInfo: null,
+      // 触发（两条臂）的每回合节流标记：与 lastTurn 分开，因为 lastTurn/lastReason
+      // 讲的是"**说过**的最后一次"（状态与文案用它），而节流必须两臂同规则。
+      lastTriggerTurn: null,
       // ── L1/L4 效果采集：**按触发点**记账，两条臂同一口径 ────────────────────
       // 为什么不是会话级计数器（本轮修掉的两个真实缺陷）：
       //   ① 对照组（触发但故意不说）以前根本不进窗口 ⇒ 对照臂恒为"未改善"，
@@ -2673,12 +2676,19 @@ function pullbackDecision(rec, turn) {
   const pending = rec.pendingPullback
   if (!pending) return null
   if (pending.reason === 'scope' && !anchorsParsed) { rec.pendingPullback = null; return null }
-  if (rec.pullback.count >= CONFIG.pullbackMaxPerSession) {
+  // 预算与节流对**两条臂**同一规则（干预 + 对照一起数）：
+  // 以前只有干预计入"每会话 3 次"与"每回合一次"，对照触发不受限 ⇒ 干预预算用尽后
+  // 仍在产生对照单元，而那些单元的窗口**更短**（会话剩下的时间更少）⇒
+  // verifiesAfterPullback 系统性偏低 ⇒ 对照臂被做差，朝"干预更好"的方向偏。
+  // 这与刚修掉的"对照臂根本没有窗口"是同一类缺陷：采样/测量口径造出来的效应。
+  // 出厂 pullbackControlRate=0（不产生对照）时，这条改动**不改变任何行为**。
+  const triggersSoFar = rec.pullback.count + rec.pullback.controls
+  if (triggersSoFar >= CONFIG.pullbackMaxPerSession) {
     rec.pullback.suppressed.cap += 1
     rec.pendingPullback = null
     return null
   }
-  if (rec.pullback.lastTurn !== null && rec.pullback.lastTurn === turn) {
+  if (rec.pullback.lastTriggerTurn !== null && rec.pullback.lastTriggerTurn === turn) {
     rec.pullback.suppressed.throttled += 1
     rec.pendingPullback = null
     return null
@@ -2768,6 +2778,8 @@ function summaryOf(rec) {
       // L4 观测单元：**触发点数**才是样本量（不是会话数），两臂都在这里可见
       triggers: rec.pullback.triggers.length,
       triggersByArm: rec.pullback.triggers.reduce((a, t) => { a[t.arm] = (a[t.arm] || 0) + 1; return a }, {}),
+      triggersBudget: CONFIG.pullbackMaxPerSession,   // 两条臂**共用**这个预算（采样规则必须一样）
+      lastTriggerTurn: rec.pullback.lastTriggerTurn,
       verifyMarks: rec.pullback.verifyMarks.length,
       violationMarks: rec.pullback.violationMarks.length,
       outcomeRows: rec.pullbackOutcomeRows || 0,
@@ -3286,6 +3298,7 @@ export function apply(ctx, config) {
         // 对照臂也**开观测窗口**（与干预臂共用 markTrigger）——不这么做对照臂就恒为
         // "未改善"，两臂比较测的是测量口径而不是效果。
         const cTrig = markTrigger(rec, 'control', pull.reason, payload.turn, payload.step)
+        rec.pullback.lastTriggerTurn = typeof payload.turn === 'number' ? payload.turn : null
         rec.pendingPullback = null
         logAudit(rec, 'pullback-control', {
           reason: pull.reason, turn: payload.turn, step: payload.step, n: cTrig.n,
@@ -3302,6 +3315,7 @@ export function apply(ctx, config) {
         rec.pullback.lastInfo = { path: pull.info.path || null, lastVerifyAt: pull.info.lastVerifyAt || null }
         rec.pullback.lastAt = Date.now()
         const trig = markTrigger(rec, 'intervened', pull.reason, payload.turn, payload.step)
+        rec.pullback.lastTriggerTurn = typeof payload.turn === 'number' ? payload.turn : null
         rec.pendingPullback = null
         logAudit(rec, 'pullback', {
           reason: pull.reason, turn: payload.turn, step: payload.step, n: trig.n,

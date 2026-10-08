@@ -465,8 +465,15 @@ if (existsSync(readmePath)) {
   // 节流：检查**代码**而不是注释（"节流见 allostasis 的 admitPerTurn"这句注释曾骗过检查）
   {
     const codeNoComments = src.split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n')
-    if (!/rec\.pullback\.lastTurn === turn/.test(codeNoComments)) problems.push('缺少"同一 turn 至多一次"的节流条件（代码里找不到）')
-    if (!/rec\.pullback\.count >= CONFIG\.pullbackMaxPerSession/.test(codeNoComments)) problems.push('缺少每会话上限判定（代码里找不到）')
+    // 这里只断言"规则存在"（用宽松到不锁拼写的模式）；"两条臂必须同规则"归 C22 ——
+    // 否则同一个性质被两处各写一份，改一处就会得到一个假失败（本文件已经吃过这个亏：
+    // 把节流标记从 lastTurn 换成 lastTriggerTurn 后，这里因为锁了字面量而误报）。
+    if (!/rec\.pullback\.last[A-Za-z]*Turn\s*!==\s*null[^\n]*===\s*turn/.test(codeNoComments)) {
+      problems.push('缺少"同一 turn 至多一次"的节流条件（代码里找不到）')
+    }
+    if (!/[A-Za-z_$][\w$.]*\s*>=\s*CONFIG\.pullbackMaxPerSession/.test(codeNoComments)) {
+      problems.push('缺少每会话上限判定（代码里找不到）')
+    }
   }
   // 门槛必须**按原因**分别判定：统一要求"解析出提示锚点"会让自由形态的长会话永远沉默
   // （实测：用例 ⑬ 的 n=0 就是被这道统一门槛挡住的 ⇒ L1 停在"存在但从不运行"）。
@@ -700,6 +707,20 @@ if (existsSync(readmePath)) {
   if (!/sessionLevelFields/.test(src)) problems.push('落盘行没有标出"会话级字段"（终态字段会被误当成逐触发点指标）')
   if (/arm: rec\.pullback\.count > 0 \? 'intervened' : 'control'/.test(src)) {
     problems.push('arm 仍按会话判定（同会话的对照触发会被并入干预臂）')
+  }
+  // ②b 采样规则也必须两臂相同（预算与节流）。否则对照单元被富集在"干预预算已用尽"的时段，
+  // 那些单元的窗口更短、verifiesAfterPullback 系统性偏低 ⇒ 对照臂被做差，朝"干预更好"偏。
+  if (!/const triggersSoFar = rec\.pullback\.count \+ rec\.pullback\.controls/.test(src)) {
+    problems.push('触发预算没有把两条臂一起数（对照触发不受限 ⇒ 采样规则不对称）')
+  }
+  if (/if \(rec\.pullback\.count >= CONFIG\.pullbackMaxPerSession\)/.test(src)) {
+    problems.push('触发预算回到了"只算干预"（对照单元会被富集在最糟的时段）')
+  }
+  if (!/lastTriggerTurn !== null && rec\.pullback\.lastTriggerTurn === turn/.test(src)) {
+    problems.push('每回合节流没有覆盖对照臂（必须用 lastTriggerTurn）')
+  }
+  if (/if \(rec\.pullback\.lastTurn !== null && rec\.pullback\.lastTurn === turn\)/.test(src)) {
+    problems.push('每回合节流回到了"只节流说过话的那次"（对照可重复触发）')
   }
   // ③ 分析器只吃 v2 行，且判定要对"会话内相关性"保守
   if (!existsSync(analyze)) problems.push('找不到 tools/analyze-pullback-outcomes.mjs')

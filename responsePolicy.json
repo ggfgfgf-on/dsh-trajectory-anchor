@@ -1,11 +1,11 @@
 {
-  "generatedAtUtc": "2026-10-08T06:21:16.546Z",
+  "generatedAtUtc": "2026-10-08T06:29:09.633Z",
   "scope": {
     "pluginVersion": "0.5.0",
     "release": "B3-calibration",
     "taskFamily": "dsh-sessions"
   },
-  "corpusFingerprint": "sessions:129:487002332:1791440355045",
+  "corpusFingerprint": "sessions:129:487543609:1791440813839",
   "calibration": {
     "withFamilyPrior": true,
     "priorStrength": 20,
