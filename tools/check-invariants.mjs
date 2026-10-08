@@ -649,7 +649,8 @@ if (existsSync(readmePath)) {
   if (!/adaptiveStateEnabled: true/.test(src)) problems.push('缺少 adaptiveStateEnabled 开关（无法一键关闭记忆）')
   // 测试隔离：持久化让状态跨挂载存活 ⇒ 各套件必须显式隔离（实测六个套件同时崩）
   const suitesNeedingIsolation = ['test-anchor-contract.mjs', 'test-response-policy.mjs', 'test-policy-gate.mjs',
-    'test-reanchor.mjs', 'test-family-prior.mjs', 'test-outcome-feedback.mjs']
+    'test-reanchor.mjs', 'test-family-prior.mjs', 'test-outcome-feedback.mjs',
+    'test-pullback-arms.mjs', 'test-audit-durability.mjs']
   for (const s of suitesNeedingIsolation) {
     const p = resolve(toolsDir, s)
     if (!existsSync(p)) { problems.push(`找不到 ${s}`); continue }
@@ -659,6 +660,77 @@ if (existsSync(readmePath)) {
   }
   if (problems.length) for (const p of problems) fails.push(`C21 ${p}`)
   else oks.push('C21 记忆持久化：派生状态仍每次重算、装载自清空且 fail-safe、倍率受"基准 α 匹配"守卫、装载有界、装载后重算降档、无关会话不落盘、各套件已隔离')
+}
+
+// ── C22 硬：L4 观测单元（两臂对称 + 按触发点记账）与审计跨挂载持久性 ──────────
+// 由来（2026-10-08 在线数据，两条都是真事故）：
+//   ① 拉回效果采集把"说过之后"的计数器挂在 `if (rec.pullback.count > 0)` 上 ⇒ 对照臂
+//      （触发但故意不说）永远拿不到窗口，verifiesAfterPullback 恒为 0；而分析器要求
+//      verifiesAfterPullback > 0 才算"改善" ⇒ 对照臂**恒为未改善**，两臂 Fisher 比较
+//      退化成"有窗口 vs 没窗口"，会假阳性地开 L2 的门。真数据里还出现过
+//      `{"arm":"intervened","pullbacks":1,"controls":1}`——对照观测被静默并入干预臂。
+//   ② 审计主文件每次 flush 是重写，块序号 `rec.chunkIdx` 随挂载从 1 重新数 ⇒ 每次重启
+//      既抹掉上一轮未满块的尾部缓冲，又覆写上一轮的 chunk 1..N。实测证据：目录里
+//      `.jsonl.1` 是 10-08 12:30–12:54 而 `.jsonl.2` 是 09-28–10-03（序号与时间反序），
+//      且 12:54–14:08 那一整段审计在磁盘上不存在。
+// 下面每条都是**负向断言**：宁可钉住"旧口径不许复活"。
+{
+  const problems = []
+  const toolsDir = resolve(dirname(indexPath), 'tools')
+  const analyze = resolve(toolsDir, 'analyze-pullback-outcomes.mjs')
+  // ① 两臂走同一条记录路径（口径对称靠共用代码保证，不靠自觉）
+  if (!/markTrigger\(rec, 'control'/.test(src)) problems.push('对照臂没有记触发点（对照观测会被整条丢掉）')
+  if (!/markTrigger\(rec, 'intervened'/.test(src)) problems.push('干预臂没有记触发点（两臂不是同一路径）')
+  if (!/function markTrigger\(rec, arm, reason, turn, step\)/.test(src)) {
+    problems.push('缺少唯一的 markTrigger 实现（两臂必须共用）')
+  }
+  // 窗口必须只有一处实现，且落盘行必须用它
+  if (!/function windowAfter\(rec, trig\)/.test(src)) problems.push('缺少 windowAfter（窗口口径必须唯一）')
+  if (!/\.\.\.windowAfter\(rec, t\)/.test(src)) problems.push('落盘行没有用 windowAfter 计算窗口')
+  // **负向**：验证/越界的窗口计数不得再被"说过话"把守
+  if (/if \(rec\.pullback\.count > 0\) rec\.pullback\.verifiesAfter/.test(src)) {
+    problems.push('验证计数回到了"说过话才算"（对照臂恒为未改善 ⇒ 两臂比较是假的）')
+  }
+  if (/if \(rec\.pullback\.count > 0\) \{\s*const last = rec\.scopeViolations/.test(src)) {
+    problems.push('越界计数回到了"说过话才算"（对照臂窗口不对称）')
+  }
+  // ② 观测单元是**触发点**，不是会话
+  if (!/triggersInSession: triggers\.length/.test(src)) problems.push('落盘行没有标注同会话触发点数（会话级/触发点级会无从区分）')
+  if (!/triggerIndex: i \+ 1/.test(src)) problems.push('落盘行没有触发点序号')
+  if (!/sessionLevelFields/.test(src)) problems.push('落盘行没有标出"会话级字段"（终态字段会被误当成逐触发点指标）')
+  if (/arm: rec\.pullback\.count > 0 \? 'intervened' : 'control'/.test(src)) {
+    problems.push('arm 仍按会话判定（同会话的对照触发会被并入干预臂）')
+  }
+  // ③ 分析器只吃 v2 行，且判定要对"会话内相关性"保守
+  if (!existsSync(analyze)) problems.push('找不到 tools/analyze-pullback-outcomes.mjs')
+  else {
+    const a = readFileSync(analyze, 'utf8')
+    if (!/schemaVersion === 2/.test(a)) problems.push('分析器没有区分 v2 行（v1 的窗口不可比，混进来会污染证据）')
+    if (!/legacyIgnored/.test(a)) problems.push('分析器没有报出被忽略的旧行（静默丢弃不可接受）')
+    if (!/leaveOneSessionOut|looMaxP|maxP/.test(a)) problems.push('分析器缺少"逐会话留一"敏感性（单个会话就能定成败）')
+    if (!/minSessions|min-sessions/.test(a)) problems.push('分析器没有会话级最小样本量（独立性在会话层）')
+  }
+  // ④ 审计接手：块序号必须先从磁盘续起，且必须发生在第一次落盘之前
+  if (!/function ensureAuditFiles\(rec\)/.test(src)) problems.push('缺少 ensureAuditFiles（续号与接手必须只有一个入口）')
+  if (!/drainAuditChunk[\s\S]{0,700}?ensureAuditFiles\(rec\)/.test(src)) {
+    problems.push('drainAuditChunk 没有先续块序号（阈值小时会先落盘，第一步就覆写 chunk 1）')
+  }
+  if (!/flushRec[\s\S]{0,900}?ensureAuditFiles\(rec\)/.test(src)) problems.push('flushRec 没有接手审计文件（重写主文件会抹掉上一轮尾部）')
+  if (/rec\.chunkIdx = \(rec\.chunkIdx \|\| 0\) \+ 1/.test(src) && !/adoptAuditFiles/.test(src)) {
+    problems.push('块序号仍从 1 重新数（每次重启覆写上一轮的块）')
+  }
+  for (const s of ['test-pullback-arms.mjs', 'test-audit-durability.mjs']) {
+    if (!existsSync(resolve(toolsDir, s))) problems.push(`缺少 ${s}（这两条纪律没有套件守）`)
+  }
+  const loop = resolve(toolsDir, 'auto-loop.mjs')
+  if (existsSync(loop)) {
+    const l = readFileSync(loop, 'utf8')
+    if (!/test-pullback-arms\.mjs/.test(l) || !/test-audit-durability\.mjs/.test(l)) {
+      problems.push('闭环的自门禁没有覆盖两臂观测/审计持久性套件')
+    }
+  }
+  if (problems.length) for (const p of problems) fails.push(`C22 ${p}`)
+  else oks.push('C22 观测单元与审计持久性：两臂共用触发记录、窗口按触发点、对照臂一样被计数、v2 行才进证据（含会话级留一敏感性）、审计块序号从磁盘续起且先于第一次落盘')
 }
 
 // ── 输出 ────────────────────────────────────────────────────────────────

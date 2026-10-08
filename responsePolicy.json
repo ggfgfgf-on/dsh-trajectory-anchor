@@ -1,11 +1,11 @@
 {
-  "generatedAtUtc": "2026-10-08T04:52:22.601Z",
+  "generatedAtUtc": "2026-10-08T06:21:16.546Z",
   "scope": {
     "pluginVersion": "0.5.0",
     "release": "B3-calibration",
     "taskFamily": "dsh-sessions"
   },
-  "corpusFingerprint": "sessions:128:484488416:1791435004210",
+  "corpusFingerprint": "sessions:129:487002332:1791440355045",
   "calibration": {
     "withFamilyPrior": true,
     "priorStrength": 20,
@@ -23,12 +23,12 @@
       "derived": {
         "consecutive": 1,
         "alpha": 0.001,
-        "sessionHitRate": 0.025974025974025976
+        "sessionHitRate": 0.02564102564102564
       },
       "derivedWithFamilyPrior": {
         "consecutive": 1,
         "alpha": 0.0001,
-        "sessionHitRate": 0.025974025974025976
+        "sessionHitRate": 0.02564102564102564
       },
       "recallSide": {
         "feasibleOperatingPoints": 8,
@@ -53,17 +53,17 @@
         {
           "consecutive": 1,
           "alpha": 0.0001,
-          "sessionHitRate": 0.025974025974025976
+          "sessionHitRate": 0.02564102564102564
         },
         {
           "consecutive": 2,
           "alpha": 0.0001,
-          "sessionHitRate": 0.025974025974025976
+          "sessionHitRate": 0.02564102564102564
         },
         {
           "consecutive": 3,
           "alpha": 0.0001,
-          "sessionHitRate": 0.025974025974025976
+          "sessionHitRate": 0.02564102564102564
         },
         {
           "consecutive": 1,
@@ -135,12 +135,12 @@
         {
           "consecutive": 2,
           "alpha": 0.0001,
-          "sessionHitRate": 0.03896103896103896
+          "sessionHitRate": 0.038461538461538464
         },
         {
           "consecutive": 3,
           "alpha": 0.0001,
-          "sessionHitRate": 0.025974025974025976
+          "sessionHitRate": 0.02564102564102564
         },
         {
           "consecutive": 1,
@@ -204,7 +204,7 @@
         {
           "consecutive": 3,
           "alpha": 0.0001,
-          "sessionHitRate": 0.012987012987012988
+          "sessionHitRate": 0.01282051282051282
         },
         {
           "consecutive": 1,
@@ -242,7 +242,7 @@
   "negativeControl": {
     "channel": "inaction",
     "variant": "turn-end-exclusion-removed",
-    "nullSessionRate": 0.2597402597402597,
+    "nullSessionRate": 0.2564102564102564,
     "expected": "unfit",
     "observed": "unfit"
   },

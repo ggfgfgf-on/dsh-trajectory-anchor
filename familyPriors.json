@@ -1,14 +1,14 @@
 {
-  "generatedAtUtc": "2026-10-08T04:50:35.864Z",
+  "generatedAtUtc": "2026-10-08T06:19:28.360Z",
   "corpus": {
-    "sessionsScanned": 128,
-    "sessionsUsed": 77
+    "sessionsScanned": 129,
+    "sessionsUsed": 78
   },
   "axes": {
     "modelFamilies": [
       {
         "key": "deepseek-official/deepseek-v4-flash",
-        "sessions": 11
+        "sessions": 12
       },
       {
         "key": "deepseek-official/deepseek-v4-pro",
@@ -34,7 +34,7 @@
     "presets": [
       {
         "key": "(none)",
-        "sessions": 77
+        "sessions": 78
       }
     ]
   },
@@ -46,12 +46,12 @@
       "preset": null,
       "scope": "none",
       "sessions": 33,
-      "steps": 20727,
-      "meanSteps": 628,
+      "steps": 21006,
+      "meanSteps": 637,
       "baseRates": {
         "inaction": 0.002,
-        "repetition": 0.054,
-        "failure": 0.0384
+        "repetition": 0.0536,
+        "failure": 0.039
       }
     },
     {
@@ -90,13 +90,13 @@
       "model": "deepseek-v4-flash",
       "preset": null,
       "scope": "none",
-      "sessions": 9,
-      "steps": 5600,
-      "meanSteps": 622,
+      "sessions": 10,
+      "steps": 5616,
+      "meanSteps": 562,
       "baseRates": {
         "inaction": 0.0002,
-        "repetition": 0.0362,
-        "failure": 0.0364
+        "repetition": 0.0361,
+        "failure": 0.0365
       }
     },
     {
@@ -267,6 +267,7 @@
     "session-e8b5": "deepseek-official/deepseek-v4-pro @ no-preset @ none",
     "session-ebc7": "deepseek-official/deepseek-v4-flash @ no-preset @ none",
     "session-ebf5": "deepseek-official/deepseek-v4-flash @ no-preset @ none",
+    "session-ee56": "deepseek-official/deepseek-v4-flash @ no-preset @ none",
     "session-f942": "deepseek-official/deepseek-v4-flash-vision-exp @ no-preset @ none"
   },
   "note": "族键 = provider/model @ agentPreset @ 任务范围名。baseRates 是各行为通道在该族的**每步命中率**（收缩先验用）。",
@@ -274,26 +275,26 @@
     {
       "channel": "repetition",
       "alpha": 0.01,
-      "sessions": 77,
-      "sessionsWithFamilyPrior": 77,
-      "noPrior": 0.3116883116883117,
-      "familyPrior": 0.33766233766233766
+      "sessions": 78,
+      "sessionsWithFamilyPrior": 78,
+      "noPrior": 0.3076923076923077,
+      "familyPrior": 0.3333333333333333
     },
     {
       "channel": "failure",
       "alpha": 0.01,
-      "sessions": 77,
-      "sessionsWithFamilyPrior": 77,
-      "noPrior": 0.4155844155844156,
-      "familyPrior": 0.45454545454545453
+      "sessions": 78,
+      "sessionsWithFamilyPrior": 78,
+      "noPrior": 0.41025641025641024,
+      "familyPrior": 0.44871794871794873
     },
     {
       "channel": "inaction",
       "alpha": 0.01,
-      "sessions": 77,
-      "sessionsWithFamilyPrior": 77,
-      "noPrior": 0.14285714285714285,
-      "familyPrior": 0.14285714285714285
+      "sessions": 78,
+      "sessionsWithFamilyPrior": 78,
+      "noPrior": 0.14102564102564102,
+      "familyPrior": 0.14102564102564102
     }
   ]
 }

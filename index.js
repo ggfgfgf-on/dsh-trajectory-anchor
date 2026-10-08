@@ -36,7 +36,7 @@
  * TRAJECTORY_ANCHOR_LEXICON_PATH; CJK-safe term matching (no ASCII \b).
  */
 
-import { readFileSync, mkdirSync, appendFileSync, existsSync } from 'node:fs'
+import { readFileSync, mkdirSync, appendFileSync, existsSync, readdirSync, writeFileSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath, dirname as dirname2 } from 'node:path'
 // L1：任务锚定信号的**单一实现**（tools/task-anchor-core.mjs 是纯模块，不反向 import 本文件，
 // 因此没有循环依赖）。为什么不在这里再写一份：本项目已经两次栽在"两套规则各说各话"
@@ -412,10 +412,15 @@ function estimateEntryBytes(entry) {
 }
 
 /** 把当前缓冲写成不可变块文件 anchor-<id>.jsonl.<idx>，然后清空缓冲。
- *  块文件按序号单调追加，永不重写——长任务的事件流因此零丢失。 */
+ *  块文件按序号单调追加，永不重写——长任务的事件流因此零丢失。
+ *  ⚠ 序号必须**先从磁盘续起**（ensureAuditFiles）：rec.chunkIdx 是随挂载新建的，
+ *  从 1 重新数就等于每次重启都把上一轮的 chunk 1..N 覆写一遍。而且这个续号必须发生
+ *  在**第一次落盘之前**——阈值小的配置下 drainAuditChunk 会先于 flushRec 被调用，
+ *  晚一步就已经把 .1 覆写了（本修复的第一次实现就踩了这个）。 */
 function drainAuditChunk(rec) {
   if (rec.events.length === 0) return
   if (!CONFIG.exportTrajectoryLogs || !fsSvc) { rec.events = []; rec.auditBytes = 0; return }
+  ensureAuditFiles(rec)
   let dir = CONFIG.logDir
   if (typeof baseDir === 'string' && baseDir.length > 0) dir = baseDir + '/' + CONFIG.logDir
   const idx = rec.chunkIdx = (rec.chunkIdx || 0) + 1
@@ -430,9 +435,66 @@ function drainAuditChunk(rec) {
   rec.flushChain = (rec.flushChain || Promise.resolve()).then(write, write)
 }
 
+function ensureAuditFiles(rec) {
+  if (rec.auditInit === true) return
+  rec.auditInit = true
+  adoptAuditFiles(rec)
+}
+
+/**
+ * 挂载时接手审计文件（每次挂载只做一次）：
+ *   ① 把上一轮挂载留在**主文件**里的尾部缓冲（主文件每次 flush 是重写，不是追加）
+ *      转成一个块文件，序号接在磁盘最大值之后；
+ *   ② 把块序号续到磁盘最大值——否则新挂载的 chunk 1 会覆写上一轮的 chunk 1。
+ * 为什么转成块而不是"当作主文件前缀接着写"：读侧（export-layer4）的顺序是
+ * **块按序号、主文件最后**。若把上一轮尾部留在主文件里，它会被读到所有新块之后，
+ * 时间序就错位了；转成"续号的块"则整条序列仍然单调。
+ */
+function adoptAuditFiles(rec) {
+  try {
+    let dir = CONFIG.logDir
+    if (typeof baseDir === 'string' && baseDir.length > 0) dir = baseDir + '/' + CONFIG.logDir
+    const main = dir + '/anchor-' + rec.sessionId + '.jsonl'
+    const prefix = 'anchor-' + rec.sessionId + '.jsonl.'
+    let maxIdx = 0
+    let names = []
+    try { names = readdirSync(dir) } catch { names = [] }
+    for (const n of names) {
+      if (!n.startsWith(prefix)) continue
+      const v = Number(n.slice(prefix.length))
+      if (Number.isFinite(v) && v > maxIdx) maxIdx = v
+    }
+    let carried = 0
+    if (existsSync(main)) {
+      let text = ''
+      try { text = readFileSync(main, 'utf8') } catch { text = '' }
+      const lines = text.split('\n').filter((l) => l.trim())
+      if (lines.length > 0) {
+        const idx = maxIdx + 1
+        writeFileSync(dir + '/anchor-' + rec.sessionId + '.jsonl.' + idx, lines.join('\n') + '\n', 'utf8')
+        maxIdx = idx
+        carried = lines.length
+        warnOnce('audit: 上一轮挂载留在主文件里的尾部缓冲已转成块文件（主文件是重写的，不转就会丢）')
+      }
+      // 主文件随新挂载从空开始（内容要么已转块、要么本来就是空的）
+      try { writeFileSync(main, '', 'utf8') } catch { /* 下一轮 flush 会重写它 */ }
+    }
+    rec.chunkIdx = maxIdx
+    if (carried > 0) {
+      logAudit(rec, 'audit-adopted', { lines: carried, chunk: maxIdx, note: '挂载接手：上一轮尾部已转块，块序号已续接' })
+    }
+  } catch (e) {
+    rec.fileError = msg(e)
+  }
+}
+
 function flushRec(rec) {
   if (!CONFIG.exportTrajectoryLogs || !fsSvc) return Promise.resolve()
-  // 主文件只持有当前未满块的缓冲 + 终态 record（每次 flush 重算新鲜摘要）；历史在块文件里。
+  // 挂载接手必须在**第一次落盘之前**完成：主文件每次 flush 是重写（不是追加），
+  // 上一轮压在里面未满块的尾部缓冲会被直接抹掉（2026-10-08 实测：12:54–14:08
+  // 一整段审计消失，连两次 pullback-outcome 的 closed 事件都没有；只有 appendFileSync
+  // 写的 pullback-outcomes.jsonl 活了下来）。
+  ensureAuditFiles(rec)
   const events = rec.events.slice()
   if (rec.lifted || rec.closed) events.push({ t: Date.now(), kind: 'record', summary: summaryOf(rec) })
   let dir = CONFIG.logDir
@@ -2003,47 +2065,91 @@ function reanchorDecision(rec, turn) {
 }
 
 /**
- * L1 效果采集（L2 的门的唯一数据来源）：会话结束时，把"说过之后行为有没有变"记下来。
+ * L1/L4 效果采集（L2 门的唯一数据来源）：**每次触发一行**，两条臂同一口径。
  *
- * 采集的是**可直接观测的行为指标**（不需要人工标签）：
- *   · verifiesAfterPullback —— 拉回之后到会话结束之间跑了几次验证
- *   · claimedUnverifiedAfter —— 拉回之后是否仍在"未验证"状态下宣称完成
- *   · scopeViolationsAfter  —— 拉回之后是否仍有越界写
- * 这三项都是"提醒的目标行为"，所以 pre/post 变化本身就是效果代理；
- * 真正的效果估计仍应由在线对照（开/关同族会话）完成，这里先把数据攒起来。
+ * 采集的是可直接观测的行为指标（不需要人工标签）：
+ *   · verifiesAfterPullback  —— 该触发点之后到会话结束之间跑了几次验证
+ *   · scopeViolationsAfter   —— 该触发点之后是否仍有越界写
+ *   · claimedUnverifiedAfter —— 会话结束时是否仍处于"改完没验证"状态
+ *
+ * 两条纪律，都是被真实数据打出来的：
+ *   ① **对称**：窗口计数与"说不说"无关。对照臂若不计窗口，它恒为"未改善"，
+ *      于是比较变成"有窗口 vs 没窗口"——那是**测量口径**造出来的假阳性。
+ *   ② **按触发点一行**：会话级一行会把同会话的多次触发与两条臂揉在一起。
+ * 终态字段（claimedUnverifiedAfter / endedNarrowed / sawUnknownTool / finalState）是
+ * **会话级**事实，同会话各行共用，行里以 sessionLevelFields 显式标注，
+ * 免得被下游当成逐触发点指标。
  */
+function markObs(rec, kind, turn, step) {
+  const n = (rec.pullback.obsN = (rec.pullback.obsN || 0) + 1)
+  const list = kind === 'verify' ? rec.pullback.verifyMarks : rec.pullback.violationMarks
+  list.push({ n, turn: turn ?? null, step: step ?? null })
+  if (list.length > 200) list.shift()
+  return n
+}
+
+/** 记一次触发（两条臂走同一条记录路径——口径对称是靠"共用代码"保证的，不是靠自觉）。 */
+function markTrigger(rec, arm, reason, turn, step) {
+  const n = (rec.pullback.obsN = (rec.pullback.obsN || 0) + 1)
+  const t = { arm, n, turn: turn ?? null, step: step ?? null, at: Date.now(), reason: reason ?? null }
+  rec.pullback.triggers.push(t)
+  if (rec.pullback.triggers.length > 50) rec.pullback.triggers.shift()
+  return t
+}
+
+/** 某次触发之后的观测窗口（**唯一口径**：落盘行、状态、离线分析都从这里来）。 */
+function windowAfter(rec, trig) {
+  return {
+    verifiesAfterPullback: rec.pullback.verifyMarks.filter((m) => m.n > trig.n).length,
+    scopeViolationsAfter: rec.pullback.violationMarks.filter((m) => m.n > trig.n).length,
+  }
+}
+
+const SESSION_LEVEL_FIELDS = ['claimedUnverifiedAfter', 'endedNarrowed', 'sawUnknownTool', 'finalState']
+
 function recordPullbackOutcome(rec) {
   try {
     if (CONFIG.pullbackEnabled !== true) return
-    // L4：**两条臂都要记账**——对照组（触发但故意没说）是估计效果的必要条件；
-    // 以前只在"说过话"时写，于是日志里根本没有对照组，效果永远估不出来。
-    const triggered = rec.pullback.count + rec.pullback.controls
-    if (triggered === 0) return
-    const outcome = {
-      at: Date.now(),
-      sessionId: rec.sessionId,
-      arm: rec.pullback.count > 0 ? 'intervened' : 'control',
-      intervened: rec.pullback.count > 0,
-      pullbacks: rec.pullback.count,
-      controls: rec.pullback.controls,
-      lastReason: rec.pullback.lastReason,
-      lastTurn: rec.pullback.lastTurn,
-      family: rec.family ? familyKeyOf(rec).full : null,
-      verifiesAfterPullback: rec.pullback.verifiesAfter,
-      scopeViolationsAfter: rec.pullback.scopeViolationsAfter,
-      claimedUnverifiedAfter: rec.pullback.claimedUnverifiedAfter === true,
-      // 结局代理（与 L3 第三层同一口径，便于跨层比对）
-      endedNarrowed: rec.surfacePhase === 'narrowed' || rec.machineState === 'drift',
-      sawUnknownTool: rec.sawUnknownTool === true,
-      finalState: { machineState: rec.machineState, surfacePhase: rec.surfacePhase, anchored: rec.anchored, lifted: rec.lifted },
-    }
-    rec.pullbackOutcome = outcome
+    const triggers = rec.pullback.triggers || []
+    // 没有触发点就没有观测窗口——**不再**用"会话里说过话"当兜底（那正是把两条臂
+    // 揉成一条的旧口径）。
+    if (triggers.length === 0) return
+    const claimedUnverifiedAtClose = rec.codeEditsAfterVerify.length > 0 && rec.lastVerifyAt !== null
+    const endedNarrowed = rec.surfacePhase === 'narrowed' || rec.machineState === 'drift'
     const dir = CONFIG.pullbackOutcomePath
       ? (isAbsolute(CONFIG.pullbackOutcomePath) ? CONFIG.pullbackOutcomePath : resolvePath(baseDir || process.cwd(), CONFIG.pullbackOutcomePath))
       : resolvePath(baseDir || process.cwd(), '.dsh-trajectory-logs', 'pullback-outcomes.jsonl')
     mkdirSync(dirname2(dir), { recursive: true })
-    appendFileSync(dir, `${JSON.stringify(outcome)}\n`, 'utf8')
-    logAudit(rec, 'pullback-outcome', outcome)
+    const rows = []
+    for (let i = 0; i < triggers.length; i++) {
+      const t = triggers[i]
+      const row = {
+        schemaVersion: 2,
+        at: Date.now(),
+        sessionId: rec.sessionId,
+        arm: t.arm,                                  // intervened | control（每行一臂，不再合并）
+        intervened: t.arm === 'intervened',
+        triggerIndex: i + 1,
+        triggersInSession: triggers.length,
+        triggerTurn: t.turn,
+        triggerStep: t.step,
+        reason: t.reason,
+        pullbacks: rec.pullback.count,               // 会话累计，仅作背景
+        controls: rec.pullback.controls,             // 会话累计，仅作背景
+        ...windowAfter(rec, t),
+        claimedUnverifiedAfter: claimedUnverifiedAtClose,
+        family: rec.family ? familyKeyOf(rec).full : null,
+        endedNarrowed,
+        sawUnknownTool: rec.sawUnknownTool === true,
+        finalState: { machineState: rec.machineState, surfacePhase: rec.surfacePhase, anchored: rec.anchored, lifted: rec.lifted },
+        sessionLevelFields: SESSION_LEVEL_FIELDS,
+      }
+      rows.push(row)
+      appendFileSync(dir, `${JSON.stringify(row)}\n`, 'utf8')
+      logAudit(rec, 'pullback-outcome', row)
+    }
+    rec.pullbackOutcome = rows[rows.length - 1]
+    rec.pullbackOutcomeRows = rows.length
   } catch (e) {
     warnOnce(`pullback outcome record failed (ignored): ${msg(e)}`)
   }
@@ -2062,10 +2168,9 @@ function closeRec(rec, reason) {
   }
   annotateReward(rec)
   rec.closed = true
-  // L1 效果采集：先结算"说过之后是否仍处于未验证状态"，再落盘（L2 门的唯一数据来源）
-  if (rec.pullback.count > 0) {
-    rec.pullback.claimedUnverifiedAfter = rec.codeEditsAfterVerify.length > 0 && rec.lastVerifyAt !== null
-  }
+  // L1 效果采集：按触发点结算观测窗口并落盘（L2 门的唯一数据来源）。
+  // 终态代理（claimedUnverifiedAfter）在 recordPullbackOutcome 里从会话状态现算，
+  // 不再往 rec.pullback 上写一份状态——避免"两处各算一遍"（本项目栽过两次）。
   recordPullbackOutcome(rec)
   // 累积状态（记忆）：**算一次，三处共用**——落盘、回灌、降档都用同一条记录，
   // 避免三处各算一遍导致口径漂移（本项目已经栽过两次"两套规则各说各话"）。
@@ -2192,8 +2297,17 @@ function adopt(agent, doAnchor, channel) {
     pendingPullback: null,
     pullback: {
       count: 0, lastTurn: null, lastReason: null, lastAt: null, lastInfo: null,
-      // L1 效果采集用的"说过之后"计数器（由 noteTaskSignal / turn-end 维护）
-      verifiesAfter: 0, scopeViolationsAfter: 0, claimedUnverifiedAfter: false,
+      // ── L1/L4 效果采集：**按触发点**记账，两条臂同一口径 ────────────────────
+      // 为什么不是会话级计数器（本轮修掉的两个真实缺陷）：
+      //   ① 对照组（触发但故意不说）以前根本不进窗口 ⇒ 对照臂恒为"未改善"，
+      //      于是 Fisher 比较变成"有窗口 vs 没窗口"，会**假阳性**地开门；
+      //   ② 会话级一行会把同会话的多次触发、两条臂揉成一条（实测真数据里就有一条
+      //      arm=intervened 的行同时带着 1 次对照触发，对照观测被静默吞掉）。
+      // 窗口用**单调观测序号** n 界定：turn/step 可能为 null，不能当序用。
+      obsN: 0,
+      triggers: [],        // [{ arm, n, turn, step, at, reason }]（有界）
+      verifyMarks: [],     // [{ n, turn, step }] 每次验证
+      violationMarks: [],  // [{ n, turn, step }] 每次越界写（同一步只记一次）
       suppressed: { throttled: 0, cap: 0, noAnchors: 0 },
       arm: null,          // intervened | control | null（未触发）
       controls: 0,        // 被"故意不说"的次数（对照组）
@@ -2464,7 +2578,9 @@ function noteTaskSignal(rec, event) {
         logAudit(rec, 'verify-run', { turn, step, clearedEdits: rec.codeEditsAfterVerify.length, cmd: String(cmdDecoded || args).slice(0, 160) })
       }
       rec.codeEditsAfterVerify = []
-      if (rec.pullback.count > 0) rec.pullback.verifiesAfter += 1
+      // 观测窗口：**与说不说无关**地记一个验证 mark（旧代码这里是
+      // `if (rec.pullback.count > 0) …`，于是对照臂永远没有窗口 ⇒ 两臂口径不对称）。
+      markObs(rec, 'verify', turn, step)
       // 重新验证会**解决**"未验证"这件事 ⇒ 必须同时清掉待发的提醒，否则会说出过期的提醒。
       // （实测：验证→改码→再验证 之后仍注入了提醒，测试用例 ⑥ 抓出来的。）
       if (rec.pendingPullback && rec.pendingPullback.reason === 'unverified') rec.pendingPullback = null
@@ -2473,6 +2589,7 @@ function noteTaskSignal(rec, event) {
     // ② 文件改动（**只把写当信号**：越界读是另一类弱信号，本轮刻意不用）
     if (!isWriteTool(name)) return
     const scopeKnown = Boolean(anchors && anchors.parsed === true)
+    let sawViolation = false
     for (const path of pathsFromCallStrict(name, d.arguments)) {
       if (isIgnorablePath(path)) continue
       if (scopeKnown && !inScope(path, anchors)) {
@@ -2480,6 +2597,7 @@ function noteTaskSignal(rec, event) {
         rec.scopeViolations.push(v)
         if (rec.scopeViolations.length > 50) rec.scopeViolations.shift()
         rec.pendingPullback = { reason: 'scope', turn, step, path, tool: name }
+        sawViolation = true
         logAudit(rec, 'scope-violation', { turn, step, tool: name, path, note: '写操作落在提示声明的范围之外' })
         continue
       }
@@ -2494,10 +2612,12 @@ function noteTaskSignal(rec, event) {
         }
       }
     }
-    // ③ "说过之后"的越界计数（效果采集用）：只有在已经说过话之后才累加
-    if (rec.pullback.count > 0) {
-      const last = rec.scopeViolations[rec.scopeViolations.length - 1]
-      if (last && last.turn === turn && last.step === step) rec.pullback.scopeViolationsAfter += 1
+    // ③ 越界写**照记不误**（归属哪个触发点的窗口在结算时按观测序号算）。
+    // 旧代码要求"已经说过话"才累加 ⇒ 对照臂永远拿不到窗口（本次修掉的口径不对称）。
+    // 同一步只记一次（一次调用里可能有多个越界路径）。
+    if (sawViolation) {
+      const lastM = rec.pullback.violationMarks[rec.pullback.violationMarks.length - 1]
+      if (!lastM || lastM.turn !== turn || lastM.step !== step) markObs(rec, 'violation', turn, step)
     }
   } catch (e) {
     warnOnce(`task-signal scan failed (ignored): ${msg(e)}`)
@@ -2645,6 +2765,12 @@ function summaryOf(rec) {
       suppressed: { ...rec.pullback.suppressed },
       arm: rec.pullback.arm,
       controls: rec.pullback.controls,
+      // L4 观测单元：**触发点数**才是样本量（不是会话数），两臂都在这里可见
+      triggers: rec.pullback.triggers.length,
+      triggersByArm: rec.pullback.triggers.reduce((a, t) => { a[t.arm] = (a[t.arm] || 0) + 1; return a }, {}),
+      verifyMarks: rec.pullback.verifyMarks.length,
+      violationMarks: rec.pullback.violationMarks.length,
+      outcomeRows: rec.pullbackOutcomeRows || 0,
     },
     // L2 重锚定：状态、门与在线证据
     reanchor: {
@@ -3157,9 +3283,12 @@ export function apply(ctx, config) {
       if (pull && CONFIG.pullbackControlRate > 0 && Math.random() < CONFIG.pullbackControlRate) {
         rec.pullback.controls += 1
         rec.pullback.arm = 'control'
+        // 对照臂也**开观测窗口**（与干预臂共用 markTrigger）——不这么做对照臂就恒为
+        // "未改善"，两臂比较测的是测量口径而不是效果。
+        const cTrig = markTrigger(rec, 'control', pull.reason, payload.turn, payload.step)
         rec.pendingPullback = null
         logAudit(rec, 'pullback-control', {
-          reason: pull.reason, turn: payload.turn, step: payload.step,
+          reason: pull.reason, turn: payload.turn, step: payload.step, n: cTrig.n,
           controls: rec.pullback.controls, rate: CONFIG.pullbackControlRate,
           note: '触发但按对照组比例故意不说（用于在线对照估计效果）',
         })
@@ -3172,9 +3301,10 @@ export function apply(ctx, config) {
         rec.pullback.lastReason = pull.reason
         rec.pullback.lastInfo = { path: pull.info.path || null, lastVerifyAt: pull.info.lastVerifyAt || null }
         rec.pullback.lastAt = Date.now()
+        const trig = markTrigger(rec, 'intervened', pull.reason, payload.turn, payload.step)
         rec.pendingPullback = null
         logAudit(rec, 'pullback', {
-          reason: pull.reason, turn: payload.turn, step: payload.step,
+          reason: pull.reason, turn: payload.turn, step: payload.step, n: trig.n,
           count: rec.pullback.count, path: pull.info.path || null, text: pull.text,
         })
         const injected = {

@@ -126,7 +126,7 @@ agent/disposed: RewardAnnotator process reward + trajectory JSONL final archive
 | `rollbackEnabled` / `notifyEnabled` | **`false` / `false`** | capability / notification switches. Both default OFF (observe-only) because the calibration measured the lexicon signal's session-level false-trigger rate at 15.9% (α=0.001) / 43.2% (α=0.01) — far above a 5% budget. See "Response policy" below |
 | `pullbackEnabled` / `pullbackMaxPerSession` | **`false`** / `3` | the informational pull-back (L1): advisories near the point of action when an out-of-scope write or an unverified code change is detected. Off by default because its mechanism is verified while its *effect* is not measurable from this corpus (there is no labelable drift in it) |
 | `reanchorEnabled` / `reanchorEvidencePath` | **`false`** / `null` | re-anchoring (L2): puts the first-round Minimal payload back near the point of action. Requires an online-evidence artifact (`verdict: PASS-online`, unexpired, non-synthetic) **and** that L1 already spoke; once per session |
-| `pullbackOutcomePath` | `null` (defaults under the audit dir) | where the per-session pull-back outcome JSONL goes — the input `analyze-pullback-outcomes.mjs` needs before the L2 gate can ever open |
+| `pullbackOutcomePath` | `null` (defaults under the audit dir) | where the pull-back outcome JSONL goes — **one line per triggered decision** (both arms), the input `analyze-pullback-outcomes.mjs` needs before the L2 gate can ever open |
 | `adaptiveStateEnabled` / `adaptiveStatePath` / `adaptiveStateWindow` | **`true`** / `null` (defaults next to the audit logs) / `200` | **memory**: the accumulated state (auto-demote window, per-channel outcome counts, learned multipliers, feedback epoch) is appended as one line per *relevant* session and reloaded at mount, so "the last N sessions" survives a restart - without it, cross-day adaptation restarts from zero every time. Sessions with nothing adaptive to report write nothing, so an all-default install produces no file. Derived state (CONFIG, artifacts) is still recomputed every mount |
 | `familyPriorPath` / `priorStrength` | `null` / `20` | L3 family-prior shrinkage: point at `familyPriors.json` (per-`provider/model` base rates) and the channel tests estimate the null rate from *both* the family prior and this session's own reference (`pHat = (refHits + rate·S) / (refLen + S)`). Unset / unreadable / unknown family ⇒ falls back to the fixed Jeffreys pseudo-count |
 | `outcomeFeedbackEnabled` (+ `feedbackMinSessions`, `feedbackMinProductiveRate`, `feedbackRevokeEligibilityRate`, `feedbackAlphaFloorDivisor`, `feedbackExploreAfterSessions`) | **`false`** / `5` / `0.6` / `0.2` / `64` / `30` | L3 outcome feedback, **per channel**: honest outcomes tighten that channel's threshold (×0.5, floored), excellent outcomes relax it back toward the calibrated value (never past it), a very poor record revokes that channel's eligibility — plus an exploration step back up after a long quiet period, because tightening until a channel stops firing also cuts off its own evidence |
@@ -331,17 +331,43 @@ the model *reads*:
 | once per session | — | `reanchor.suppressed.alreadyDone` |
 
 The evidence is not a promise, it is a file produced from real sessions:
-`recordPullbackOutcome()` appends one JSONL line per session that actually received a
-pull-back (only when `pullbackEnabled` is on), recording directly observable proxies —
-`verifiesAfterPullback`, `scopeViolationsAfter`, `claimedUnverifiedAfter` — and
-`tools/analyze-pullback-outcomes.mjs` turns those into the artifact (`< minSamples` ⇒
-`INSUFFICIENT` ⇒ the gate stays shut; improvement ≥ 50% ⇒ `PASS-online`; 14-day expiry).
+`recordPullbackOutcome()` appends **one JSONL line per triggered decision** — both the
+intervened and the control arm — recording directly observable proxies
+(`verifiesAfterPullback`, `scopeViolationsAfter`, and the session-level
+`claimedUnverifiedAfter`), and `tools/analyze-pullback-outcomes.mjs` turns those into the
+artifact (`< minSamples` ⇒ `INSUFFICIENT` ⇒ the gate stays shut; improvement ≥ 50% ⇒
+`PASS-online`; 14-day expiry).
 Walking that chain end to end surfaced a real risk: the synthetic data used to exercise
 it *opened the gate*, so the loader now rejects `synthetic: true` outright.
 `tools/test-reanchor.mjs` (26 cases) covers all five gates in both directions, and
 invariant **C18** pins — per function — the ordering rule, the once-per-session rule, the
 persona being carried verbatim, the advisory wording, and that the collector is actually
 called, with six deliberately broken copies all failing.
+
+**Two instrument defects found in the live log (2026-10-08), both fixed and pinned by C22.**
+The first two rows ever collected contained `{"arm":"intervened","pullbacks":1,"controls":1}`
+and `"controls":1 → 0` across two rows of *one* session — which exposed that the collector
+was measuring the wrong thing:
+
+- **The control arm was structurally unmeasurable.** The "after the pull-back" counters were
+  gated on `if (rec.pullback.count > 0)`, and only an intervention increments `count` — so a
+  control trigger never opened a window and its `verifiesAfterPullback` was always `0`. Because
+  the analyzer's `good()` requires `verifiesAfterPullback > 0`, *every* control row was "not
+  improved" **by construction**: the two-arm Fisher test was really comparing "has a window"
+  against "has no window" and would have driven a **false `PASS-online`** and opened L2 on a
+  measurement artefact. Windows are now recorded for both arms through the same
+  `markTrigger`/`markObs` path, and `tools/test-pullback-arms.mjs` (19 cases) asserts the
+  symmetry directly: the same event sequence with only the arm swapped must produce *identical*
+  metric values.
+- **One row per session merged the two arms.** `arm` was decided by `count > 0`, so a control
+  trigger inside an intervened session was silently absorbed into the intervened arm — the very
+  row quoted above. Rows are now one per triggered decision, carry `triggerIndex` /
+  `triggersInSession` / the trigger position, and mark their session-level fields
+  (`sessionLevelFields`) so `claimedUnverifiedAfter` is never mistaken for a per-trigger metric.
+  The analyzer only accepts `schemaVersion === 2` rows, **reports** the `v1` rows it excludes,
+  requires a session-level minimum (`--min-sessions`, independence lives at the session level),
+  and demands that a **leave-one-session-out** recomputation still stays significant — one
+  session carrying the result is no longer evidence.
 
 Consequently the shipped `responsePolicy.json` records **verdict `FAIL` with zero
 capability-eligible channels**, and the capability layer stays off. The gate is not
@@ -507,12 +533,16 @@ Two structures make that measurement possible rather than aspirational:
   `policyArtifact.derivedSource`. Load order matters — the test caught the reversed order as
   "priors loaded, but the no-prior α used."
 - **A control arm.** `pullbackControlRate` (default `0`) suppresses the message on a trigger
-  with that probability, so the outcome log contains *intervened* and *control* sessions
+  with that probability, so the outcome log contains *intervened* and *control* triggers
   rather than only the treated side. `analyze-pullback-outcomes.mjs` then does a one-sided
-  Fisher exact comparison and demands direction **and** significance **and** an absolute
-  level: single-arm ⇒ `INSUFFICIENT` ("cannot estimate"), control better ⇒ `FAIL`, a tie ⇒
-  `FAIL` (not demonstrated better), positive-but-not-significant ⇒ `INSUFFICIENT` (keep
-  sampling, don't gamble). Only a significant positive effect opens L2.
+  Fisher exact comparison and demands direction **and** significance **and** robustness
+  (leave-one-session-out) **and** an absolute level: single-arm ⇒ `INSUFFICIENT` ("cannot
+  estimate"), control better ⇒ `FAIL`, a tie ⇒ `FAIL` (not demonstrated better),
+  positive-but-not-significant ⇒ `INSUFFICIENT` (keep sampling, don't gamble). Only a
+  significant, robust positive effect opens L2. The comparison is only meaningful because the
+  control trigger is measured exactly like the intervention — see the C22 note above; before
+  that fix this arm could never look good, which is the one failure mode worse than a
+  mediocre signal.
 
 Running the loop for the first time immediately caught a silent loosening: without a recall
 report it produced a *looser* artifact (`PARTIAL-PASS`, two channels granted). C16 and gate

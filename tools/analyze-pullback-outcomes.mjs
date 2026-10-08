@@ -1,26 +1,35 @@
 /**
  * analyze-pullback-outcomes.mjs —— 从拉回效果数据生成**在线证据件**（L2 门的唯一输入）
  *
- * 口径（为什么是这些指标）：拉回说的是"回到范围内"和"验证后再宣布完成"，所以效果代理就是
- * **这两个目标行为在说过之后有没有发生**：
- *   · verifiesAfterPullback  —— 说过之后跑了几次验证（越大越好）
- *   · scopeViolationsAfter    —— 说过之后又越界几次（越小越好）
- *   · claimedUnverifiedAfter  —— 说过之后是否仍处于"未验证"状态（false 为好）
+ * 观测单元（v2 口径，必须与 runtime 一致）：
+ *   **一次触发 = 一个观测单元**。干预臂（说了）与对照臂（触发但按比例故意没说）走
+ *   同一条记录路径，各自开一个"从该触发点起算"的窗口：
+ *   · verifiesAfterPullback  —— 该触发点之后跑了几次验证（越大越好）
+ *   · scopeViolationsAfter   —— 该触发点之后又越界几次（越小越好）
+ *   · claimedUnverifiedAfter —— 会话结束时是否仍处于"未验证"状态（false 为好；**会话级**）
  *
- * 判定纪律（与其它标定一致，宁可保守）：
- *   · 样本不足（pullbacksObserved < --min-samples，默认 10）⇒ verdict = INSUFFICIENT，**不开门**；
- *   · 达到样本量且"目标行为改善率" ≥ --min-improve（默认 0.5）⇒ verdict = PASS-online；
- *   · 否则 FAIL。产物带 expiresAtUtc（默认 14 天）与语料指纹，过期即失效。
+ * 为什么必须区分 v2 行（这条是被真实数据逼出来的）：
+ *   v1 行按**会话**记账，且验证计数被 `count > 0` 把守 ⇒ 对照臂的 verifiesAfterPullback
+ *   恒为 0，而 good() 要求它 > 0 ⇒ 对照臂**恒为未改善**，两臂比较测的是测量口径而不是
+ *   效果，会假阳性开门。所以 v1 行一律**不参与**统计，并且要把忽略条数**报出来**（静默丢弃不可接受）。
+ *
+ * 判定纪律（与其它标定一致，宁可保守）：三关都过才算 PASS-online——
+ *   ① 样本量：观测单元 ≥ --min-samples（默认 10）且**会话数** ≥ --min-sessions（默认 5）
+ *      （独立性在会话层：同会话的多次触发是相关观测，不能当独立样本充数）；
+ *   ② 方向 + 显著性：Fisher 单侧 p ≤ 0.05 且干预臂更好；
+ *   ③ 稳健性：**逐会话留一**（每次丢掉一个会话重算）后最大 p 仍 ≤ 0.05
+ *      —— 否则只要有一个会话撑着，就不算证据。
+ * 产物带 expiresAtUtc（默认 14 天）与语料指纹，过期即失效。
  *
  * 用法：
- *   node tools/analyze-pullback-outcomes.mjs <outcomes.jsonl> [--out 前缀] [--min-samples 10] [--min-improve 0.5] [--days 14]
+ *   node tools/analyze-pullback-outcomes.mjs <outcomes.jsonl> [--out 前缀] [--min-samples 10] [--min-sessions 5] [--min-improve 0.5] [--days 14]
  *   node tools/analyze-pullback-outcomes.mjs --synthesize 12 --out 前缀   # 合成演示数据（仅用于验证链路）
  */
 import { readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const args = process.argv.slice(2)
-const FLAGS_WITH_VALUE = new Set(['--out', '--min-samples', '--min-improve', '--days', '--synthesize'])
+const FLAGS_WITH_VALUE = new Set(['--out', '--min-samples', '--min-sessions', '--min-improve', '--days', '--synthesize'])
 const positional = []
 for (let i = 0; i < args.length; i++) {
   if (FLAGS_WITH_VALUE.has(args[i])) { i += 1; continue }
@@ -29,17 +38,20 @@ for (let i = 0; i < args.length; i++) {
 }
 const val = (name, dflt) => (args.includes(name) ? args[args.indexOf(name) + 1] : dflt)
 const minSamples = Number(val('--min-samples', 10))
+const minSessions = Number(val('--min-sessions', 5))
 const minImprove = Number(val('--min-improve', 0.5))
 const days = Number(val('--days', 14))
 const outPrefix = resolve(val('--out', './pullbackEvidence'))
 const synth = args.includes('--synthesize') ? Number(val('--synthesize', 12)) : null
 
-let rows = []
+let raw = []
 if (synth !== null) {
   // 合成数据只用来验证"链路能跑通"，且 verdict 会标明是合成的（防止把演示当证据）
   for (let i = 0; i < synth; i++) {
-    rows.push({
-      sessionId: `synthetic-${i}`, pullbacks: 1, verifiesAfterPullback: i % 3 === 0 ? 0 : 1,
+    raw.push({
+      schemaVersion: 2, sessionId: `synthetic-${i}`, arm: i % 2 === 0 ? 'intervened' : 'control',
+      intervened: i % 2 === 0, triggerIndex: 1, triggersInSession: 1, pullbacks: 1,
+      verifiesAfterPullback: i % 3 === 0 ? 0 : 1,
       scopeViolationsAfter: i % 4 === 0 ? 1 : 0, claimedUnverifiedAfter: i % 5 === 0,
       synthetic: true,
     })
@@ -48,22 +60,23 @@ if (synth !== null) {
   const p = positional[0]
   if (!p) { console.error('用法：node tools/analyze-pullback-outcomes.mjs <outcomes.jsonl> [--out 前缀]'); process.exit(1) }
   const text = readFileSync(resolve(p), 'utf8')
-  rows = text.split('\n').filter((l) => l.trim()).map((l) => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
+  raw = text.split('\n').filter((l) => l.trim()).map((l) => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
 }
+
+// ── v2 口径过滤：v1 行的窗口与 v2 不可比，必须排除，且**报出**排除条数 ──────────
+const isV2 = (r) => r.schemaVersion === 2 && (r.arm === 'intervened' || r.arm === 'control' || r.intervened === false)
+const rows = raw.filter(isV2)
+const legacyIgnored = raw.length - rows.length
 
 const improved = rows.filter((r) => (r.verifiesAfterPullback > 0) || (r.scopeViolationsAfter === 0 && r.claimedUnverifiedAfter !== true))
 const rate = rows.length ? improved.length / rows.length : 0
+const sessions = [...new Set(rows.map((r) => r.sessionId))]
 
-// ── L4 在线对照：两条臂的**配对比较** ────────────────────────────────────────
-// 只有"说过话"的一侧是观测，无法区分"起了作用"与"本来就会这样"；所以插件在触发时可按
-// pullbackControlRate 故意不说，形成对照组。这里做两侧比例比较并给出**方向性**判定。
+// ── 两臂比较（Fisher 单侧：干预臂是否更好）────────────────────────────────────
 const armOf = (r) => (r.arm === 'control' || r.intervened === false ? 'control' : 'intervened')
 const good = (r) => (r.verifiesAfterPullback > 0) && r.scopeViolationsAfter === 0 && r.claimedUnverifiedAfter !== true
-const byArm = { intervened: [], control: [] }
-for (const r of rows) byArm[armOf(r)].push(r)
-const rateOfArm = (a) => (byArm[a].length ? byArm[a].filter(good).length / byArm[a].length : null)
 
-/** Fisher 精确检验（单侧：干预臂是否更好）。纯函数，小样本也准。 */
+/** 单侧 Fisher（干预臂更好）。纯函数，小样本也准。 */
 function fisherGreater(a, b, c, d) {
   const logFact = (n) => { let s = 0; for (let i = 2; i <= n; i++) s += Math.log(i); return s }
   const hyper = (x) => Math.exp(
@@ -71,39 +84,71 @@ function fisherGreater(a, b, c, d) {
     - logFact(x) - logFact(a + b - x) - logFact(a + c - x) - logFact(d - a + x))
   const minX = Math.max(0, a - d)
   const maxX = Math.min(a + b, a + c)
-  const list = []
-  for (let x = minX; x <= maxX; x++) list.push([x, hyper(x)])
   let p = 0
-  for (const [x, v] of list) if (x >= a) p += v
+  for (let x = minX; x <= maxX; x++) if (x >= a) p += hyper(x)
   return Math.min(1, p)
 }
 
-const cmp = {
-  intervened: { n: byArm.intervened.length, goodRate: rateOfArm('intervened') },
-  control: { n: byArm.control.length, goodRate: rateOfArm('control') },
-}
-if (byArm.intervened.length > 0 && byArm.control.length > 0) {
+/** 对一组行做两臂比较；任一条臂为空 ⇒ null（无法估计）。 */
+function compareRows(list) {
+  const byArm = { intervened: [], control: [] }
+  for (const r of list) byArm[armOf(r)].push(r)
+  if (byArm.intervened.length === 0 || byArm.control.length === 0) return null
+  const rateOf = (a) => (byArm[a].length ? byArm[a].filter(good).length / byArm[a].length : null)
   const a = byArm.intervened.filter(good).length
   const b = byArm.intervened.length - a
   const c = byArm.control.filter(good).length
   const d = byArm.control.length - c
-  cmp.table = { intervenedGood: a, intervenedBad: b, controlGood: c, controlBad: d }
-  cmp.oneSidedP = fisherGreater(a, b, c, d)
-  cmp.effectPP = (rateOfArm('intervened') - rateOfArm('control')) * 100
+  return {
+    intervened: { n: byArm.intervened.length, goodRate: rateOf('intervened') },
+    control: { n: byArm.control.length, goodRate: rateOf('control') },
+    table: { intervenedGood: a, intervenedBad: b, controlGood: c, controlBad: d },
+    oneSidedP: fisherGreater(a, b, c, d),
+    effectPP: (rateOf('intervened') - rateOf('control')) * 100,
+  }
 }
 
-// 判定（方向性 + 显著性 + 绝对水平，三者都要过）：
-//   · 单臂 ⇒ INSUFFICIENT（无法估效果；这正是"只记说过话的会话"时的老状态）
-//   · 干预臂不比对照好 ⇒ FAIL（并且这是**该被采纳的**结论，不是"测不出来"）
-//   · 方向为正但未达显著 ⇒ INSUFFICIENT（继续攒样本，不冒险）
+const cmp = compareRows(rows)
+
+// ── 敏感性：会话级独立性（同会话多次触发是相关观测）───────────────────────────
+// ① 逐会话留一：只要有一个会话撑着结论，就不算证据 ⇒ 取最大 p（最保守）
+let looMaxP = null
+let looWorstSession = null
+if (cmp && sessions.length > 1) {
+  looMaxP = 0
+  for (const s of sessions) {
+    const rest = rows.filter((r) => r.sessionId !== s)
+    const c2 = compareRows(rest)
+    const p = c2 ? c2.oneSidedP : 1   // 丢掉该会话后无法比较 ⇒ 按"最不显著"处理
+    if (p > looMaxP) { looMaxP = p; looWorstSession = s }
+  }
+}
+// ② 每会话只取首个触发点（去相关的最粗口径），看方向是否还在
+const firstPerSession = []
+{
+  const seen = new Set()
+  const sorted = [...rows].sort((x, y) => (x.triggerIndex || 1) - (y.triggerIndex || 1))
+  for (const r of sorted) {
+    if (seen.has(r.sessionId)) continue
+    seen.add(r.sessionId)
+    firstPerSession.push(r)
+  }
+}
+const cmpFirst = compareRows(firstPerSession)
+
+// 判定：方向 + 显著性 + 会话级样本量 + 留一稳健性 + 绝对水平，全部要过
 let verdict = 'FAIL'
 let verdictReason = ''
-if (rows.length < minSamples) { verdict = 'INSUFFICIENT'; verdictReason = `样本 ${rows.length} < ${minSamples}` }
-else if (!cmp.table) { verdict = 'INSUFFICIENT'; verdictReason = '只有单臂（无对照数据）⇒ 无法估计效果' }
+if (rows.length < minSamples) { verdict = 'INSUFFICIENT'; verdictReason = `观测单元 ${rows.length} < ${minSamples}` }
+else if (sessions.length < minSessions) { verdict = 'INSUFFICIENT'; verdictReason = `会话数 ${sessions.length} < ${minSessions}（独立性在会话层）` }
+else if (!cmp) { verdict = 'INSUFFICIENT'; verdictReason = '只有单臂（无对照数据）⇒ 无法估计效果' }
 else if (cmp.effectPP <= 0) { verdict = 'FAIL'; verdictReason = `干预臂并不更好（${cmp.effectPP.toFixed(1)}pp）` }
 else if (cmp.oneSidedP > 0.05) { verdict = 'INSUFFICIENT'; verdictReason = `方向为正但未显著（单侧 p=${cmp.oneSidedP.toFixed(3)}）` }
-else if (rate >= minImprove) { verdict = 'PASS-online'; verdictReason = `干预臂显著更好（+${cmp.effectPP.toFixed(1)}pp，单侧 p=${cmp.oneSidedP.toFixed(3)}）` }
-else { verdict = 'FAIL'; verdictReason = `显著但绝对产出率不足（${(rate * 100).toFixed(1)}% < ${(minImprove * 100).toFixed(0)}%）` }
+else if (looMaxP !== null && looMaxP > 0.05) {
+  verdict = 'INSUFFICIENT'
+  verdictReason = `去掉会话 ${looWorstSession} 后不再显著（留一最大 p=${looMaxP.toFixed(3)}）⇒ 单个会话撑着，不算证据`
+} else if (rate < minImprove) { verdict = 'FAIL'; verdictReason = `显著但绝对产出率不足（${(rate * 100).toFixed(1)}% < ${(minImprove * 100).toFixed(0)}%）` }
+else { verdict = 'PASS-online'; verdictReason = `干预臂显著更好（+${cmp.effectPP.toFixed(1)}pp，单侧 p=${cmp.oneSidedP.toFixed(3)}，留一最大 p=${looMaxP === null ? 'n/a' : looMaxP.toFixed(3)}）` }
 
 const artifact = {
   generatedAtUtc: new Date().toISOString(),
@@ -111,26 +156,42 @@ const artifact = {
   kind: 'reanchor-online-evidence',
   verdict,
   verdictReason,
-  pullbacksObserved: rows.length,
+  schema: 'pullback-outcomes/v2',
+  pullbacksObserved: rows.length,     // 观测单元数（= 触发点数；字段名保持兼容）
+  sessionsObserved: sessions.length,
+  legacyIgnored,                      // v1 行（窗口不可比）被排除的条数——必须可见
   minSamples,
+  minSessions,
   minImprove,
   comparison: cmp,
+  sensitivity: {
+    looMaxP,                          // 逐会话留一后的最大 p（≤0.05 才算稳）
+    looWorstSession,
+    firstPerSessionN: cmpFirst ? { intervened: cmpFirst.intervened.n, control: cmpFirst.control.n } : null,
+    firstPerSessionP: cmpFirst ? cmpFirst.oneSidedP : null,
+    firstPerSessionEffectPP: cmpFirst ? cmpFirst.effectPP : null,
+  },
   effectiveness: {
     improvedRate: Number(rate.toFixed(4)),
     verifyAfterRate: rows.length ? Number((rows.filter((r) => r.verifiesAfterPullback > 0).length / rows.length).toFixed(4)) : null,
     scopeViolationsAfterRate: rows.length ? Number((rows.filter((r) => r.scopeViolationsAfter > 0).length / rows.length).toFixed(4)) : null,
     claimedUnverifiedAfterRate: rows.length ? Number((rows.filter((r) => r.claimedUnverifiedAfter === true).length / rows.length).toFixed(4)) : null,
   },
+  armCounts: rows.reduce((a, r) => { const k = armOf(r); a[k] = (a[k] || 0) + 1; return a }, {}),
   synthetic: synth !== null,
   note: synth !== null
     ? '**合成数据**：仅用于验证"采集→分析→门禁"链路，不得当作效果证据（装载器会拒绝 synthetic:true）'
-    : '由真实会话的拉回效果采集聚合而来；**两条臂**（intervened/control）都要有样本才可能 PASS-online',
+    : '由真实会话的拉回效果采集聚合而来（v2：一次触发一个观测单元）；**两条臂**都要有样本、'
+      + '会话数达下限、且逐会话留一后仍显著，才可能 PASS-online',
 }
 writeFileSync(`${outPrefix}.json`, JSON.stringify(artifact, null, 2), 'utf8')
-console.log(`样本 ${rows.length}（要求 ≥${minSamples}）  改善率 ${(rate * 100).toFixed(1)}%（要求 ≥${(minImprove * 100).toFixed(0)}%）`)
-if (cmp.table) {
+console.log(`观测单元 ${rows.length}（要求 ≥${minSamples}）  会话 ${sessions.length}（要求 ≥${minSessions}）  改善率 ${(rate * 100).toFixed(1)}%（要求 ≥${(minImprove * 100).toFixed(0)}%）`)
+if (legacyIgnored > 0) console.log(`已排除 v1 行 ${legacyIgnored} 条（v1 按会话记账、对照臂无窗口 ⇒ 与 v2 不可比）`)
+if (cmp) {
   console.log(`对照：干预臂 ${(cmp.intervened.goodRate * 100).toFixed(1)}%（n=${cmp.intervened.n}） vs 对照臂 ${(cmp.control.goodRate * 100).toFixed(1)}%（n=${cmp.control.n}）`
     + `  效应 ${cmp.effectPP >= 0 ? '+' : ''}${cmp.effectPP.toFixed(1)}pp  单侧 p=${cmp.oneSidedP.toFixed(4)}`)
+  console.log(`敏感性：逐会话留一最大 p=${looMaxP === null ? 'n/a' : looMaxP.toFixed(4)}（最差会话 ${looWorstSession ?? 'n/a'}）`
+    + `；每会话首个触发点 p=${cmpFirst ? cmpFirst.oneSidedP.toFixed(4) : 'n/a'}`)
 } else {
   console.log('对照：**只有单臂** ⇒ 无法估计效果（需要 pullbackControlRate > 0 攒对照数据）')
 }
