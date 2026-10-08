@@ -36,8 +36,8 @@
  * TRAJECTORY_ANCHOR_LEXICON_PATH; CJK-safe term matching (no ASCII \b).
  */
 
-import { readFileSync } from 'node:fs'
-import { isAbsolute, resolve as resolvePath } from 'node:path'
+import { readFileSync, mkdirSync, appendFileSync } from 'node:fs'
+import { isAbsolute, resolve as resolvePath, dirname as dirname2 } from 'node:path'
 // L1：任务锚定信号的**单一实现**（tools/task-anchor-core.mjs 是纯模块，不反向 import 本文件，
 // 因此没有循环依赖）。为什么不在这里再写一份：本项目已经两次栽在"两套规则各说各话"
 // （台账定稿 51 倍偏差、两级连续计数混层），所以本轮一律共用一份实现。
@@ -132,6 +132,15 @@ const DEFAULTS = {
   pullbackEnabled: false,
   // 每会话最多说几次（节流见 allostasis 的 admitPerTurn：同一 turn 至多一次）。
   pullbackMaxPerSession: 3,
+  // ── L2 重锚定（最强干预：把首轮 Minimal 载荷重新灌回近因位置）────────────────
+  // 默认关，且**不与 L1 共用同一道门**：它额外要求一份**在线证据件**（reanchorEvidencePath），
+  // 该证据件由真实会话累积的结果生成（见 recordPullbackOutcome），且必须 verdict=PASS-online、未过期。
+  // 依据：本项目最重的一次事故就是"未经验证的信号 → 不可逆执行器"（23 个会话进收窄、0 个恢复），
+  // 所以凡是要动**上下文内容**的动作，一律先要在线证据。
+  reanchorEnabled: false,
+  reanchorEvidencePath: null,
+  // 拉回效果采集：会话结束时把"说过之后行为有没有变"写成一行 JSONL（默认在 baseDir 下）。
+  pullbackOutcomePath: null,
   // P6 不变量：收窄态的步数硬上限（退出条件必然可达）。0 = 关闭该上限（不推荐）。
   // 到顶后本漂移片段内禁止再次收窄，直到检验不再触发（片段结束）才复位。
   // 取值来源（不是拍脑袋）：45 个历史会话 / 3299 步关上限回放得到的自然片段长度
@@ -233,6 +242,8 @@ let policyArtifact = null
 let autoDemote = null
 /** 最近已结束会话的"是否收窄过"记录（在线超预算自动降档用）。 */
 const sessionOutcomes = []
+/** L2：已装载的在线证据件摘要（null = 未提供）。 */
+let reanchorEvidence = null
 
 /**
  * 能力层**有效**开关（决策路径必须用这个，而不是直接读 CONFIG.rollbackEnabled）：
@@ -257,6 +268,26 @@ function capabilityGateReason() {
   if (autoDemote) return `auto-demoted:${autoDemote.reason}`
   if (policyArtifact && policyArtifact.verdict !== 'PASS' && policyArtifact.verdict !== 'PARTIAL-PASS') return `policy-${policyArtifact.verdict}`
   if (CONFIG.rollbackEnabled !== true) return 'switch-off'
+  return null
+}
+
+/**
+ * L2 重锚定的**有效**开关：配置开关 ∧ 在线证据件通过 ∧ 未被自动降档 ∧ 不在评测保护下。
+ * 与能力层分开判（各自的证据门槛不同：能力层要"空转+召回"两关，重锚定要"在线效果"证据）。
+ */
+function effectiveReanchor() {
+  if (CONFIG.measurementSafe === true) return false
+  if (autoDemote) return false
+  if (!reanchorEvidence || reanchorEvidence.verdict !== 'PASS-online') return false
+  return CONFIG.reanchorEnabled === true
+}
+/** 重锚定为何关闭（同 capabilityGateReason 的可观测原则）。 */
+function reanchorGateReason() {
+  if (CONFIG.measurementSafe === true) return 'measurement-safe'
+  if (autoDemote) return 'auto-demoted'
+  if (!reanchorEvidence) return CONFIG.reanchorEnabled === true ? 'no-online-evidence' : 'switch-off'
+  if (reanchorEvidence.verdict !== 'PASS-online') return `evidence-${reanchorEvidence.verdict}`
+  if (CONFIG.reanchorEnabled !== true) return 'switch-off'
   return null
 }
 
@@ -1543,6 +1574,72 @@ function recordSessionOutcome(rec) {
   }
 }
 
+/**
+ * L2 重锚定文本：把**首轮 Minimal 载荷**原样带回近因位置，并自报依据。
+ *
+ * 为什么是"原样带回"（社区依据）：dsh-anchored-monitor 的 L2 是"重置载荷——逐字节对齐官方
+ * Minimal 预设"，即不发明新指令，而是把已知有效的首轮载荷重新灌回去。发明新指令会引入
+ * 未验证的措辞风险（措辞纪律那一条已经证明措辞本身会改变轨迹）。
+ * 同样按 L1 的措辞纪律：陈述事实 + 建议，不用命令式。
+ */
+export function reanchorText(persona, info, count) {
+  const why = info && info.path ? `（上次提醒针对 ${info.path}）` : ''
+  return `[trajectory-anchor] 重锚定${count > 1 ? `（第 ${count} 次）` : ''}：前面的提醒之后轨迹仍未回到任务骨架${why}，`
+    + '这里把首轮的工作方式原样带回来：'
+    + `\n\n${persona}`
+    + '\n\n说明：这是把**已知有效**的首轮载荷重新放回近因位置（不改写系统基线）。'
+    + '若你已经在按这个方式工作，忽略本条即可。'
+}
+
+/**
+ * L2：是否该重锚定。比 L1 严得多——要过在线证据门、每会话只做一次、且必须"L1 已经说过话"
+ * （先轻后重：能一句话解决就不动上下文）。
+ */
+function reanchorDecision(rec, turn) {
+  if (!effectiveReanchor()) return null
+  if (rec.reanchor.count > 0) { rec.reanchor.suppressed.alreadyDone += 1; return null }
+  if (rec.pullback.count === 0) { rec.reanchor.suppressed.noPriorPullback += 1; return null }
+  if (rec.reanchor.lastPullbackCount === rec.pullback.count) { rec.reanchor.suppressed.noNewEvidence += 1; return null }
+  return { info: rec.pullback.lastInfo || null, reason: 'reanchor' }
+}
+
+/**
+ * L1 效果采集（L2 的门的唯一数据来源）：会话结束时，把"说过之后行为有没有变"记下来。
+ *
+ * 采集的是**可直接观测的行为指标**（不需要人工标签）：
+ *   · verifiesAfterPullback —— 拉回之后到会话结束之间跑了几次验证
+ *   · claimedUnverifiedAfter —— 拉回之后是否仍在"未验证"状态下宣称完成
+ *   · scopeViolationsAfter  —— 拉回之后是否仍有越界写
+ * 这三项都是"提醒的目标行为"，所以 pre/post 变化本身就是效果代理；
+ * 真正的效果估计仍应由在线对照（开/关同族会话）完成，这里先把数据攒起来。
+ */
+function recordPullbackOutcome(rec) {
+  try {
+    if (CONFIG.pullbackEnabled !== true) return
+    if (rec.pullback.count === 0) return
+    const outcome = {
+      at: Date.now(),
+      sessionId: rec.sessionId,
+      pullbacks: rec.pullback.count,
+      lastReason: rec.pullback.lastReason,
+      lastTurn: rec.pullback.lastTurn,
+      verifiesAfterPullback: rec.pullback.verifiesAfter,
+      scopeViolationsAfter: rec.pullback.scopeViolationsAfter,
+      claimedUnverifiedAfter: rec.pullback.claimedUnverifiedAfter === true,
+      finalState: { machineState: rec.machineState, surfacePhase: rec.surfacePhase, anchored: rec.anchored, lifted: rec.lifted },
+    }
+    rec.pullbackOutcome = outcome
+    const dir = CONFIG.pullbackOutcomePath
+      ? (isAbsolute(CONFIG.pullbackOutcomePath) ? CONFIG.pullbackOutcomePath : resolvePath(baseDir || process.cwd(), CONFIG.pullbackOutcomePath))
+      : resolvePath(baseDir || process.cwd(), '.dsh-trajectory-logs', 'pullback-outcomes.jsonl')
+    mkdirSync(dirname2(dir), { recursive: true })
+    appendFileSync(dir, `${JSON.stringify(outcome)}\n`, 'utf8')
+    logAudit(rec, 'pullback-outcome', outcome)
+  } catch (e) {
+    warnOnce(`pullback outcome record failed (ignored): ${msg(e)}`)
+  }
+}
+
 function closeRec(rec, reason) {
   if (rec.closed) return
   if (rec.anchored && !rec.lifted) lift(rec, 'close:' + reason)
@@ -1556,6 +1653,11 @@ function closeRec(rec, reason) {
   }
   annotateReward(rec)
   rec.closed = true
+  // L1 效果采集：先结算"说过之后是否仍处于未验证状态"，再落盘（L2 门的唯一数据来源）
+  if (rec.pullback.count > 0) {
+    rec.pullback.claimedUnverifiedAfter = rec.codeEditsAfterVerify.length > 0 && rec.lastVerifyAt !== null
+  }
+  recordPullbackOutcome(rec)
   logAudit(rec, 'closed', { reason })
   recordSessionOutcome(rec)
   recs.delete(rec.sessionId)
@@ -1670,7 +1772,15 @@ function adopt(agent, doAnchor, channel) {
     scopeViolations: [],
     /** 待发出的拉回原因（工具调用时置位，pre-step 时消费；保证"触发点=说出口的点"）。 */
     pendingPullback: null,
-    pullback: { count: 0, lastTurn: null, lastReason: null, lastAt: null, suppressed: { throttled: 0, cap: 0, noAnchors: 0 } },
+    pullback: {
+      count: 0, lastTurn: null, lastReason: null, lastAt: null, lastInfo: null,
+      // L1 效果采集用的"说过之后"计数器（由 noteTaskSignal / turn-end 维护）
+      verifiesAfter: 0, scopeViolationsAfter: 0, claimedUnverifiedAfter: false,
+      suppressed: { throttled: 0, cap: 0, noAnchors: 0 },
+    },
+    // L2 重锚定状态（每会话只做一次）
+    reanchor: { count: 0, lastTurn: null, lastPullbackCount: null, lastAt: null, suppressed: { alreadyDone: 0, noPriorPullback: 0, noNewEvidence: 0 } },
+    pullbackOutcome: null,
     bandHistory: [],        // 审计用：personaRatio 导出的波段序列（离线回放读日志）
     driftEnteredAt: null,
     rollbackDeny: [],
@@ -1854,6 +1964,7 @@ function noteTaskSignal(rec, event) {
         logAudit(rec, 'verify-run', { turn, step, clearedEdits: rec.codeEditsAfterVerify.length, cmd: String(cmd).slice(0, 160) })
       }
       rec.codeEditsAfterVerify = []
+      if (rec.pullback.count > 0) rec.pullback.verifiesAfter += 1
       // 重新验证会**解决**"未验证"这件事 ⇒ 必须同时清掉待发的提醒，否则会说出过期的提醒。
       // （实测：验证→改码→再验证 之后仍注入了提醒，测试用例 ⑥ 抓出来的。）
       if (rec.pendingPullback && rec.pendingPullback.reason === 'unverified') rec.pendingPullback = null
@@ -1878,6 +1989,11 @@ function noteTaskSignal(rec, event) {
           rec.pendingPullback = { reason: 'unverified', turn, step, path, lastVerifyAt: rec.lastVerifyAt }
         }
       }
+    }
+    // ③ "说过之后"的越界计数（效果采集用）：只有在已经说过话之后才累加
+    if (rec.pullback.count > 0) {
+      const last = rec.scopeViolations[rec.scopeViolations.length - 1]
+      if (last && last.turn === turn && last.step === step) rec.pullback.scopeViolationsAfter += 1
     }
   } catch (e) {
     warnOnce(`task-signal scan failed (ignored): ${msg(e)}`)
@@ -2006,6 +2122,15 @@ function summaryOf(rec) {
       lastVerifyAt: rec.lastVerifyAt,
       suppressed: { ...rec.pullback.suppressed },
     },
+    // L2 重锚定：状态、门与在线证据
+    reanchor: {
+      enabled: effectiveReanchor(),
+      gate: reanchorGateReason(),
+      count: rec.reanchor.count,
+      lastTurn: rec.reanchor.lastTurn,
+      suppressed: { ...rec.reanchor.suppressed },
+    },
+    pullbackOutcome: rec.pullbackOutcome || null,
     lexiconDegenerate: rec.lexiconDegenerate,
     stepsScored: rec.stepsScored,
     positiveHitSteps: rec.positiveHitSteps,
@@ -2081,12 +2206,17 @@ function buildSummary(filter) {
       suppressSkillCatalog: CONFIG.suppressSkillCatalog,
       pullbackEnabled: CONFIG.pullbackEnabled === true,
       pullbackMaxPerSession: CONFIG.pullbackMaxPerSession,
+      reanchorEnabled: CONFIG.reanchorEnabled === true,
+      reanchorEvidencePath: CONFIG.reanchorEvidencePath || null,
+      pullbackOutcomePath: CONFIG.pullbackOutcomePath || null,
       rewardAnnotator: CONFIG.rewardAnnotator,
     },
     configWarnings: configWarnings.slice(),
     policyArtifact,
     autoDemote,
     capabilityGate: capabilityGateReason(),
+    reanchorGate: reanchorGateReason(),
+    reanchorEvidence,
     effectiveSwitches: { rollback: effectiveRollback(), notify: effectiveNotify() },
     sessionOutcomes: { window: sessionOutcomes.length, narrowed: sessionOutcomes.filter((o) => o.narrowed).length, budget: CONFIG.autoDemoteBudget },
     listAtApply,
@@ -2166,6 +2296,7 @@ function cloneDefaults() {
 export function apply(ctx, config) {
   CONFIG = cloneDefaults()
   policyArtifact = null
+  reanchorEvidence = null
   autoDemote = null
   sessionOutcomes.length = 0
   configWarnings.length = 0
@@ -2229,6 +2360,39 @@ export function apply(ctx, config) {
     } catch (e) {
       policyArtifact = { source: policyPath, verdict: 'REJECTED', rejectReason: msg(e), eligibleChannels: [] }
       noteConfigWarning(`failed to load response policy from "${policyPath}": ${msg(e)}; capability layer stays off`)
+    }
+  }
+
+  // L2：在线证据件加载（重锚定的前置门）。与标定件同样的 fail-safe 姿态：
+  // 缺/坏/过期/verdict≠PASS-online ⇒ 一律不开。
+  const envEvidence = typeof process !== 'undefined' && process.env && process.env.TRAJECTORY_ANCHOR_EVIDENCE_PATH
+  const evidencePath = (config && typeof config.reanchorEvidencePath === 'string' && config.reanchorEvidencePath) || envEvidence || ''
+  if (evidencePath) {
+    try {
+      const p = isAbsolute(evidencePath) ? evidencePath : resolvePath(process.cwd(), evidencePath)
+      const ev = JSON.parse(readFileSync(p, 'utf8'))
+      const reject = (why) => {
+        reanchorEvidence = { source: p, verdict: 'REJECTED', rejectReason: why }
+        noteConfigWarning(`re-anchor evidence rejected (${why}); re-anchor stays off`)
+      }
+      if (!ev || typeof ev !== 'object') reject('not an object')
+      // 合成/演示数据不得当证据（analyze-pullback-outcomes.mjs --synthesize 会标 synthetic:true）。
+      // 这条是实测出来的：第一版链路上，合成证据喂进去门**照样开了**。
+      else if (ev.synthetic === true) reject('synthetic-evidence')
+      else if (ev.verdict !== 'PASS-online') reject(`verdict=${ev.verdict}`)
+      else if (typeof ev.expiresAtUtc === 'string' && Date.parse(ev.expiresAtUtc) < Date.now()) reject(`expired at ${ev.expiresAtUtc}`) // time-ok: artifact-expiry
+      else {
+        reanchorEvidence = {
+          source: p, verdict: 'PASS-online',
+          pullbacksObserved: ev.pullbacksObserved ?? null,
+          effectiveness: ev.effectiveness ?? null,
+          generatedAtUtc: ev.generatedAtUtc ?? null,
+        }
+        console.log(`[${name}] re-anchor evidence loaded from ${p} (${reanchorEvidence.pullbacksObserved ?? '?'} pull-backs observed)`)
+      }
+    } catch (e) {
+      reanchorEvidence = { source: evidencePath, verdict: 'REJECTED', rejectReason: msg(e) }
+      noteConfigWarning(`failed to load re-anchor evidence from "${evidencePath}": ${msg(e)}; re-anchor stays off`)
     }
   }
 
@@ -2384,6 +2548,7 @@ export function apply(ctx, config) {
         rec.pullback.count += 1
         rec.pullback.lastTurn = typeof payload.turn === 'number' ? payload.turn : null
         rec.pullback.lastReason = pull.reason
+        rec.pullback.lastInfo = { path: pull.info.path || null, lastVerifyAt: pull.info.lastVerifyAt || null }
         rec.pullback.lastAt = Date.now()
         rec.pendingPullback = null
         logAudit(rec, 'pullback', {
@@ -2406,6 +2571,21 @@ export function apply(ctx, config) {
           logAudit(rec, 'skill-catalog-suppressed', { removed: withPullback.messages.length - kept.length, turn: payload.turn, step: payload.step })
         }
         return { ...withPullback, messages: kept }
+      }
+      // ── L2 重锚定：先轻后重。只有"L1 已经说过、且仍有新证据"时才动上下文内容 ──
+      const re = reanchorDecision(rec, typeof payload.turn === 'number' ? payload.turn : null)
+      if (re && decision && Array.isArray(decision.messages)) {
+        const text = reanchorText(CONFIG.bootstrapPersona, re.info, rec.reanchor.count + 1)
+        rec.reanchor.count += 1
+        rec.reanchor.lastTurn = typeof payload.turn === 'number' ? payload.turn : null
+        rec.reanchor.lastPullbackCount = rec.pullback.count
+        rec.reanchor.lastAt = Date.now()
+        logAudit(rec, 'reanchor', {
+          turn: payload.turn, step: payload.step, count: rec.reanchor.count,
+          afterPullbacks: rec.pullback.count, evidence: reanchorEvidence ? reanchorEvidence.source : null, personaBytes: CONFIG.bootstrapPersona.length,
+        })
+        const injected = { source: { kind: 'trajectory-anchor-reanchor' }, content: [{ type: 'text', text }] }
+        return { ...decision, messages: [...decision.messages, injected] }
       }
       if (!CONFIG.suppressSkillCatalog || !(rec.anchored && !rec.lifted)) return decision
       if (!decision || !Array.isArray(decision.messages)) return decision

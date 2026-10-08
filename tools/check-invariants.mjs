@@ -465,6 +465,47 @@ if (existsSync(readmePath)) {
   else oks.push('C17 L1 拉回接线：默认关、受门控、共用单一锚定实现、措辞为建议式且带豁免、turn 级节流 + 会话上限')
 }
 
+// ── C18 硬：L2 重锚定的门禁（最强干预必须最难开）─────────────────────────────
+// 由来：本项目最重的事故是"未经验证的信号 → 不可逆执行器"（23 会话进收窄、0 恢复）。
+// 重锚定改的是**模型上下文**，比收窄工具面更强，因此：① 默认关；② 除开关外还要求一份
+// **在线证据件**（真实会话累积、verdict=PASS-online、未过期）；③ 先轻后重（L1 已说过话）；
+// ④ 每会话只做一次；⑤ 评测保护与自动降档都能关掉它；⑥ 效果采集必须真的被调用。
+{
+  const problems = []
+  if (!/reanchorEnabled: false/.test(src)) problems.push('reanchorEnabled 默认必须是 false（最强干预）')
+  if (!/function effectiveReanchor\(\)/.test(src)) problems.push('缺少 effectiveReanchor()（重锚定必须经门禁）')
+  if (!/ev\.synthetic === true\) reject\('synthetic-evidence'\)/.test(src)) {
+    problems.push('证据加载器接受合成/演示证据（synthetic:true 必须被拒——实测第一版会被它开门）')
+  }
+  if (!/reanchorEvidence \|\| reanchorEvidence\.verdict !== 'PASS-online'/.test(src)) {
+    problems.push('effectiveReanchor 未要求在线证据件（只有开关没有证据 = 未验证的执行器）')
+  }
+  const codeNoComments = src.split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n')
+  // 这两条必须**在 reanchorDecision 函数体内**检查：同名条件在 recordPullbackOutcome 里也出现，
+  // 全局检查会被它"撞"过去（反向验证抓出来的——把"先轻后重"删掉仍然全绿）。
+  const rd = src.match(/function reanchorDecision\([\s\S]*?\n\}/)
+  if (!rd) problems.push('找不到 reanchorDecision（重锚定判定必须集中在一处）')
+  else {
+    if (!/rec\.reanchor\.count > 0/.test(rd[0])) problems.push('reanchorDecision 缺少"每会话只重锚定一次"的判定')
+    if (!/rec\.pullback\.count === 0/.test(rd[0])) problems.push('reanchorDecision 缺少"先轻后重"的判定（L1 未说过话就不许重锚定）')
+    if (!/effectiveReanchor\(\)/.test(rd[0])) problems.push('reanchorDecision 未走门禁 effectiveReanchor()')
+  }
+  if (!/function recordPullbackOutcome\(rec\)/.test(src)) problems.push('缺少效果采集 recordPullbackOutcome（L2 的门没有数据来源）')
+  if (!/^\s*recordPullbackOutcome\(rec\)$/m.test(codeNoComments)) problems.push('效果采集写了但没有被调用（从不执行）')
+  if (!/mkdirSync\(dirname2\(dir\), \{ recursive: true \}\)/.test(codeNoComments)) problems.push('效果采集未建目录（首次落盘会失败）')
+  const refn = src.match(/export function reanchorText\([\s\S]*?\n\}/)
+  if (!refn) problems.push('找不到 reanchorText')
+  else {
+    if (!/\$\{persona\}/.test(refn[0])) problems.push('重锚定文本没有原样带回 persona（社区依据：重置载荷 = 逐字节对齐已有效载荷）')
+    const forbidden = ['必须', '务必', '禁止', 'do not', "don't", 'never', 'shall', 'follow']
+    const hit = forbidden.filter((w) => refn[0].includes(w))
+    if (hit.length) problems.push(`重锚定文本出现命令式措辞 [${hit.join(', ')}]`)
+    if (!/忽略本条即可|建议/.test(refn[0])) problems.push('重锚定文本缺少建议式/可忽略表述')
+  }
+  if (problems.length) for (const p of problems) fails.push(`C18 ${p}`)
+  else oks.push('C18 L2 门禁：默认关 + 在线证据件（PASS-online/未过期）+ 先轻后重 + 每会话一次 + 措辞建议式 + 效果采集在位')
+}
+
 // ── 输出 ────────────────────────────────────────────────────────────────
 for (const s of oks) console.log(`  OK    ${s}`)
 for (const s of debts) console.log(`  DEBT  ${s}`)

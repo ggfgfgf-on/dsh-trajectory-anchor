@@ -125,6 +125,8 @@ agent/disposed: RewardAnnotator process reward + trajectory JSONL final archive
 | `maxDriftSteps` | `12` | hard bound on any narrowed episode — the exit condition that is **provably reachable**. Derived, not guessed: replaying 45 sessions / 3,299 steps with the bound off gives natural episode lengths p50=5, p75=9, **p90=12**, p95=19, max=22, so 12 = the p90 of what an episode naturally lasts (it truncates 5 of 53 episodes). The value is a *safety bound*; the real budget lever is the false-trigger rate (G1 gate). A calibration artifact may recompute and override it by the same quantile method |
 | `rollbackEnabled` / `notifyEnabled` | **`false` / `false`** | capability / notification switches. Both default OFF (observe-only) because the calibration measured the lexicon signal's session-level false-trigger rate at 15.9% (α=0.001) / 43.2% (α=0.01) — far above a 5% budget. See "Response policy" below |
 | `pullbackEnabled` / `pullbackMaxPerSession` | **`false`** / `3` | the informational pull-back (L1): advisories near the point of action when an out-of-scope write or an unverified code change is detected. Off by default because its mechanism is verified while its *effect* is not measurable from this corpus (there is no labelable drift in it) |
+| `reanchorEnabled` / `reanchorEvidencePath` | **`false`** / `null` | re-anchoring (L2): puts the first-round Minimal payload back near the point of action. Requires an online-evidence artifact (`verdict: PASS-online`, unexpired, non-synthetic) **and** that L1 already spoke; once per session |
+| `pullbackOutcomePath` | `null` (defaults under the audit dir) | where the per-session pull-back outcome JSONL goes — the input `analyze-pullback-outcomes.mjs` needs before the L2 gate can ever open |
 | `measurementSafe` | `false` | evaluation protection: `true` forces observe-only (both layers), so a measured score cannot be attributed to the plugin |
 | `leanDenyPatterns` | 28 entries | the set hidden while `surfacePhase === 'narrowed'` (`*` prefix wildcards); count is asserted against the source by `tools/check-invariants.mjs` |
 | `rewardAnnotator` | `default` | Layer-4 process reward; pluggable extension point |
@@ -303,6 +305,38 @@ it reminds after a code edit and stays silent after a documentation edit; it fir
 per turn, stops at the session cap, stops after a re-verification, and does nothing at
 all when disabled or when the prompt has no scope clause — plus that the injected text
 contains evidence and exemption and **no** imperative verb.
+
+### Re-anchoring (L2): the strongest action, behind the hardest gate
+
+`reanchorEnabled` (default **`false`**) puts the **first-round Minimal payload back into
+the near-term position** — following the community precedent (dsh-anchored-monitor's L2
+is "reset the payload, byte-identical to the official Minimal preset"), because inventing
+new wording carries a risk the wording-discipline finding already demonstrated.
+
+It is deliberately harder to turn on than the capability layer, because it rewrites what
+the model *reads*:
+
+| Gate | Condition | Visible as |
+|---|---|---|
+| switch | `reanchorEnabled`, default off | `reanchor.gate = 'switch-off'` |
+| **online evidence** | `reanchorEvidencePath` → `verdict: 'PASS-online'`, unexpired, and **not synthetic** | `'evidence-REJECTED'` / `'no-online-evidence'` |
+| evaluation protection | `measurementSafe` | `'measurement-safe'` |
+| self-demotion | `autoDemote` | `'auto-demoted'` |
+| **light before heavy** | L1 must already have spoken, with new evidence since | `reanchor.suppressed.noPriorPullback` |
+| once per session | — | `reanchor.suppressed.alreadyDone` |
+
+The evidence is not a promise, it is a file produced from real sessions:
+`recordPullbackOutcome()` appends one JSONL line per session that actually received a
+pull-back (only when `pullbackEnabled` is on), recording directly observable proxies —
+`verifiesAfterPullback`, `scopeViolationsAfter`, `claimedUnverifiedAfter` — and
+`tools/analyze-pullback-outcomes.mjs` turns those into the artifact (`< minSamples` ⇒
+`INSUFFICIENT` ⇒ the gate stays shut; improvement ≥ 50% ⇒ `PASS-online`; 14-day expiry).
+Walking that chain end to end surfaced a real risk: the synthetic data used to exercise
+it *opened the gate*, so the loader now rejects `synthetic: true` outright.
+`tools/test-reanchor.mjs` (26 cases) covers all five gates in both directions, and
+invariant **C18** pins — per function — the ordering rule, the once-per-session rule, the
+persona being carried verbatim, the advisory wording, and that the collector is actually
+called, with six deliberately broken copies all failing.
 
 Consequently the shipped `responsePolicy.json` records **verdict `FAIL` with zero
 capability-eligible channels**, and the capability layer stays off. The gate is not
@@ -506,7 +540,7 @@ node tools\export-layer4.mjs `
   and the per-channel snapshot (`channels`, `channelWindows`) with the effective
   `actAlpha` / `notifyAlpha` / `consecutive` and the two live run counters
 - Assertion suites (all must stay green; each is run against `index.js` by path):
-  `tools/check-invariants.mjs` — 17 static invariants (C1–C17), 0 debt;
+  `tools/check-invariants.mjs` — 18 static invariants (C1–C18), 0 debt;
   `tools/test-runtime-lexicon.mjs` — 64 pure-function cases;
   `tools/test-anchor-contract.mjs` — 24 install-and-use / contract cases (incl. the
   "apply() with no config at all" mount and a lossless-JSON walk over live rows);
@@ -521,6 +555,9 @@ node tools\export-layer4.mjs `
   four audited false-positive classes pinned as regressions);
   `tools/test-pullback.mjs` — 28 L1 cases (fires/stays-silent both ways, turn throttle,
   session cap, re-verification clears the reminder, wording has no imperative verb);
+  `tools/test-reanchor.mjs` — 26 L2 cases (all five gates both ways, light-before-heavy,
+  once per session, persona carried verbatim, synthetic evidence rejected, outcome JSONL
+  written only when a pull-back actually happened);
   `tools/test-ledger-semantics.mjs` — 11 hand-computed finalization cases (ground truth
   for the four ledger paths, including the two the real corpus never exercises);
   `tools/test-ledger-parity.mjs` — 14 live-vs-batch parity runs (4 synthetic streams +
