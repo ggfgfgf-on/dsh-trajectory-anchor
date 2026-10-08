@@ -468,8 +468,38 @@ if (existsSync(readmePath)) {
     if (!/rec\.pullback\.lastTurn === turn/.test(codeNoComments)) problems.push('缺少"同一 turn 至多一次"的节流条件（代码里找不到）')
     if (!/rec\.pullback\.count >= CONFIG\.pullbackMaxPerSession/.test(codeNoComments)) problems.push('缺少每会话上限判定（代码里找不到）')
   }
+  // 门槛必须**按原因**分别判定：统一要求"解析出提示锚点"会让自由形态的长会话永远沉默
+  // （实测：用例 ⑬ 的 n=0 就是被这道统一门槛挡住的 ⇒ L1 停在"存在但从不运行"）。
+  {
+    const pd = src.match(/function pullbackDecision\([\s\S]*?\n\}/)
+    if (!pd) problems.push('找不到 pullbackDecision')
+    else {
+      if (!/pending\.reason === 'scope' && !anchorsParsed/.test(pd[0])) {
+        problems.push('pullbackDecision 未按原因分别判门槛（scope 才需要提示范围；unverified 不该要求）')
+      }
+      // 无锚点时的门槛必须**同时**看"行为观测到的验证"，不能只看提示解析结果。
+      // 注意别写成匹配某段旧文本：第一版就是这么写的，于是把 `!anchorsParsed` 这种等价改写放过了
+      // （负向副本 ① 抓到）；这里改成"门槛条件里必须出现 observedVerify"。
+      if (!/if \(!anchorsParsed && !observedVerify\)/.test(pd[0])) {
+        problems.push('pullbackDecision 的无锚点门槛未把 observedVerify 计入（自由会话会永远沉默）')
+      }
+    }
+  }
+  // 验证命令必须有两种来源，且"形态识别"共用 core 的一份实现。
+  // 注意：检查必须落在**调用点**上——第一版只查 `verifyCommandKind` 这个标识符，
+  // 于是 import 行就满足了它（负向副本 ② 抓到），等于没查。
+  if (!/verifyCommandKind\(cmd\)/.test(src)) problems.push('运行时没有真的调用 verifyCommandKind()（验证命令只能来自提示 ⇒ 自由会话沉默）')
+  if (!/import\s*\{[\s\S]*?verifyCommandKind[\s\S]*?\}\s*from\s*'\.\/tools\/task-anchor-core\.mjs'/.test(src)) {
+    problems.push('verifyCommandKind 未从 task-anchor-core 共用（禁止在 index.js 再写一份形态表）')
+  }
+  {
+    const corePath = resolve(dirname(indexPath), 'tools', 'task-anchor-core.mjs')
+    if (!existsSync(corePath) || !/export function verifyCommandKind\(cmd\)/.test(readFileSync(corePath, 'utf8'))) {
+      problems.push('task-anchor-core 里找不到 verifyCommandKind')
+    }
+  }
   if (problems.length) for (const p of problems) fails.push(`C17 ${p}`)
-  else oks.push('C17 L1 拉回接线：默认关、受门控、共用单一锚定实现、措辞为建议式且带豁免、turn 级节流 + 会话上限')
+  else oks.push('C17 L1 拉回接线：默认关、受门控、共用单一锚定实现、门槛按原因分别判、验证命令两种来源、措辞建议式带豁免、turn 级节流 + 会话上限')
 }
 
 // ── C18 硬：L2 重锚定的门禁（最强干预必须最难开）─────────────────────────────

@@ -145,6 +145,41 @@ export function inScope(path, anchors) {
   return false
 }
 
+/**
+ * **从会话自身行为**识别"这是一条验证命令"（不依赖提示里写没写）。
+ *
+ * 为什么需要：L1 的"未验证"信号原先只在提示声明了**范围子句**时才启用——于是自由形态的长会话
+ * （比如这个项目自己的会话，提示里没有"Work only inside X"）永远沉默，观察期攒不到任何数据，
+ * 能力就停在"存在但从不运行"。而"跑过测试/构建"这件事**在会话里就能看见**，不需要提示声明。
+ *
+ * 判据保守（宁可漏检也不误报）：只认明确的测试/构建命令形态。
+ * @returns {string|null} 命中的形态名（便于审计"凭什么认为它是验证"）
+ */
+export function verifyCommandKind(cmd) {
+  if (typeof cmd !== 'string' || cmd.length === 0) return null
+  const c = cmd.toLowerCase()
+  const patterns = [
+    ['pytest', /\bpytest\b/],
+    ['python-unittest', /\bpython[0-9.]*\s+-m\s+(unittest|pytest)\b/],
+    ['python-test-file', /\bpython[0-9.]*\s+[^\s]*test[^\s]*\.py\b/],
+    ['npm-test', /\bnpm\s+(run\s+)?test\b/],
+    ['pnpm-test', /\bpnpm\s+(run\s+)?(test|check|verify)\b/],
+    ['yarn-test', /\byarn\s+(run\s+)?test\b/],
+    ['node-test', /\bnode\s+--test\b/],
+    ['go-test', /\bgo\s+test\b/],
+    ['cargo-test', /\bcargo\s+(test|check)\b/],
+    ['dotnet-test', /\bdotnet\s+test\b/],
+    ['make-test', /\bmake\s+(test|check)\b/],
+    ['gradle-test', /\b(\.\/)?gradlew?\s+\S*test\b/],
+    ['maven-test', /\bmvn\s+\S*test\b/],
+    ['run-tests-script', /\b(run|invoke)[-_ ]?(public[-_ ]?)?tests?\.(py|ps1|sh|js|mjs)\b/],
+    ['vitest-jest', /\b(vitest|jest)\b/],
+    ['tsc-check', /\btsc\b[^|]*--noemit|--noemit[^|]*\btc\b/],
+  ]
+  for (const [name, re] of patterns) if (re.test(c)) return name
+  return null
+}
+
 /** 会改文件的工具（用于区分"越界读"与"越界写"）。 */
 const WRITE_TOOLS = new Set(['edit', 'write', 'str_replace_editor', 'notebook_edit', 'apply_patch'])
 /** 只读工具（读取/搜索）。 */

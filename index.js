@@ -43,6 +43,7 @@ import { isAbsolute, resolve as resolvePath, dirname as dirname2 } from 'node:pa
 // （台账定稿 51 倍偏差、两级连续计数混层），所以本轮一律共用一份实现。
 import {
   parseTaskAnchors, inScope, isIgnorablePath, changeInvalidatesVerification, pathsFromCallStrict, isWriteTool,
+  verifyCommandKind,
 } from './tools/task-anchor-core.mjs'
 
 const DEFAULTS = {
@@ -1997,6 +1998,7 @@ function adopt(agent, doAnchor, channel) {
     // L3 第三层：本会话各通道的行动级触发次数 + 结局代理
     channelActFires: {},
     sawUnknownTool: false,
+    verifyKinds: {},           // 本会话实际跑过的验证命令形态（L1"未验证"信号的第二种来源）
     episodesEndedNaturally: 0,
     pullbackOutcome: null,
     bandHistory: [],        // 审计用：personaRatio 导出的波段序列（离线回放读日志）
@@ -2201,7 +2203,6 @@ function noteHumanMessage(rec, event) {
 function noteTaskSignal(rec, event) {
   try {
     const anchors = rec.taskAnchors
-    if (!anchors || anchors.parsed !== true) return
     const d = event && event.data
     if (!d) return
     const name = typeof d.name === 'string' ? d.name : ''
@@ -2213,9 +2214,20 @@ function noteTaskSignal(rec, event) {
       const m = args.match(/"command"\s*:\s*"([^"]*)"/)
       return m ? m[1] : (typeof d.arguments === 'string' && !args.trim().startsWith('{') ? d.arguments : '')
     })()
-    // ① 验证运行
-    const isVerify = (anchors.verifyTokens || []).some((t) => cmd && cmd.includes(t))
+    // ① 验证运行——两种来源取并集：
+    //    · 提示里声明的验证命令（anchors.verifyTokens，要求范围子句能解析出锚点）
+    //    · **会话自身行为**里识别出的验证命令（verifyCommandKind）
+    //      为什么必须有第二种：只认提示的话，自由形态的长会话（提示里没有"Work only inside X"
+    //      这类子句）永远沉默，L1 就停在"存在但从不运行"，观察期也攒不到数据。
+    //      而"跑过测试/构建"这件事在会话里本来就看得见，不需要提示声明。
+    const fromPrompt = Boolean(anchors) && (anchors.verifyTokens || []).some((t) => cmd && cmd.includes(t))
+    const observedKind = verifyCommandKind(cmd)
+    const isVerify = Boolean(cmd) && (fromPrompt || observedKind !== null)
     if (isVerify) {
+      if (observedKind && !rec.verifyKinds[observedKind]) {
+        rec.verifyKinds[observedKind] = 1
+        logAudit(rec, 'verify-kind', { kind: observedKind, turn, step, via: fromPrompt ? 'prompt+observed' : 'observed', cmd: String(cmd).slice(0, 120) })
+      }
       rec.lastVerifyAt = { turn, step }
       if (rec.codeEditsAfterVerify.length > 0) {
         logAudit(rec, 'verify-run', { turn, step, clearedEdits: rec.codeEditsAfterVerify.length, cmd: String(cmd).slice(0, 160) })
@@ -2229,9 +2241,10 @@ function noteTaskSignal(rec, event) {
     }
     // ② 文件改动（**只把写当信号**：越界读是另一类弱信号，本轮刻意不用）
     if (!isWriteTool(name)) return
+    const scopeKnown = Boolean(anchors && anchors.parsed === true)
     for (const path of pathsFromCallStrict(name, d.arguments)) {
       if (isIgnorablePath(path)) continue
-      if (!inScope(path, anchors)) {
+      if (scopeKnown && !inScope(path, anchors)) {
         const v = { turn, step, tool: name, path, at: Date.now() }
         rec.scopeViolations.push(v)
         if (rec.scopeViolations.length > 50) rec.scopeViolations.shift()
@@ -2242,6 +2255,9 @@ function noteTaskSignal(rec, event) {
       if (changeInvalidatesVerification(path)) {
         rec.codeEditsAfterVerify.push({ turn, step, path, tool: name })
         if (rec.codeEditsAfterVerify.length > 50) rec.codeEditsAfterVerify.shift()
+        // "未验证"只需要"本会话确实验证过"（lastVerifyAt 来自提示**或**行为），
+        // **不要求提示里有范围子句**——范围只约束"越界写"，与"改完没验证"是两件事
+        // （这条区分由用例 ⑬ 守住；否则自由会话永远沉默）。
         if (rec.lastVerifyAt) {
           rec.pendingPullback = { reason: 'unverified', turn, step, path, lastVerifyAt: rec.lastVerifyAt }
         }
@@ -2292,9 +2308,20 @@ export function pullbackText(reason, info, count) {
 function pullbackDecision(rec, turn) {
   if (CONFIG.pullbackEnabled !== true) return null
   const anchors = rec.taskAnchors
-  if (!anchors || anchors.parsed !== true) { rec.pullback.suppressed.noAnchors += 1; return null }
+  const anchorsParsed = Boolean(anchors && anchors.parsed === true)
+  const observedVerify = Object.keys(rec.verifyKinds || {}).length > 0 || rec.lastVerifyAt !== null
+  // 门槛**按原因分别判定**，不再统一要求"解析出提示锚点"：
+  //   · scope      需要提示里的范围（越界只能相对声明来判，不许凭空）
+  //   · unverified 只需要"本会话确实验证过"（提示或行为皆可）
+  // 原先统一要求 parsed ⇒ 自由形态会话永远沉默（实测：用例 ⑬ 的 n=0 正是这道门槛挡的）。
+  if (!anchorsParsed && !observedVerify) {
+    rec.pullback.suppressed.noAnchors += 1
+    rec.pendingPullback = null
+    return null
+  }
   const pending = rec.pendingPullback
   if (!pending) return null
+  if (pending.reason === 'scope' && !anchorsParsed) { rec.pendingPullback = null; return null }
   if (rec.pullback.count >= CONFIG.pullbackMaxPerSession) {
     rec.pullback.suppressed.cap += 1
     rec.pendingPullback = null
@@ -2382,6 +2409,8 @@ function summaryOf(rec) {
       scopeViolations: rec.scopeViolations.length,
       pendingCodeEdits: rec.codeEditsAfterVerify.length,
       lastVerifyAt: rec.lastVerifyAt,
+      verifyKinds: Object.keys(rec.verifyKinds),
+      anchorsMode: (rec.taskAnchors && rec.taskAnchors.parsed === true) ? "prompt" : (Object.keys(rec.verifyKinds).length > 0 ? "observed-verify" : "none"),
       suppressed: { ...rec.pullback.suppressed },
       arm: rec.pullback.arm,
       controls: rec.pullback.controls,

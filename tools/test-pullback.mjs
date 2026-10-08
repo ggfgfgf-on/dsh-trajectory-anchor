@@ -240,6 +240,48 @@ await boot({ pullbackEnabled: true })
   check('⑧ 拉回写入审计尾部（可回溯"说过什么"）', audit.includes('pullback'), JSON.stringify(audit))
 }
 
+// ── ⑬ 自由会话（提示里没有范围/验证子句）也必须能触发"未验证"信号 ──────────────
+// 由来：原先"未验证"依赖提示里的范围子句 ⇒ 自由形态的长会话（这个项目自己的会话就是）
+// 永远沉默，L1 停在"存在但从不运行"，观察期也攒不到数据。
+// 现在验证命令可从**会话自身行为**识别（verifyCommandKind），不要求提示声明；
+// 反方向同样要守：会话里从未跑过验证 ⇒ 一句都不说（不许凭空提醒）。
+await boot({ pullbackEnabled: true })
+{
+  const { agent, session } = adopt('pb-obs-verify')
+  sessionEvent(session, human('帮我修一下这个 bug（提示里没有范围与验证命令）'))
+  sessionEvent(session, call('pwsh', { command: 'pnpm test', workdir: 'D:\\proj' }, 1, 1))
+  sessionEvent(session, call('edit', EDIT_OK, 1, 2))
+  const d = await preStep(agent, 1, 3)
+  const items = pullbacks(d)
+  check('⑬ 无提示子句但会话里跑过测试 ⇒ 改码后仍提醒', items.length === 1, `n=${items.length}`)
+  check('⑬ 文本仍带证据与豁免',
+    items.length === 1 && /turn 1 step 1/.test(textOf(items[0])) && /不算/.test(textOf(items[0])),
+    items.length === 1 ? textOf(items[0]).slice(0, 110) : '')
+  const row = await statusOf('pb-obs-verify')
+  check('⑬ 记录来源为 observed-verify', row.pullback.anchorsMode === 'observed-verify',
+    JSON.stringify({ m: row.pullback.anchorsMode, k: row.pullback.verifyKinds }))
+  check('⑬ 识别出的验证形态被留痕', (row.pullback.verifyKinds || []).includes('pnpm-test'), JSON.stringify(row.pullback.verifyKinds))
+}
+{
+  const { agent, session } = adopt('pb-no-verify')
+  sessionEvent(session, human('随便改改'))
+  sessionEvent(session, call('pwsh', { command: 'Get-ChildItem', workdir: 'D:\\proj' }, 1, 1))
+  sessionEvent(session, call('edit', EDIT_OK, 1, 2))
+  const d = await preStep(agent, 1, 3)
+  check('⑬ 从未跑过验证 ⇒ 一句都不说（不许凭空提醒）', pullbacks(d).length === 0, JSON.stringify(pullbacks(d).map(textOf)))
+  const row = await statusOf('pb-no-verify')
+  check('⑬ 来源记为 none', row.pullback.anchorsMode === 'none' && (row.pullback.verifyKinds || []).length === 0,
+    JSON.stringify({ m: row.pullback.anchorsMode, k: row.pullback.verifyKinds }))
+}
+{
+  const { agent, session } = adopt('pb-no-scope-nowrite')
+  sessionEvent(session, human('随便改改'))
+  sessionEvent(session, call('pwsh', { command: 'pnpm test' }, 1, 1))
+  sessionEvent(session, call('edit', EDIT_OUT, 1, 2))
+  const row = await statusOf('pb-no-scope-nowrite')
+  check('⑬ 无范围子句 ⇒ 越界写不记为违规（范围只能来自提示）', row.pullback.scopeViolations === 0, String(row.pullback.scopeViolations))
+}
+
 console.warn = origWarn
 console.log(`\n${pass} pass, ${fail} fail`)
 if (fail > 0) process.exit(1)
