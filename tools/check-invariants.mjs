@@ -211,6 +211,35 @@ if (existsSync(readmePath)) {
   }
 }
 
+// ── C8 硬：失败标记表在运行时与标定工具之间必须一致 ─────────────────────────
+{
+  const toolPath = resolve(dirname(indexPath), 'tools', 'calibrate-lexicon-v2.mjs')
+  const markers = ['exit code:', 'sandbox: file access denied', 'Traceback (most recent call last)', 'AssertionError', 'FAILED', 'Command failed']
+  if (!existsSync(toolPath)) warns.push(`C8 找不到标定工具（${toolPath}），跳过标记表一致性检查`)
+  else {
+    // 源码里这些标记以**正则字面量**形式出现（转义括号等），所以先剥掉反斜杠再比对，
+    // 否则会把 `Traceback \(most recent call last\)` 误判成"缺失"。
+    const norm = (s) => s.replace(/\\/g, '')
+    const idx = norm(src)
+    const tool = norm(readFileSync(toolPath, 'utf8'))
+    const missIdx = markers.filter((m) => !idx.includes(m))
+    const missTool = markers.filter((m) => !tool.includes(m))
+    if (missIdx.length || missTool.length) {
+      fails.push(`C8 失败标记表不一致：index.js 缺 [${missIdx.join(', ')}]；标定工具缺 [${missTool.join(', ')}]（两处判定必须同源，否则运行时与离线标定会各说各话）`)
+    } else oks.push(`C8 失败标记表一致（${markers.length} 条标记在运行时与标定工具中都存在）`)
+  }
+}
+
+// ── C9 硬：A′ 通道必须带"回合末步"排除（否则 100% 误判）────────────────────
+{
+  const hasExclusion = /midTurnInaction/.test(src)
+  const hasTurnEnd = /'turn\/end'/.test(src)
+  const hasLedgerClose = /function ledgerCloseTurn/.test(src)
+  if (!hasExclusion || !hasTurnEnd || !hasLedgerClose) {
+    fails.push(`C9 中途停手通道缺少"回合末步"排除（midTurnInaction=${hasExclusion} turn/end=${hasTurnEnd} ledgerCloseTurn=${hasLedgerClose}）：实测不分回合末步就是 100% 误判（67 个无工具调用步全部是回合收尾）`)
+  } else oks.push('C9 A′ 通道带回合末步排除（下一步推进 + turn/end 双判）')
+}
+
 // ── 输出 ────────────────────────────────────────────────────────────────
 for (const s of oks) console.log(`  OK    ${s}`)
 for (const s of debts) console.log(`  DEBT  ${s}`)

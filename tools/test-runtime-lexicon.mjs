@@ -82,7 +82,7 @@ eq('pd: 能力层关 → 只通知', pd({ rollbackEnabled: false }).level + '/' 
 eq('pd: 双关（默认）→ 只观察不动手', pd({ rollbackEnabled: false, notifyEnabled: false }).action + '/' + pd({ rollbackEnabled: false, notifyEnabled: false }).reason, 'none/observe-only')
 eq('pd: 弱偏离（act<p≤notify）→ watch+通知', pd({ p: 0.03 }).level + '/' + pd({ p: 0.03 }).action, 'watch/notice')
 eq('pd: 无偏离 → stable', pd({ p: 0.6 }).level + '/' + pd({ p: 0.6 }).reason, 'stable/within-reference')
-eq('pd: 无观测 → stable', pd({ p: null }).level + '/' + pd({ p: null }).action + '/' + pd({ p: null }).reason, 'stable/none/no-observation')
+eq('pd: 无观测（连检验窗都没有，refLen<1）→ stable', pd({ p: null, refLen: 0 }).level + '/' + pd({ p: null, refLen: 0 }).action + '/' + pd({ p: null, refLen: 0 }).reason, 'stable/none/no-observation')
 
 // lexiconDegenerate：正桶一次都没命中 = 该会话的词典退化（能力层闸门）
 eq('deg: 观测够且正桶 0 命中 → 退化', mod.lexiconDegenerate(0, 20, 12), 'positive-bucket-never-hit')
@@ -94,6 +94,41 @@ const TT = (...names) => names.map((n) => ({ name: n }))
 eq('surface: narrowed 摘掉命中模式的工具', mod.surfaceForPhase('narrowed', TT('pwsh', 'browser_x', 'todo_write'), ['browser_*', 'todo_write']).length, 1)
 eq('surface: stable 原样返回', mod.surfaceForPhase('stable', TT('pwsh', 'browser_x'), ['browser_*']).length, 2)
 eq('surface: 空模式表不动手', mod.surfaceForPhase('narrowed', TT('pwsh'), []).length, 1)
+
+// ── B1 二值通道：精确二项检验（Jeffreys 伪计数）────────────────────────────
+// 数值示例（代码注释里给的）：参考 20 步全干净、窗 3、命中 2 → p̂=0.5/21=0.0238 → p≈0.0016
+const blp = (o, m, rh, rl) => mod.binomialLowerP(o, m, rh, rl)
+eq('bin: 参考 20 步全干净 + 窗3命中2 → p≈0.0016', Math.abs(blp(2, 3, 0, 20) - 0.0016) < 0.0008, true)
+eq('bin: 同条件下命中 1 → 不够显著', blp(1, 3, 0, 20) > 0.05, true)
+eq('bin: 命中 3 → 比命中 2 更小', blp(3, 3, 0, 20) < blp(2, 3, 0, 20), true)
+eq('bin: 参考里全是命中 → 不算偏离（p≈1）', blp(3, 3, 20, 20) > 0.9, true)
+eq('bin: 样本不足（refLen=0）→ p=1（无证据）', blp(2, 3, 0, 0), 1)
+eq('bin: 窗长为 0 → p=1', blp(1, 0, 0, 20), 1)
+eq('bin: 观测超过窗长时按窗长截断', blp(9, 3, 0, 20), blp(3, 3, 0, 20), true)
+
+// ── B1 多通道聚合：OR 入口 + 能力层闸门 ────────────────────────────────────
+const ec = (o) => mod.evaluateChannels(Object.assign({
+  perChannel: [], refMinSteps: 12, actAlpha: 0.01, notifyAlpha: 0.05,
+  rollbackEnabled: true, notifyEnabled: true, budgetExhausted: false,
+}, o))
+const chan = (name, p, extra = {}) => Object.assign({ name, p, refLen: 30, refMinSteps: 12, capabilityEligible: true }, extra)
+eq('聚合: 无通道命中 → stable', ec({ perChannel: [chan('inaction', 0.7)] }).level, 'stable')
+eq('聚合: 弱偏离 → watch/notice', ec({ perChannel: [chan('inaction', 0.03)] }).level + '/' + ec({ perChannel: [chan('inaction', 0.03)] }).action, 'watch/notice')
+eq('聚合: 强偏离+有资格 → narrow', ec({ perChannel: [chan('inaction', 0.001)] }).action, 'narrow')
+eq('聚合: 强偏离但无资格 → 只通知',
+  ec({ perChannel: [chan('failure', 0.001, { capabilityEligible: false })] }).action + '/' + ec({ perChannel: [chan('failure', 0.001, { capabilityEligible: false })] }).reason,
+  'notice/channel-not-eligible')
+eq('聚合: 无资格通道带 blockedBy → 用 blockedBy 作原因',
+  ec({ perChannel: [chan('lexicon', 0.001, { capabilityEligible: false, blockedBy: 'lexicon-degenerate' })] }).reason, 'lexicon-degenerate')
+eq('聚合: **OR 入口**——一条有资格即可 narrow（另一条无资格不拖后腿）',
+  ec({ perChannel: [chan('failure', 0.0005, { capabilityEligible: false }), chan('inaction', 0.005)] }).action, 'narrow')
+eq('聚合: 参考不足的通道被忽略', ec({ perChannel: [chan('inaction', 0.0001, { refLen: 3, refMinSteps: 12 })] }).reason, 'insufficient-reference')
+eq('聚合: 连检验窗都没有 → no-observation',
+  ec({ perChannel: [{ name: 'inaction', p: null, refLen: 0, refMinSteps: 12, capabilityEligible: true }] }).reason, 'no-observation')
+eq('聚合: 能力预算耗尽 → 只通知',
+  ec({ perChannel: [chan('inaction', 0.001)], budgetExhausted: true }).action + '/' + ec({ perChannel: [chan('inaction', 0.001)], budgetExhausted: true }).reason,
+  'notice/capability-budget-exhausted')
+eq('聚合: 总开关关 → 只观察', ec({ perChannel: [chan('inaction', 0.001)], rollbackEnabled: false, notifyEnabled: false }).action, 'none')
 
 console.log(`\n${pass} pass, ${fail} fail`)
 if (fail > 0) process.exit(1)

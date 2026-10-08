@@ -111,7 +111,7 @@ await boot({ rollbackEnabled: true, notifyEnabled: true })
 }
 
 // ── 场景 B：偏离触发 → 收窄 + 组装期派生 + notice ─────────────────────────
-await boot({ rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 3 })
+await boot({ rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 3, responseChannels: { lexicon: { capabilityEligible: true } } })
 {
   const { session } = await adoptAndLift('sess-B')
   for (let i = 0; i < 16; i++) sessionEvent(session, text('We will run the full build and verify each artifact carefully.'))
@@ -180,7 +180,7 @@ await boot({ rollbackEnabled: true, notifyEnabled: true })
 }
 
 // ── 场景 E：轨迹恢复 → 回到 stable ───────────────────────────────────────
-await boot({ rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 50 })
+await boot({ rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 50, responseChannels: { lexicon: { capabilityEligible: true } } })
 {
   const { session } = await adoptAndLift('sess-E')
   for (let i = 0; i < 16; i++) sessionEvent(session, text('We will run the full build and verify each artifact carefully.'))
@@ -191,6 +191,91 @@ await boot({ rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 50 })
   const recovered = await summaryOf('sess-E')
   check('E: 轨迹恢复 → 自动回到 stable（"归还"无调用）',
     recovered.surfacePhase === 'stable' && recovered.narrowedNow === false, `${recovered.surfacePhase}/${recovered.policy}`)
+}
+
+// ── B1 行为通道 ──────────────────────────────────────────────────────────
+// 事件构造器（带 turn/step）
+const msgAt = (turn, step, s) => ({ type: 'assistant/message', data: { turn, step, message: { content: [{ type: 'reasoning', text: s }] } } })
+const callAt = (turn, step, name, args) => ({ type: 'tool/call', data: { turn, step, name, arguments: args } })
+const resultAt = (turn, step, out) => ({ type: 'tool/result', data: { turn, step, message: { content: [{ type: 'tool-result', content: [{ type: 'text', text: out }] }] } } })
+const turnEndAt = (turn) => ({ type: 'turn/end', data: { turn } })
+const OK_TEXT = 'We will inspect the repository and verify each artifact carefully.'
+
+/** 造 n 个"有工具调用"的干净步（同回合）。 */
+function cleanSteps(session, turn, from, to) {
+  for (let i = from; i <= to; i++) {
+    sessionEvent(session, callAt(turn, i, 'pwsh', `cmd-${i}`))
+    sessionEvent(session, msgAt(turn, i, OK_TEXT))
+  }
+}
+
+// ── 场景 H：A′ 中途停手（有资格）→ 收窄；且 turn/end 把末步回落为合法收尾 ──
+await boot({ rollbackEnabled: true, notifyEnabled: true, responseChannels: { inaction: { capabilityEligible: true } } })
+{
+  const { session } = await adoptAndLift('sess-H')
+  cleanSteps(session, 1, 1, 24)
+  for (let i = 25; i <= 28; i++) sessionEvent(session, msgAt(1, i, OK_TEXT))   // 无工具调用，但回合仍在继续
+  const row = await summaryOf('sess-H')
+  check('H: A′（中途停手）→ 通道 p 很小', typeof row.channels?.find((c) => c.name === 'inaction')?.p === 'number'
+    && row.channels.find((c) => c.name === 'inaction').p <= 0.01,
+    JSON.stringify(row.channels?.find((c) => c.name === 'inaction')))
+  check('H: 命中通道被记录且驱动了收窄',
+    row.policyChannel === 'inaction' && row.narrowedNow === true, `${row.policyChannel}/${row.surfacePhase}`)
+  // C9：回合结束把"最后一格"回落为合法收尾（不是停手）——检验窗随之后移一格，
+  // 停手命中数应从 3 降到 2（末步被排除）。用实时窗口字段（channels 是上次判定的快照）。
+  const beforeHits = row.channelWindows.inaction.observed
+  sessionEvent(session, turnEndAt(1))
+  const after = await summaryOf('sess-H')
+  const afterHits = after.channelWindows.inaction.observed
+  check('H: turn/end 把末步排除出"停手"（窗口命中 3 → 2）',
+    beforeHits === 3 && afterHits === 2, `${beforeHits} → ${afterHits}`)
+}
+
+// ── 场景 H2：只有"回合末步"没有工具调用 → 永不判为停手（C9 反向）──────────
+await boot({ rollbackEnabled: true, notifyEnabled: true, responseChannels: { inaction: { capabilityEligible: true } } })
+{
+  const { session } = await adoptAndLift('sess-H2')
+  cleanSteps(session, 2, 1, 24)
+  sessionEvent(session, msgAt(2, 25, OK_TEXT))   // 无工具调用
+  sessionEvent(session, turnEndAt(2))            // 但回合就此结束 ⇒ 合法收尾
+  const row = await summaryOf('sess-H2')
+  const ch = row.channels?.find((c) => c.name === 'inaction')
+  check('H2: 回合末步的"无工具调用"不计入停手命中', ch?.observed === 0, JSON.stringify(ch))
+  check('H2: 因此不收窄', row.narrowedNow === false, String(row.surfacePhase))
+}
+
+// ── 场景 I：C 重复调用（有资格）→ 收窄 ─────────────────────────────────
+await boot({ rollbackEnabled: true, notifyEnabled: true, responseChannels: { repetition: { capabilityEligible: true } } })
+{
+  const { session } = await adoptAndLift('sess-I')
+  cleanSteps(session, 1, 1, 24)
+  for (let i = 25; i <= 27; i++) {
+    sessionEvent(session, callAt(1, i, 'pwsh', 'same-command'))
+    sessionEvent(session, callAt(1, i, 'pwsh', 'same-command'))   // 同工具同参第二次
+    sessionEvent(session, msgAt(1, i, OK_TEXT))
+  }
+  const row = await summaryOf('sess-I')
+  check('I: C（重复调用）被识别', row.channels?.find((c) => c.name === 'repetition')?.observed >= 2,
+    JSON.stringify(row.channels?.find((c) => c.name === 'repetition')))
+  check('I: 命中通道为 repetition 且驱动收窄',
+    row.policyChannel === 'repetition' && row.narrowedNow === true, `${row.policyChannel}/${row.surfacePhase}`)
+}
+
+// ── 场景 J：B 工具失败 → 只能通知，不得驱动能力层（D1 分层）─────────────
+await boot({ rollbackEnabled: true, notifyEnabled: true })
+{
+  const { session } = await adoptAndLift('sess-J')
+  cleanSteps(session, 1, 1, 24)
+  for (let i = 25; i <= 27; i++) {
+    sessionEvent(session, callAt(1, i, 'pwsh', `cmd-${i}`))
+    sessionEvent(session, resultAt(1, i, '[exit code: 1] Command failed'))
+    sessionEvent(session, msgAt(1, i, OK_TEXT))
+  }
+  const row = await summaryOf('sess-J')
+  const ch = row.channels?.find((c) => c.name === 'failure')
+  check('J: B（工具失败）被识别且 p 很小', typeof ch?.p === 'number' && ch.p <= 0.01, JSON.stringify(ch))
+  check('J: 但该通道无能力层资格 → 只通知，工具面保持全量',
+    row.policyAction !== 'narrow' && row.surfacePhase === 'stable', `${row.policyAction}/${row.policyReason}`)
 }
 
 console.log(`\n${pass} pass, ${fail} fail`)

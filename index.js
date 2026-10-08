@@ -74,10 +74,23 @@ const DEFAULTS = {
   // 因此"根据全局语料解一对 (K,k)"在该信号上无解（K 拉到 32 仍有 8% 误进）。
   // 新做法：拿**本会话自己的历史**当零假设，检验当前窗是否异常偏低（分布无关的
   // 秩检验），预算直接落在会话内；离线语料只用来回答"该信号有没有判别力"。
-  refMinSteps: 12,      // 参考段最少步数；不足则不做任何动作（只记审计）
-  testWindow: 4,        // 检验窗长度
+  refMinSteps: 12,      // 参考段最少步数（全局默认；每通道可在 responseChannels 覆盖）
+  testWindow: 4,        // 检验窗长度（全局默认；每通道可覆盖）
   notifyAlpha: 0.05,    // 通知预算（p ≤ 该值 → 通知，不动能力）
-  actAlpha: 0.01,       // 能力层预算（更严；还需通过词典非退化闸门）
+  actAlpha: 0.01,       // 能力层预算（更严；还需通道有资格 + 开关打开）
+  // ── 行为通道（B1）────────────────────────────────────────────────────────
+  // 为什么加：词表信号实测无判别力（会话级误触发 15.9%–43.2%，预算 5%）；行为通道
+  //   的实测空转侧：A′ 中途停手 0/26 会话、C 重复调用 0/26、B 工具失败 12/26（46%）。
+  //   → A′/C 够格驱动能力层，B 只做通知（见 docs/community-reference-matrix.md）。
+  // A′ 的定义**必须**带"回合未结束"硬条件：实测 67 个"无工具调用"步 100% 是回合末步
+  //   （代理干完活回答了），不分回合末步就是 100% 误判。
+  // capabilityEligible 默认全 false：由标定件（responsePolicy.json）按预算翻转。
+  responseChannels: {
+    inaction: { enabled: true, refMinSteps: 20, testWindow: 3, capabilityEligible: false },
+    repetition: { enabled: true, refMinSteps: 20, testWindow: 3, window: 5, minRepeats: 2, capabilityEligible: false },
+    failure: { enabled: true, refMinSteps: 20, testWindow: 3, capabilityEligible: false },
+    lexicon: { enabled: true, refMinSteps: 12, testWindow: 4, capabilityEligible: false },
+  },
   // P6 不变量：收窄态的步数硬上限（退出条件必然可达）。0 = 关闭该上限（不推荐）。
   // 到顶后本漂移片段内禁止再次收窄，直到检验不再触发（片段结束）才复位。
   // 取值来源（不是拍脑袋）：45 个历史会话 / 3299 步关上限回放得到的自然片段长度
@@ -573,31 +586,128 @@ function erf(x) {
   return sign * y
 }
 
+/** 二项分布对数概率 ln C(n,k) + k·ln p + (n−k)·ln(1−p)，避免下溢。 */
+function binomLogPmf(k, n, p) {
+  if (k < 0 || k > n) return -Infinity
+  if (p <= 0) return k === 0 ? 0 : -Infinity
+  if (p >= 1) return k === n ? 0 : -Infinity
+  let logC = 0
+  for (let i = 1; i <= k; i++) logC += Math.log(n - k + i) - Math.log(i)
+  return logC + k * Math.log(p) + (n - k) * Math.log1p(-p)
+}
+
 /**
- * 行动分档（纯函数，可单测）。返回两个正交维度：
- *   level  = 状态语义：'stable'（回到参考内，片段结束）| 'watch'（弱偏离，不动能力）
- *            | 'narrowed'（强偏离，需过能力层闸门）
- *   action = 实际动作：'none' | 'notice'（只审计，不改能力面）| 'narrow'（派生收窄）
- * 分开的理由：状态是否结束只能由证据决定（p 回到参考内），而"要不要动手"还要过开关
- * 与闸门——混在一起会导致"闸门拦截 → 片段被判结束 → 下一步立刻重新收窄"的抖动。
+ * 二值通道的单侧精确二项检验（会话内自参考；纯函数，可单测）。
+ *
+ * 与词表通道的曼-惠特尼检验是同一件事的两种测量标度：都拿**本会话自己的历史**
+ * 当零假设，检验"当前窗是否异常"；区别只是标度是连续值 vs 二值命中。
+ *
+ * pHat 用 Jeffreys 伪计数（a=0.5）估计：否则"历史 0 命中 → p̂=0 → 任何一次命中
+ * 都无限显著"。数值示例（参考 20 步全干净、窗 3、命中 2）：p̂=0.0238 → p≈0.0016。
+ *
+ * @returns 上侧尾概率 P(Binom(m, p̂) ≥ observed)，[0,1]；样本不足返回 1（无证据）。
  */
+export function binomialLowerP(observed, m, refHits, refLen, pseudo = 0.5) {
+  if (!Number.isFinite(observed) || !Number.isFinite(m) || m <= 0) return 1
+  if (!Number.isFinite(refHits) || !Number.isFinite(refLen) || refLen <= 0) return 1
+  const pHat = (refHits + pseudo) / (refLen + 2 * pseudo)
+  const k0 = Math.max(0, Math.min(m, Math.round(observed)))
+  let logTail = -Infinity
+  for (let k = k0; k <= m; k++) {
+    const lp = binomLogPmf(k, m, pHat)
+    if (lp === -Infinity) continue
+    logTail = logTail === -Infinity ? lp : logAdd(logTail, lp)
+  }
+  if (logTail === -Infinity) return 1
+  return Math.min(1, Math.max(0, Math.exp(logTail)))
+}
+
+/** log(exp(a)+exp(b))，数值稳定。 */
+function logAdd(a, b) {
+  const hi = a > b ? a : b
+  const lo = a > b ? b : a
+  return hi + Math.log1p(Math.exp(lo - hi))
+}
+
+/**
+ * 多通道聚合（纯函数，可单测）——**唯一的决策入口**。
+ *
+ * 每个通道各自过会话内自参考检验，得到 p 值与自己的参考长度；聚合规则：
+ *   ① 所有通道都不可用（连检验窗/参考段都不够）→ stable + 两档"证据不足"原因（留痕）；
+ *   ② 有通道 p ≤ actAlpha（强偏离）→ 状态语义 narrowed；**动作**还要过闸门：
+ *        能力开关关 / 通道无资格（capabilityEligible=false，如退化词典或未过标定）
+ *        / 能力预算耗尽 → 只通知（或只审计）；全部通过才 narrow；
+ *   ③ 只有 p ≤ notifyAlpha（弱偏离）→ watch + 通知/审计。
+ * 入口用 **OR**（任一通道成立即可），不做跨通道"与"——"与"会继承每个通道的盲区。
+ */
+export function evaluateChannels(input) {
+  const chans = Array.isArray(input.perChannel) ? input.perChannel : []
+  const usable = []
+  let maxRefLen = 0
+  let anyWindow = false
+  for (const c of chans) {
+    if (typeof c.refLen === 'number') maxRefLen = Math.max(maxRefLen, c.refLen)
+    if (typeof c.refLen === 'number' && c.refLen >= 1) anyWindow = true
+    if (Number.isFinite(c.p) && typeof c.refLen === 'number' && c.refLen >= (c.refMinSteps ?? input.refMinSteps)) {
+      usable.push(c)
+    }
+  }
+  const none = { channel: null, p: null, perChannel: chans.map((c) => ({ name: c.name, p: Number.isFinite(c.p) ? round2(c.p) : null })) }
+  if (usable.length === 0) {
+    return {
+      ...none,
+      level: 'stable',
+      action: 'none',
+      reason: anyWindow ? 'insufficient-reference' : 'no-observation',
+    }
+  }
+  const byP = usable.slice().sort((a, b) => a.p - b.p)
+  const strong = byP.filter((c) => c.p <= input.actAlpha)
+  const weak = byP.filter((c) => c.p <= input.notifyAlpha)
+  const notice = input.notifyEnabled === true ? 'notice' : 'none'
+  if (strong.length > 0) {
+    // OR 入口的正确语义：**任一"有资格"的通道够强即可收窄**。
+    // 不能只看 p 最小的那条——否则一条无资格通道（p 更小）会挡住另一条有资格通道
+    // 本该成立的收窄（这条语义错误是被回归用例 H/I/J 里的 "OR 入口" 用例抓出来的）。
+    const strongEligible = strong.filter((c) => c.capabilityEligible === true)
+    const pick = strongEligible.length > 0 ? strongEligible[0] : strong[0]
+    if (input.rollbackEnabled !== true) {
+      return { ...none, level: 'narrowed', action: notice, reason: input.notifyEnabled === true ? 'capability-disabled' : 'observe-only', channel: pick.name, p: round2(pick.p) }
+    }
+    if (strongEligible.length === 0) {
+      return { ...none, level: 'narrowed', action: notice, reason: pick.blockedBy || 'channel-not-eligible', channel: pick.name, p: round2(pick.p) }
+    }
+    if (input.budgetExhausted === true) {
+      return { ...none, level: 'narrowed', action: notice, reason: 'capability-budget-exhausted', channel: pick.name, p: round2(pick.p) }
+    }
+    return { ...none, level: 'narrowed', action: 'narrow', reason: 'deviation', channel: pick.name, p: round2(pick.p) }
+  }
+  if (weak.length > 0) {
+    const pick = weak[0]
+    return { ...none, level: 'watch', action: notice, reason: input.notifyEnabled === true ? 'deviation-weak' : 'observe-only', channel: pick.name, p: round2(pick.p) }
+  }
+  return { ...none, level: 'stable', action: 'none', reason: 'within-reference' }
+}
+
+/** 兼容 façade：单通道（词表）调用 evaluateChannels。保留给既有调用方与回归用例。 */
 export function policyDecision(input) {
-  const { p, refLen, refMinSteps, notifyAlpha, actAlpha, degenerate, budgetExhausted, rollbackEnabled, notifyEnabled } = input
-  if (!Number.isFinite(p)) return { level: 'stable', action: 'none', reason: 'no-observation' }
-  if (refLen < refMinSteps) return { level: 'stable', action: 'none', reason: 'insufficient-reference' }
-  if (p > notifyAlpha) return { level: 'stable', action: 'none', reason: 'within-reference' }
-  const notice = notifyEnabled === true ? 'notice' : 'none'
-  if (p > actAlpha) {
-    return { level: 'watch', action: notice, reason: notifyEnabled === true ? 'deviation-weak' : 'observe-only' }
-  }
-  // 强偏离：能力层闸门（任何一个不过 → 只通知/只审计，但仍保留 narrowed 状态语义）
-  if (rollbackEnabled !== true) {
-    const bothOff = notifyEnabled !== true
-    return { level: 'narrowed', action: notice, reason: bothOff ? 'observe-only' : 'capability-disabled' }
-  }
-  if (degenerate) return { level: 'narrowed', action: notice, reason: 'lexicon-degenerate' }
-  if (budgetExhausted) return { level: 'narrowed', action: notice, reason: 'capability-budget-exhausted' }
-  return { level: 'narrowed', action: 'narrow', reason: 'deviation' }
+  const r = evaluateChannels({
+    perChannel: [{
+      name: 'lexicon',
+      p: input.p,
+      refLen: input.refLen,
+      refMinSteps: input.refMinSteps,
+      capabilityEligible: input.degenerate !== true,
+      blockedBy: input.degenerate === true ? 'lexicon-degenerate' : undefined,
+    }],
+    refMinSteps: input.refMinSteps,
+    actAlpha: input.actAlpha,
+    notifyAlpha: input.notifyAlpha,
+    rollbackEnabled: input.rollbackEnabled,
+    notifyEnabled: input.notifyEnabled,
+    budgetExhausted: input.budgetExhausted,
+  })
+  return { level: r.level, action: r.action, reason: r.reason }
 }
 
 /** 词典退化判定（纯函数）：本会话已有足够观测，但正桶一次都没命中。 */
@@ -684,29 +794,32 @@ function notePolicySkipped(rec, reason) {
  *   ② 收窄满 maxDriftSteps → 能力预算耗尽（本片段内不再收窄，只通知）。
  */
 function stateMachine(rec, agent) {
-  const hist = rec.ratioHistory
-  const refLen = hist.length - CONFIG.testWindow
-  let p = null
-  if (refLen >= 1) {
-    const test = hist.slice(hist.length - CONFIG.testWindow)
-    const reference = hist.slice(0, hist.length - CONFIG.testWindow)
-    p = mannWhitneyLowerP(test, reference)
-  }
-  const decision = policyDecision({
-    p,
-    refLen,
+  // 多通道：词表（曼-惠特尼，会话内自参考）+ 行为（中途停手 / 重复 / 失败，二值精确二项）。
+  // 入口是 OR——任一通道成立即可；不做跨通道"与"（"与"会继承每个通道的盲区）。
+  const perChannel = channelTests(rec)
+  const decision = evaluateChannels({
+    perChannel,
     refMinSteps: CONFIG.refMinSteps,
     notifyAlpha: CONFIG.notifyAlpha,
     actAlpha: CONFIG.actAlpha,
-    degenerate: Boolean(rec.lexiconDegenerate),
     budgetExhausted: Boolean(rec.capabilityBudgetExhausted),
     rollbackEnabled: Boolean(CONFIG.rollbackEnabled),
     notifyEnabled: Boolean(CONFIG.notifyEnabled),
   })
+  rec.channels = perChannel.map((c) => ({
+    name: c.name,
+    p: Number.isFinite(c.p) ? round2(c.p) : null,
+    observed: c.observed,
+    window: c.window,
+    refLen: c.refLen,
+    refHits: c.refHits,
+    eligible: c.capabilityEligible === true,
+  }))
   rec.lastPolicy = decision.level
   rec.lastPolicyAction = decision.action
-  rec.lastPolicyP = p === null ? null : round2(p)
+  rec.lastPolicyP = decision.p === null || decision.p === undefined ? null : round2(decision.p)
   rec.lastPolicyReason = decision.reason
+  rec.lastPolicyChannel = decision.channel || null
   // 两个"证据不足"档都留痕（A 方案）：
   //   no-observation         —— 连检验窗都没有（会话最开始的 testWindow 步）
   //   insufficient-reference —— 检验窗有了，但参考段还不够长
@@ -727,7 +840,7 @@ function stateMachine(rec, agent) {
     return
   }
   if (decision.action === 'narrow') {
-    if (rec.machineState !== 'drift') enterDrift(rec, decision.reason, p)
+    if (rec.machineState !== 'drift') enterDrift(rec, `${decision.reason}:${decision.channel}`, decision.p)
   } else {
     // 偏离存在但不动能力面（弱偏离 / 闸门拦截）：保留状态语义，只写审计
     if (rec.machineState === 'stable') {
@@ -755,6 +868,173 @@ function stateMachine(rec, agent) {
     }
   }
 }
+
+// ---------- 行为通道台账（B1）----------
+// 每步一格，记录该步是否"有工具调用 / 有失败 / 有重复调用"，并在**证据确定后**才定稿：
+//   · 出现同回合更大的 step  ⇒ 上一格定稿为"中途停手 = 无工具调用"
+//   · turn/end 先到         ⇒ 上一格定稿为"合法收尾"（永不判为停手）
+// 历史教训：不分"回合末步"就是 100% 误判——67 个"无工具调用"步实测 100% 是回合收尾。
+
+/** 失败标记表（与 tools/calibrate-lexicon-v2.mjs 的 classifyResult 必须一致，断言 C8 守护）。 */
+const FAILURE_MARKERS = [
+  /\[exit code:\s*[1-9]\d*\]/,
+  /\[sandbox: file access denied/,
+  /Traceback \(most recent call last\)/,
+  /AssertionError/,
+  /\bFAILED\b/,
+  /Command failed/,
+]
+
+/** 工具结果文本（DSH 会话日志形态：data.message.content[] → tool-result 文本块）。 */
+function toolResultText(event) {
+  try {
+    const blocks = event && event.data && event.data.message && event.data.message.content
+    if (!Array.isArray(blocks)) return ''
+    const parts = []
+    for (const b of blocks) {
+      if (b && b.type === 'tool-result' && Array.isArray(b.content)) {
+        for (const c of b.content) if (c && c.type === 'text' && typeof c.text === 'string') parts.push(c.text)
+      }
+    }
+    return parts.join('\n')
+  } catch (e) {
+    return ''
+  }
+}
+
+/** 参数归一化：空白折叠 + 路径分隔符统一（宁可漏检，不做语义等价）。 */
+function normalizeArgs(args) {
+  const s = typeof args === 'string' ? args : JSON.stringify(args ?? '')
+  return s.replace(/\s+/g, ' ').replace(/\\/g, '/').trim().slice(0, 300)
+}
+
+function ledgerCell(rec, turn, step) {
+  if (typeof turn !== 'number' || typeof step !== 'number') return null
+  let cell = rec.ledger.find((c) => c.turn === turn && c.step === step)
+  if (!cell) {
+    cell = { turn, step, tools: 0, failures: 0, repeated: false, finalized: false, midTurnInaction: null }
+    rec.ledger.push(cell)
+    if (rec.ledger.length > CONFIG.historyCap) rec.ledger.shift()
+  }
+  return cell
+}
+
+function ledgerNoteToolCall(rec, turn, step, name, args) {
+  const cell = ledgerCell(rec, turn, step)
+  if (!cell) return
+  cell.tools += 1
+  if (typeof name !== 'string' || name.length === 0) return
+  const sig = `${name}\u0000${normalizeArgs(args)}`
+  rec.recentCalls.push({ sig, turn, step })
+  if (rec.recentCalls.length > 40) rec.recentCalls.shift()
+  const window = (CONFIG.responseChannels.repetition && CONFIG.responseChannels.repetition.window) || 5
+  const minRepeats = (CONFIG.responseChannels.repetition && CONFIG.responseChannels.repetition.minRepeats) || 2
+  const distinct = []
+  let hits = 0
+  for (let i = rec.recentCalls.length - 1; i >= 0; i--) {
+    const c = rec.recentCalls[i]
+    if (c.turn === turn && c.step === step && c.sig === sig && distinct.length > 0) { hits += 1; continue }
+    const key = `${c.turn}#${c.step}`
+    if (!distinct.includes(key)) {
+      if (distinct.length >= window) break
+      distinct.push(key)
+    }
+    if (c.sig === sig) hits += 1
+  }
+  if (hits >= minRepeats) cell.repeated = true
+}
+
+function ledgerNoteToolResult(rec, turn, step, text) {
+  const cell = ledgerCell(rec, turn, step)
+  if (!cell || typeof text !== 'string' || text.length === 0) return
+  if (FAILURE_MARKERS.some((re) => re.test(text))) cell.failures += 1
+}
+
+function ledgerFinalize(rec, cell, midTurnInaction) {
+  if (!cell || cell.finalized) return
+  cell.finalized = true
+  cell.midTurnInaction = midTurnInaction
+}
+
+/** 新步到来：把同回合、更早且未定稿的格定稿（它们后面还有步 ⇒ 不是回合末步）。 */
+function ledgerAdvanceStep(rec, turn, step) {
+  if (typeof turn !== 'number' || typeof step !== 'number') return
+  for (const c of rec.ledger) {
+    if (c.finalized) continue
+    if (c.turn === turn && c.step < step) ledgerFinalize(rec, c, c.tools === 0)
+    else if (c.turn < turn) ledgerFinalize(rec, c, false)   // 跨回合的旧格：按合法收尾处理
+  }
+}
+
+/** 回合结束：该回合最后一格定稿为"合法收尾"（永不判为中途停手）。 */
+function ledgerCloseTurn(rec, turn) {
+  if (typeof turn !== 'number') return
+  for (const c of rec.ledger) {
+    if (!c.finalized && c.turn === turn) ledgerFinalize(rec, c, false)
+  }
+}
+
+/** 通道序列：只取已定稿的格（未定稿的步不参与判定）。 */
+function channelSeries(rec) {
+  const done = rec.ledger.filter((c) => c.finalized)
+  return {
+    inaction: done.map((c) => (c.midTurnInaction === true ? 1 : 0)),
+    repetition: done.map((c) => (c.repeated ? 1 : 0)),
+    failure: done.map((c) => (c.failures > 0 ? 1 : 0)),
+  }
+}
+
+/** 单通道的二值检验输入。 */
+function channelTest(name, series) {
+  const cfg = (CONFIG.responseChannels && CONFIG.responseChannels[name]) || {}
+  if (cfg.enabled === false) return { name, p: null, refLen: 0, refMinSteps: cfg.refMinSteps || CONFIG.refMinSteps, capabilityEligible: false, blockedBy: 'channel-disabled' }
+  const m = cfg.testWindow || CONFIG.testWindow
+  const refLen = series.length - m
+  if (refLen < 1) {
+    return { name, p: null, refLen, refMinSteps: cfg.refMinSteps || CONFIG.refMinSteps, capabilityEligible: cfg.capabilityEligible === true }
+  }
+  const test = series.slice(series.length - m)
+  const reference = series.slice(0, series.length - m)
+  const observed = test.reduce((a, b) => a + b, 0)
+  const refHits = reference.reduce((a, b) => a + b, 0)
+  const p = binomialLowerP(observed, m, refHits, reference.length)
+  return {
+    name,
+    p,
+    refLen: reference.length,
+    refMinSteps: cfg.refMinSteps || CONFIG.refMinSteps,
+    capabilityEligible: cfg.capabilityEligible === true,
+    observed,
+    window: m,
+    refHits,
+  }
+}
+
+/** 全部通道的检验输入（词表通道沿用曼-惠特尼，行为通道用二项）。 */
+function channelTests(rec) {
+  const out = []
+  const lexCfg = (CONFIG.responseChannels && CONFIG.responseChannels.lexicon) || {}
+  if (lexCfg.enabled !== false) {
+    const hist = rec.ratioHistory
+    const m = lexCfg.testWindow || CONFIG.testWindow
+    const refLen = hist.length - m
+    let p = null
+    if (refLen >= 1) p = mannWhitneyLowerP(hist.slice(hist.length - m), hist.slice(0, hist.length - m))
+    out.push({
+      name: 'lexicon',
+      p,
+      refLen,
+      refMinSteps: lexCfg.refMinSteps || CONFIG.refMinSteps,
+      // 词典退化 → 该通道失去能力层资格（不是全局闸门：行为通道不受影响）
+      capabilityEligible: lexCfg.capabilityEligible === true && !rec.lexiconDegenerate,
+      blockedBy: rec.lexiconDegenerate ? 'lexicon-degenerate' : undefined,
+    })
+  }
+  const series = channelSeries(rec)
+  for (const name of ['inaction', 'repetition', 'failure']) out.push(channelTest(name, series[name] || []))
+  return out
+}
+
 
 // ---------- anchoring / lifting / gate / suppression ----------
 
@@ -1026,9 +1306,14 @@ function adopt(agent, doAnchor, channel) {
     lastPolicy: null,
     lastPolicyAction: null,
     lastPolicyP: null,
+    lastPolicyChannel: null,
     lastNoticeReason: null,
     lastPolicyReason: null,
     lastPolicySkip: null,
+    // B1 行为通道台账：每步一格（定稿后才参与判定）+ 近期调用指纹（重复检测）
+    ledger: [],
+    recentCalls: [],
+    channels: null,
     bandHistory: [],        // 审计用：personaRatio 导出的波段序列（离线回放读日志）
     driftEnteredAt: null,
     rollbackDeny: [],
@@ -1091,6 +1376,7 @@ function feedSessionEvent(session, event) {
       rec.toolNames.push(name)
       if (rec.toolNames.length > 50) rec.toolNames.shift()
     }
+    ledgerNoteToolCall(rec, event.data && event.data.turn, event.data && event.data.step, name, event.data && event.data.arguments)
     logAudit(rec, 'tool-call', { name, turn: event.data && event.data.turn, step: event.data && event.data.step })
     if (rec.anchored && !rec.lifted) {
       if (CONFIG.gateEnabled) {
@@ -1102,10 +1388,20 @@ function feedSessionEvent(session, event) {
         lift(rec, 'first-tool-call')
       }
     }
+  } else if (event.type === 'tool/result') {
+    ledgerNoteToolResult(rec, event.data && event.data.turn, event.data && event.data.step, toolResultText(event))
+  } else if (event.type === 'turn/end') {
+    // A′ 的关键排除：回合到此结束 ⇒ 最后一格"无工具调用"是合法收尾，不是停手。
+    ledgerCloseTurn(rec, event.data && event.data.turn)
   } else if (event.type === 'assistant/message') {
     rec.messages += 1
     const turn = event.data && event.data.turn
     const step = event.data && event.data.step
+    // 先为**本步**建格（纯文本步没有工具调用，若不在建格就永远无法被计为"中途停手"），
+    // 再推进：新的一步出现 ⇒ 上一步"没有工具调用"就是回合中途停手。
+    // （若上一步是回合末步，会先被 turn/end 关掉，不会走到这里。这是 A′ 双判的第一判。）
+    ledgerCell(rec, turn, step)
+    ledgerAdvanceStep(rec, turn, step)
     if (typeof turn === 'number') rec.lastTurn = turn
     if (typeof step === 'number') rec.lastStep = step
     const texts = reasoningBlocks(event)
@@ -1142,6 +1438,17 @@ function safeGet(service, id) {
 // ---------- status tool ----------
 
 function summaryOf(rec) {
+  // 行为通道的**实时**窗口（与判定走同一套 channelTest；`channels` 是上次判定时的快照，
+  // 而台账在 turn/end 之后还会被定稿，所以两者会短暂不同——这里把"现在"也暴露出来）。
+  let channelWindows = null
+  try {
+    const live = channelSeries(rec)
+    channelWindows = {}
+    for (const nm of ['inaction', 'repetition', 'failure']) {
+      const t = channelTest(nm, live[nm] || [])
+      channelWindows[nm] = { observed: t.observed ?? null, window: t.window ?? null, refLen: t.refLen, p: Number.isFinite(t.p) ? round2(t.p) : null }
+    }
+  } catch (e) { channelWindows = { error: msg(e) } }
   return {
     sessionId: rec.sessionId,
     self: rec.adoptedSelf,
@@ -1170,8 +1477,12 @@ function summaryOf(rec) {
     capabilityBudgetExhausted: rec.capabilityBudgetExhausted,
     policy: rec.lastPolicy,
     policyAction: rec.lastPolicyAction,
+    policyChannel: rec.lastPolicyChannel,
     policyP: rec.lastPolicyP,
     policyReason: rec.lastPolicyReason,
+    channels: rec.channels,
+    channelWindows,
+    ledgerSize: rec.ledger.length,
     lexiconDegenerate: rec.lexiconDegenerate,
     stepsScored: rec.stepsScored,
     positiveHitSteps: rec.positiveHitSteps,
@@ -1275,6 +1586,26 @@ function mergeConfig(config) {
         noteConfigWarning('invalid inline lexicon (needs positive/negative/neutral buckets); keeping current lexicon')
         continue
       }
+    }
+    if (key === 'responseChannels') {
+      // 嵌套对象**逐通道合并**：只覆盖你写的那条通道，兄弟通道保持默认。
+      // （否则 `responseChannels: {lexicon: {...}}` 会把 inaction/repetition/failure 抹掉，
+      //   表现为"看不见的降级"——这类静默失效正是本项目反复栽的坑。）
+      const incoming = config[key]
+      if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) {
+        noteConfigWarning('invalid responseChannels (needs an object of channel overrides); keeping current channels')
+        continue
+      }
+      const merged = { ...CONFIG.responseChannels }
+      for (const [chName, chCfg] of Object.entries(incoming)) {
+        if (!chCfg || typeof chCfg !== 'object' || Array.isArray(chCfg)) {
+          noteConfigWarning(`invalid responseChannels.${chName} (needs an object); keeping defaults for that channel`)
+          continue
+        }
+        merged[chName] = { ...(CONFIG.responseChannels[chName] || {}), ...chCfg }
+      }
+      CONFIG[key] = merged
+      continue
     }
     CONFIG[key] = config[key]
   }
