@@ -1,78 +1,31 @@
 # dsh-trajectory-anchor bundle patch.
-# One host-plane row over the empty profile root. The plugin resolves every
-# other capability through ctx.get() at event time — no hard dependencies
-# beyond cordis itself.
+#
+# One host-plane row over the profile root. The plugin resolves every other
+# capability through `ctx.get()` at event time — no hard dependencies beyond
+# cordis itself.
+#
+# ── What you get on install, with zero configuration ──────────────────────────
+#   · first-round anchoring (the performance lever):
+#       bootstrap tool surface = bash / str_replace_editor / pwsh (intersected
+#       with what the agent can actually see), Minimal persona, runtime-context
+#       + skill-catalog suppression, promotion gate with maxBootstrapSteps
+#       fallback and an explicit post-promotion maxTokens strip.
+#   · per-step trajectory scoring + append-only audit log:
+#       <workspaceRoot>/.dsh-trajectory-logs/anchor-<agentId>.jsonl
+#   · `anchor_status` — read-only live audit tool.
+#
+# ── What is OFF by default (intentionally) ────────────────────────────────────
+#   · drift response (`rollbackEnabled: false`, `notifyEnabled: false`).
+#     The tool surface is only ever narrowed through an assembly-time *derived*
+#     filter (never a registry mutation), and only when a calibration artifact
+#     passes the false-trigger budget; both switches stay off until then.
+#     See README → "Response policy (P1–P7)" for the measured numbers behind
+#     this default.
+#
+# `config:` is deliberately omitted: a fresh install should inherit the code
+# defaults, so this file cannot drift out of sync with them. Any key you add is
+# validated at mount; an unknown key is loudly warned about and ignored (never
+# silently applied). Every key is listed in the README configuration table.
 - insert:
     - id: trajectory-anchor
       name: '@dsh-ext/trajectory-anchor'
-      config:
-        # --- scoring v2 (lexicon + bands + baseline percentile) ---
-        trajectoryWindowSize: 3
-        ewmaAlpha: 0.4
-        specMax: 0.2
-        reactMin: 0.5
-        baselineMinSamples: 10
-        rollbackPercentile: 25
-        lexicon:
-          positive: { we: 2, "let's": 1.5, "we'll": 1.2, 'we need': 1.2, our: 0.8 }
-          negative: { 'let me': 3 }
-          neutral: { 'i will': 1, "i'll": 1, 'i need': 0.8, check: 0.4, verify: 0.4 }
-        ratioWeights: { alpha: 2, beta: 0.5, gamma: 1.5, epsilon: 1 }
-
-        # --- anchoring (iteration 1-3) ---
-        bootstrapTools: [bash, str_replace_editor, pwsh]
-        # OPT-IN (default off): a cap below the real first-round output
-        # truncates the model's opening plan and kills the turn
-        # (anchored-standard issue #85, reproduced live here).
-        bootstrapMaxTokens: null
-        bootstrapPersona: 'You are a helpful software engineer assistant.'
-        gateEnabled: true
-        maxBootstrapSteps: 5
-        promoteAfterFirstResponse: true
-        suppressContextOnBootstrap: true
-        suppressSkillCatalog: true
-        suppressedSources: [skill-catalog]
-
-        # --- drift rollback ---
-        # Baseline-relative: react band alone is not drift on models whose
-        # baseline IS let-me-heavy; drift requires the current ratio to rank
-        # below rollbackPercentile against the session's own history.
-        rollbackEnabled: true
-        leanDenyPatterns:
-          - vision_*
-          - browser_*
-          - sandbox_*
-          - desktop_*
-          - web_search
-          - workflow
-          - ralph
-          - session_log_scan
-          - session_log_repair
-          - model_knobs
-          - model_balance
-          - subagent
-          - subagent_fork
-          - send_message
-          - interrupt_agent
-          - list_agents
-          - todo_write
-          - plot_function
-          - lean_check
-          - cordis_define
-          - cordis_run
-          - cordis_update_tool
-          - cordis_inspect_query
-          - cordis_inspect_list
-          - cordis_inspect_self
-          - cordis_stop
-          - cordis_undefine
-          - anchor_status
-
-        # --- training-data export (Layer 4) ---
-        exportTrajectoryLogs: true
-        logDir: '.dsh-trajectory-logs'
-        rewardAnnotator: 'default'
-        mineCounterfactualCandidates: true
-
-        # --- perception ---
-        pollMs: 3000

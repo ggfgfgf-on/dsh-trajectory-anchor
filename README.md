@@ -41,6 +41,33 @@ Restart DSH. The plugin mounts on the host plane: it adopts all live agents at s
 (audit-only) and every new agent then goes through the
 **anchor → gate promotion → continuous scoring** lifecycle.
 
+## What you get on install (zero configuration)
+
+The bundle patch shipped with this package inserts the row with **no `config:` block**,
+so a fresh install inherits the code defaults and cannot drift out of sync with them
+(asserted by `tools/check-invariants.mjs` C12).
+
+**Active by default — the performance lever:**
+
+| Mechanism | Default | What it does |
+|---|---|---|
+| first-round anchoring | `bootstrapTools: [bash, str_replace_editor, pwsh]`, `bootstrapPersona` (Minimal), `suppressRuntimeContext()`, `suppressSkillCatalog` | keeps request #1 on the Minimal tool schema + Minimal persona — the condition under which anchoring reproduces |
+| promotion gate | `gateEnabled`, `maxBootstrapSteps: 5`, `promoteAfterFirstResponse` | lifts the bootstrap restrictions and restores context; three independent fallbacks so a session can never be trapped in bootstrap |
+| maxTokens handling | `bootstrapMaxTokens: null` (uncapped) | opt-in only: a cap below the real first-round output truncates the opening plan (issue #85); when enabled it is explicitly stripped after promotion |
+| per-step trajectory scoring + audit log | `exportTrajectoryLogs`, `logDir` | `<workspaceRoot>/.dsh-trajectory-logs/anchor-<agentId>.jsonl`, append-only, chunked |
+| `anchor_status` | read-only tool | live state, lexicon source, policy decision, audit tail |
+
+**Off by default — the repair layer (deliberately):**
+
+| Switch | Default | Why it is off |
+|---|---|---|
+| `rollbackEnabled` | `false` | narrowing the tool surface is the only capability-affecting action; it stays off until a calibration artifact passes the false-trigger budget |
+| `notifyEnabled` | `false` | same signal, same budget — notifications are only useful once the signal discriminates |
+
+Both are **safe off**: with them disabled the plugin observes and audits only, and no
+code path can remove a tool from the registry (asserted by C3, and enumerated: with
+both switches off `policyDecision` can only return `action: 'none'`).
+
 ## Lifecycle
 
 ```
@@ -77,7 +104,7 @@ agent/disposed: RewardAnnotator process reward + trajectory JSONL final archive
 | `specMax` / `reactMin` | `0.2` / `0.5` | persona_ratio band boundaries (spec/mixed/react) |
 | `refMinSteps` / `testWindow` | `12` / `4` | **session-local reference test**: the last `testWindow` observations are compared against the session's own earlier history |
 | `actAlpha` / `notifyAlpha` | `0.01` / `0.05` | budgets for the capability layer / notification layer (one-sided Mann-Whitney p-value thresholds) |
-| `maxDriftSteps` | `12` | hard bound on any narrowed episode — the exit condition that is **provably reachable** |
+| `maxDriftSteps` | `12` | hard bound on any narrowed episode — the exit condition that is **provably reachable**. Derived, not guessed: replaying 45 sessions / 3,299 steps with the bound off gives natural episode lengths p50=5, p75=9, **p90=12**, p95=19, max=22, so 12 = the p90 of what an episode naturally lasts (it truncates 5 of 53 episodes). The value is a *safety bound*; the real budget lever is the false-trigger rate (G1 gate). A calibration artifact may recompute and override it by the same quantile method |
 | `rollbackEnabled` / `notifyEnabled` | **`false` / `false`** | capability / notification switches. Both default OFF (observe-only) because the calibration measured the lexicon signal's session-level false-trigger rate at 15.9% (α=0.001) / 43.2% (α=0.01) — far above a 5% budget. See "Response policy" below |
 | `leanDenyPatterns` | 28 entries | the set hidden while `surfacePhase === 'narrowed'` (`*` prefix wildcards); count is asserted against the source by `tools/check-invariants.mjs` |
 | `rewardAnnotator` | `default` | Layer-4 process reward; pluggable extension point |

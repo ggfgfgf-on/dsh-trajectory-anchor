@@ -143,6 +143,74 @@ if (existsSync(readmePath)) {
   } else oks.push('C7 两个证据不足档都写 policy-skipped（日志从第 1 步起可回溯）')
 }
 
+// ── C10 硬：零墙钟决策（策略节奏只能用观测量）──────────────────────────────
+{
+  const problems = []
+  if (/setTimeout\s*\(|setInterval\s*\(/.test(src)) problems.push('出现 setTimeout/setInterval（策略不得用计时器）')
+  const nowLines = src.split('\n').filter((l) => /Date\.now\(\)/.test(l) && !/^\s*(\/\/|\*)/.test(l))
+  const arithmetic = nowLines.filter((l) => /[<>]=?|Date\.now\(\)\s*[-+]|[-+]\s*Date\.now\(\)/.test(l.replace(/=>/g, '')))
+  for (const l of arithmetic) problems.push(`Date.now() 参与比较/算术：${l.trim().slice(0, 80)}`)
+  const setters = nowLines.filter((l) => !/(t|at|From|At|time)\s*:\s*Date\.now\(\)|=\s*Date\.now\(\),?\s*$/.test(l))
+  for (const l of setters) problems.push(`Date.now() 出现在非时间戳位置：${l.trim().slice(0, 80)}`)
+  if (problems.length) for (const p of problems) fails.push(`C10 ${p}`)
+  else oks.push(`C10 零墙钟决策：无计时器，${nowLines.length} 处 Date.now() 全部只是时间戳`)
+}
+
+// ── C11 硬：决策路径不得读 band（band 只喂审计与离线标定）───────────────────
+{
+  const decisionLines = src.split('\n').filter((l) => {
+    const t = l.trim()
+    if (/^\s*(\/\/|\*)/.test(t)) return false
+    return /rec\.band\b|rec\.personaRatio|rec\.percentile/.test(t)
+  })
+  // 允许的位置：审计载荷、summaryOf 回显、赋值语句、本地计算。
+  // 注意 `rec.band =` 必须带否定前瞻，否则 `rec.band === 'spec'`（比较）会被误当成赋值放过
+  // ——这正是反向验证（故意注入违规）抓出来的漏洞。
+  const ALLOW = new RegExp([
+    'logAudit\\(',
+    'band:', 'personaRatio:', 'percentile:',
+    'summaryOf', 'warnOnce',
+    'rec\\.band\\s*=\\s*[^=]', 'rec\\.personaRatio\\s*=\\s*[^=]', 'rec\\.percentile\\s*=\\s*[^=]',
+    'const band =', 'const percentile =',
+  ].join('|'))
+  const bad = decisionLines.filter((l) => !ALLOW.test(l))
+  if (bad.length) for (const l of bad) fails.push(`C11 决策路径读了 band/personaRatio/percentile：${l.trim().slice(0, 80)}`)
+  else oks.push('C11 决策只依赖会话内参考检验；band/personaRatio/percentile 仅供审计与离线标定')
+}
+
+// ── C12 硬：安装面配置一致性（bundle patch 不得与代码 DEFAULTS 漂移）────────
+{
+  const patchPath = resolve(dirname(indexPath), 'cordis.patch.yml')
+  if (!existsSync(patchPath)) warns.push(`C12 找不到 bundle patch（${patchPath}），跳过安装面检查`)
+  else {
+    const patch = readFileSync(patchPath, 'utf8')
+    const defined = new Set([...(src.match(/const DEFAULTS = \{([\s\S]*?)\n\}/)?.[1] ?? '')
+      .matchAll(/^\s{2}([A-Za-z_][A-Za-z0-9_]*):/gm)].map((m) => m[1]))
+    // 只检查 patch 里 config: 块内的 `key:` 行。块边界按 **config: 自身的缩进** 判定
+    // （不能按固定缩进猜——反向验证里 6 空格的行会被误当成 config 内层）。
+    const declared = new Set()
+    let configIndent = null
+    for (const raw of patch.split('\n')) {
+      const line = raw.replace(/#.*$/, '')
+      if (!line.trim()) continue
+      const indent = line.match(/^\s*/)[0].length
+      const cfg = line.match(/^(\s*)config:\s*$/)
+      if (cfg) { configIndent = cfg[1].length; continue }
+      if (configIndent === null) continue
+      if (indent <= configIndent) { configIndent = null; continue }
+      const m = line.match(/^\s+([A-Za-z_][A-Za-z0-9_]*):/)
+      if (m) declared.add(m[1])
+    }
+    const unknown = [...declared].filter((k) => !defined.has(k))
+    const dangerous = []
+    if (/rollbackEnabled:\s*true/.test(patch)) dangerous.push('rollbackEnabled: true（能力层默认必须关）')
+    if (/notifyEnabled:\s*true/.test(patch)) dangerous.push('notifyEnabled: true（通知层默认必须关）')
+    const problems = [...unknown.map((k) => `patch 声明了 DEFAULTS 里不存在的键 "${k}"（新装会触发响亮告警）`), ...dangerous]
+    if (problems.length) for (const p of problems) fails.push(`C12 安装面：${p}`)
+    else oks.push(`C12 安装面一致：patch 未声明未知键，且未打开任何默认关闭的开关（${declared.size} 个显式键）`)
+  }
+}
+
 // ── 输出 ────────────────────────────────────────────────────────────────
 for (const s of oks) console.log(`  OK    ${s}`)
 for (const s of debts) console.log(`  DEBT  ${s}`)

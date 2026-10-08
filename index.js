@@ -80,6 +80,13 @@ const DEFAULTS = {
   actAlpha: 0.01,       // 能力层预算（更严；还需通过词典非退化闸门）
   // P6 不变量：收窄态的步数硬上限（退出条件必然可达）。0 = 关闭该上限（不推荐）。
   // 到顶后本漂移片段内禁止再次收窄，直到检验不再触发（片段结束）才复位。
+  // 取值来源（不是拍脑袋）：45 个历史会话 / 3299 步关上限回放得到的自然片段长度
+  //   p50=5  p75=9  p90=12  p95=19  p99=22  max=22
+  // → 12 = 自然长度的 p90，即"给证据与它在 90% 情形下自然需要的时间一样长"，
+  //   只截断尾部 5/53 个片段（见 D:\DSHwork\scratch\derive-max-drift-steps.mjs）。
+  // 角色分工：本上限是**安全界**（必须存在、必须可达）；真正的预算杠杆是**误触发率**
+  //   （由 tools/calibrate-response-policy.mjs 的 G1 门禁管）。标定件
+  //   （responsePolicy.json）可按同一分位法重算该值并覆盖此默认。
   maxDriftSteps: 12,
   historyCap: 200,
   leanDenyPatterns: [
@@ -388,7 +395,9 @@ function recompute(rec, agent) {
   const band = bandOf(pr)
   rec.ratioHistory.push(ratio)
   if (rec.ratioHistory.length > CONFIG.historyCap) rec.ratioHistory.shift()
-  // 真实 band 历史（personaRatio 导出的 band，供动态恢复阈值估计 p=P(spec|spec)）
+  // band / personaRatio / percentile：**仅供审计与离线标定**——标定工具
+  // （calibrate-lexicon-v2、calibrate-response-policy）都从轨迹日志读这些字段。
+  // 决策路径一律不得读它们（断言 C11 守护）；漂移判定已改为会话内自参考检验。
   rec.bandHistory.push(band)
   if (rec.bandHistory.length > CONFIG.historyCap) rec.bandHistory.shift()
   const percentile = percentileRank(ratio, rec.ratioHistory)
