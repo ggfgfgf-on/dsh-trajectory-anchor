@@ -299,6 +299,92 @@ await boot({ pullbackEnabled: true })
     JSON.stringify({ k: row.pullback.verifyKinds, m: row.pullback.anchorsMode }))
 }
 
+// ── ⑭ 成功门：工具**没落地**就不算"改了代码/越界写" ──────────────────────────
+// 由来（真实触发）：turn 676 我收到一条提醒说"你在上次验证之后又改了代码（gen-b4-negatives.mjs）"，
+// 但那次 edit **被 harness 拒绝了**（"read the file, then retry"）——一句话都没改。
+// tool/call 只说明"发起了"，落地与否要看 tool/result 的结构化失败标记。
+/** 造一个 tool/result 事件；failed=true 时带上实测里的结构化失败标记。 */
+const toolResult = (name, turn, step, callId, failed, text) => ({
+  type: 'tool/result',
+  data: {
+    turn, step, callId,
+    message: {
+      source: { kind: 'tool', callId },
+      content: [{ type: 'tool-result', toolCallId: callId, content: [{ type: 'text', text: text || (failed ? 'Error: edit requires reading "x" first — read the file, then retry' : 'ok') }], isError: failed === true }],
+    },
+    ...(failed ? { error: { name: 'FsError', code: 'FS_NOT_OBSERVED' } } : {}),
+  },
+})
+const callWithId = (name, args, turn, step, callId) => ({ type: 'tool/call', data: { name, arguments: JSON.stringify(args), turn, step, callId } })
+
+{
+  const { agent, session } = adopt('pb-gate-rejected')
+  sessionEvent(session, human(PROMPT))
+  sessionEvent(session, call('pwsh', VERIFY, 1, 1))             // 先验证过
+  sessionEvent(session, callWithId('edit', EDIT_OK, 1, 2, 'c-rej'))  // 发起一次改码
+  sessionEvent(session, toolResult('edit', 1, 2, 'c-rej', true))     // 结果：被拒（没落地）
+  const d = await preStep(agent, 1, 3)
+  check('⑭ 被拒的 edit 不算"改了代码" ⇒ 一句都不说', pullbacks(d).length === 0, JSON.stringify(pullbacks(d).map(textOf)))
+  const row = await statusOf('pb-gate-rejected')
+  check('⑭ 撤回有痕：pendingCodeEdits 归零 + armRetracted 计数 + 审计留痕',
+    row.pullback.pendingCodeEdits === 0 && row.pullback.armRetracted === 1 && row.auditTail.includes('arm-retracted'),
+    JSON.stringify({ e: row.pullback.pendingCodeEdits, r: row.pullback.armRetracted, t: row.auditTail.slice(-4) }))
+}
+{
+  // 反向对照：同样的序列，但结果是**成功** ⇒ 必须照旧提醒（这道门不许把 L1 说哑）
+  const { agent, session } = adopt('pb-gate-ok')
+  sessionEvent(session, human(PROMPT))
+  sessionEvent(session, call('pwsh', VERIFY, 1, 1))
+  sessionEvent(session, callWithId('edit', EDIT_OK, 1, 2, 'c-ok'))
+  sessionEvent(session, toolResult('edit', 1, 2, 'c-ok', false))
+  const d = await preStep(agent, 1, 3)
+  check('⑭ 反向对照：成功的 edit **仍然**提醒', pullbacks(d).length === 1, `n=${pullbacks(d).length}`)
+  const row = await statusOf('pb-gate-ok')
+  check('⑭ 反向对照：没有撤回发生', row.pullback.armRetracted === 0 && row.pullback.pendingCodeEdits === 1,
+    JSON.stringify({ r: row.pullback.armRetracted, e: row.pullback.pendingCodeEdits }))
+}
+{
+  // 越界写同理：被沙箱拒绝的越界写不算"落到了范围之外"
+  const { agent, session } = adopt('pb-gate-scope')
+  sessionEvent(session, human(PROMPT))
+  sessionEvent(session, callWithId('edit', EDIT_OUT, 1, 1, 'c-scope'))
+  sessionEvent(session, toolResult('edit', 1, 1, 'c-scope', true))
+  const d = await preStep(agent, 1, 2)
+  check('⑭ 被拒的越界写不算违规、也不拉回', pullbacks(d).length === 0, JSON.stringify(pullbacks(d).map(textOf)))
+  const row = await statusOf('pb-gate-scope')
+  check('⑭ 越界记录与窗口 mark 都被撤回', row.pullback.scopeViolations === 0 && row.pullback.violationMarks === 0 && row.pullback.armRetracted === 1,
+    JSON.stringify({ v: row.pullback.scopeViolations, m: row.pullback.violationMarks, r: row.pullback.armRetracted }))
+}
+{
+  // 明确的口径：**验证命令失败仍然算验证过**（要撤的是"根本没发生的事"，不是"结果不好"）
+  const { agent, session } = adopt('pb-gate-verify-fail')
+  sessionEvent(session, human(PROMPT))
+  sessionEvent(session, callWithId('pwsh', VERIFY, 1, 1, 'c-verify'))
+  sessionEvent(session, toolResult('pwsh', 1, 1, 'c-verify', true, 'FAIL 3 tests'))
+  sessionEvent(session, call('edit', EDIT_OK, 1, 2))
+  const d = await preStep(agent, 1, 3)
+  check('⑭ 反向对照：**验证命令报错**仍算验证过（仍会提醒改完没验证）', pullbacks(d).length === 1, `n=${pullbacks(d).length}`)
+  const row = await statusOf('pb-gate-verify-fail')
+  check('⑭ 反向对照：验证 mark 不被成功门撤回', row.pullback.verifyMarks === 1 && row.pullback.armRetracted === 0,
+    JSON.stringify({ vm: row.pullback.verifyMarks, r: row.pullback.armRetracted }))
+}
+{
+  // 成功门的判据只能用**结构化字段**，不许文本匹配：一次**成功**的写，它的结果文本里
+  // 完全可能带着 "Error"/"not a known tool" 之类的字样（读到的代码、日志、报错文本），
+  // 按文本判会把成功的写当成失败 ⇒ 把 L1 说哑（本项目栽过两次的"能力其实没在跑"）。
+  const { agent, session } = adopt('pb-gate-text-trap')
+  sessionEvent(session, human(PROMPT))
+  sessionEvent(session, call('pwsh', VERIFY, 1, 1))
+  sessionEvent(session, callWithId('edit', EDIT_OK, 1, 2, 'c-trap'))
+  sessionEvent(session, toolResult('edit', 1, 2, 'c-trap', false,
+    'The file has been updated successfully. Added try/catch: Error handling + not a known tool branch.'))
+  const d = await preStep(agent, 1, 3)
+  check('⑭ 反向对照：结果文本里含 "Error" 的**成功**写照样提醒（判据只认结构化字段）',
+    pullbacks(d).length === 1, `n=${pullbacks(d).length}`)
+  const row = await statusOf('pb-gate-text-trap')
+  check('⑭ 反向对照：这次没有撤回（文本不参与判定）', row.pullback.armRetracted === 0, String(row.pullback.armRetracted))
+}
+
 console.warn = origWarn
 console.log(`\n${pass} pass, ${fail} fail`)
 if (fail > 0) process.exit(1)

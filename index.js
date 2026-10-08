@@ -2406,7 +2406,14 @@ function feedSessionEvent(session, event) {
     noteSessionEvent(rec, event)
   } else if (event.type === 'tool/result') {
     ledgerNoteToolResult(rec, event.data && event.data.turn, event.data && event.data.step, toolResultText(event))
-    if (/\\bunknown tool\\b|not a known tool/i.test(toolResultText(event))) {
+    // L1 成功门：工具**没落地**就撤回它刚贡献的信号（见 retractArm 的长注释）。
+    // 注意**验证运行不设这道门**：命令跑过就是跑过，即使报错/非零退出也算"验证过了"
+    // （本项目早已定下的口径：报错的测试同样携带信息；要撤的是"根本没发生的事"）。
+    if (toolResultFailed(event)) retractArm(rec, event)
+    // ⚠ 这里原来是 `\\bunknown tool\\b`（双重转义）⇒ 该分支**从来没匹配上过**，
+    // 只有 `not a known tool` 这一半在起作用。这正是"检查静默死掉"的那一类，
+    // 顺手修成真正的词边界（sawUnknownTool 是 L3.3 结局代理的一项）。
+    if (/\bunknown tool\b|not a known tool/i.test(toolResultText(event))) {
       rec.sawUnknownTool = true
       logAudit(rec, 'unknown-tool', { turn: event.data && event.data.turn, step: event.data && event.data.step })
     }
@@ -2521,6 +2528,12 @@ function noteHumanMessage(rec, event) {
  *   · 范围内的**代码**改动 ⇒ 记入 codeEditsAfterVerify（文档类改动不记，见
  *     changeInvalidatesVerification 的实测来由）；若此前已验证过 ⇒ 置 pendingPullback='unverified'
  * 判据一律保守：认不出范围/认不出文件类型就什么都不做（宁可漏检也不误报）。
+ *
+ * ⚠ `tool/call` 只代表"**发起**了写操作"，不代表写成功（2026-10-08 实测：一次被 harness
+ * 拒绝的 edit —— `read the file, then retry` —— 仍然被算作"改了代码"，L1 随即说出一句
+ * **前提为假**的提醒）。所以这里只**暂记**（按 callId 存进 pendingArms），等 tool/result
+ * 回来再定：失败 ⇒ 撤回（retractArm），成功/无结果 ⇒ 保留。
+ * 为什么用 callId 而不是 (turn,step)：同一步可以有并行工具调用，按步匹配会误撤别人的信号。
  */
 function noteTaskSignal(rec, event) {
   try {
@@ -2592,6 +2605,8 @@ function noteTaskSignal(rec, event) {
     // ② 文件改动（**只把写当信号**：越界读是另一类弱信号，本轮刻意不用）
     if (!isWriteTool(name)) return
     const scopeKnown = Boolean(anchors && anchors.parsed === true)
+    const callId = typeof d.callId === 'string' ? d.callId : null
+    const arm = { callId, turn, step, tool: name, addedEdit: false, addedViolation: false, markN: null, armedReason: null }
     let sawViolation = false
     for (const path of pathsFromCallStrict(name, d.arguments)) {
       if (isIgnorablePath(path)) continue
@@ -2599,19 +2614,23 @@ function noteTaskSignal(rec, event) {
         const v = { turn, step, tool: name, path, at: Date.now() }
         rec.scopeViolations.push(v)
         if (rec.scopeViolations.length > 50) rec.scopeViolations.shift()
-        rec.pendingPullback = { reason: 'scope', turn, step, path, tool: name }
+        rec.pendingPullback = { reason: 'scope', turn, step, path, tool: name, byCall: callId }
+        arm.addedViolation = true
+        arm.armedReason = 'scope'
         sawViolation = true
-        logAudit(rec, 'scope-violation', { turn, step, tool: name, path, note: '写操作落在提示声明的范围之外' })
+        logAudit(rec, 'scope-violation', { turn, step, tool: name, path, note: '写操作落在提示声明的范围之外（**暂记**：等 tool/result 确认是否真的落地）' })
         continue
       }
       if (changeInvalidatesVerification(path)) {
         rec.codeEditsAfterVerify.push({ turn, step, path, tool: name })
         if (rec.codeEditsAfterVerify.length > 50) rec.codeEditsAfterVerify.shift()
+        arm.addedEdit = true
         // "未验证"只需要"本会话确实验证过"（lastVerifyAt 来自提示**或**行为），
         // **不要求提示里有范围子句**——范围只约束"越界写"，与"改完没验证"是两件事
         // （这条区分由用例 ⑬ 守住；否则自由会话永远沉默）。
         if (rec.lastVerifyAt) {
-          rec.pendingPullback = { reason: 'unverified', turn, step, path, lastVerifyAt: rec.lastVerifyAt }
+          rec.pendingPullback = { reason: 'unverified', turn, step, path, lastVerifyAt: rec.lastVerifyAt, byCall: callId }
+          arm.armedReason = 'unverified'
         }
       }
     }
@@ -2620,10 +2639,75 @@ function noteTaskSignal(rec, event) {
     // 同一步只记一次（一次调用里可能有多个越界路径）。
     if (sawViolation) {
       const lastM = rec.pullback.violationMarks[rec.pullback.violationMarks.length - 1]
-      if (!lastM || lastM.turn !== turn || lastM.step !== step) markObs(rec, 'violation', turn, step)
+      if (!lastM || lastM.turn !== turn || lastM.step !== step) arm.markN = markObs(rec, 'violation', turn, step)
+    }
+    // 暂记这次调用的贡献（按 callId）——tool/result 回来若报失败就整条撤回。
+    if (arm.addedEdit || arm.addedViolation) {
+      if (!rec.pendingArms) rec.pendingArms = new Map()
+      if (rec.pendingArms.size >= 20) {
+        const oldest = rec.pendingArms.keys().next().value
+        rec.pendingArms.delete(oldest)
+      }
+      rec.pendingArms.set(callId === null ? `${turn}:${step}` : callId, arm)
     }
   } catch (e) {
     warnOnce(`task-signal scan failed (ignored): ${msg(e)}`)
+  }
+}
+
+/**
+ * 工具结果是否**失败/被拒**。判据只用结构化字段（实测形态：
+ * `data.message.content[i].isError === true` 与顶层 `data.error = {name,code}`），
+ * **不做文本匹配**——文本匹配要么漏（漏则退回旧行为，无害）要么误伤（误伤会把 L1 说哑，
+ * 那是本项目栽过两次的"能力其实没在跑"）。所以：
+ * 没有明确失败标记 ⇒ 当作成功（保留信号）。
+ */
+export function toolResultFailed(event) {
+  const d = (event && event.data) || null
+  if (!d) return false
+  if (d.error) return true
+  const msg2 = d.message
+  const blocks = msg2 && Array.isArray(msg2.content) ? msg2.content : (Array.isArray(d.content) ? d.content : [])
+  for (const b of blocks) if (b && b.isError === true) return true
+  return false
+}
+
+/**
+ * 撤回一次**没有落地**的写操作所贡献的信号（成功门）。
+ * 为什么必须撤：`tool/call` 只说明"发起了"。被拒的 edit 会让 L1 说出"你在上次验证之后
+ * 又改了代码"——那句话是**假的**（实测 turn 676），而"假提醒"正是本项目最在意的那类缺陷。
+ * 撤回是**有痕**的（`arm-retracted` 审计 + `pullback.armRetracted` 计数），不是静默忽略。
+ */
+function retractArm(rec, event) {
+  try {
+    if (!rec.pendingArms || rec.pendingArms.size === 0) return false
+    const d = (event && event.data) || {}
+    const callId = (d.message && d.message.source && d.message.source.callId) || d.callId || null
+    const key = callId === null ? `${d.turn}:${d.step}` : callId
+    const a = rec.pendingArms.get(key)
+    if (!a) return false
+    rec.pendingArms.delete(key)
+    if (a.addedEdit) {
+      const last = rec.codeEditsAfterVerify[rec.codeEditsAfterVerify.length - 1]
+      if (last && last.turn === a.turn && last.step === a.step) rec.codeEditsAfterVerify.pop()
+    }
+    if (a.addedViolation) {
+      const lastV = rec.scopeViolations[rec.scopeViolations.length - 1]
+      if (lastV && lastV.turn === a.turn && lastV.step === a.step) rec.scopeViolations.pop()
+      const lastM = rec.pullback.violationMarks[rec.pullback.violationMarks.length - 1]
+      if (a.markN !== null && lastM && lastM.n === a.markN) rec.pullback.violationMarks.pop()
+    }
+    // 只清**这次调用**置位的待发提醒（byCall 对齐），不误伤同一步里别的调用的信号
+    if (rec.pendingPullback && rec.pendingPullback.byCall === a.callId) rec.pendingPullback = null
+    rec.armRetracted = (rec.armRetracted || 0) + 1
+    logAudit(rec, 'arm-retracted', {
+      turn: a.turn, step: a.step, tool: a.tool, addedEdit: a.addedEdit, addedViolation: a.addedViolation,
+      reason: a.armedReason, note: '工具调用失败/被拒 ⇒ 不算"改了代码/越界写"，也不据此拉回',
+    })
+    return true
+  } catch (e) {
+    warnOnce(`arm retract failed (ignored): ${msg(e)}`)
+    return false
   }
 }
 
@@ -2783,6 +2867,9 @@ function summaryOf(rec) {
       verifyMarks: rec.pullback.verifyMarks.length,
       violationMarks: rec.pullback.violationMarks.length,
       outcomeRows: rec.pullbackOutcomeRows || 0,
+      // 成功门：有多少次"发起了但没落地"的写被撤回（撤回不是静默忽略，必须可见）
+      armRetracted: rec.armRetracted || 0,
+      pendingArms: rec.pendingArms ? rec.pendingArms.size : 0,
     },
     // L2 重锚定：状态、门与在线证据
     reanchor: {

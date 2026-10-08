@@ -1,5 +1,5 @@
 {
-  "generatedAtUtc": "2026-10-08T06:27:22.338Z",
+  "generatedAtUtc": "2026-10-08T06:50:26.694Z",
   "corpus": {
     "sessionsScanned": 129,
     "sessionsUsed": 78
@@ -46,12 +46,12 @@
       "preset": null,
       "scope": "none",
       "sessions": 33,
-      "steps": 21052,
-      "meanSteps": 638,
+      "steps": 21091,
+      "meanSteps": 639,
       "baseRates": {
         "inaction": 0.0019,
-        "repetition": 0.0536,
-        "failure": 0.039
+        "repetition": 0.0535,
+        "failure": 0.0392
       }
     },
     {
@@ -91,12 +91,12 @@
       "preset": null,
       "scope": "none",
       "sessions": 10,
-      "steps": 5624,
-      "meanSteps": 562,
+      "steps": 5632,
+      "meanSteps": 563,
       "baseRates": {
         "inaction": 0.0002,
-        "repetition": 0.0361,
-        "failure": 0.0365
+        "repetition": 0.036,
+        "failure": 0.0364
       }
     },
     {

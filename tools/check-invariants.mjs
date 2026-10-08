@@ -475,6 +475,35 @@ if (existsSync(readmePath)) {
       problems.push('缺少每会话上限判定（代码里找不到）')
     }
   }
+  // 成功门：`tool/call` 只说明"**发起**了写操作"，落地与否要看 `tool/result` 的**结构化**失败标记。
+  // 由来（真实触发）：一次被 harness 拒绝的 edit 仍被算作"改了代码"，L1 随即说出一句前提为假的提醒。
+  if (!/export function toolResultFailed\(/.test(src)) problems.push('缺少 toolResultFailed（成功门没有单一实现）')
+  if (!/if \(toolResultFailed\(event\)\) retractArm\(rec, event\)/.test(src)) {
+    problems.push('tool/result 分支没有接成功门（发起了但没落地的写仍会被算作改动）')
+  }
+  if (!/function retractArm\(rec, event\)/.test(src)) problems.push('缺少 retractArm（撤回必须单一实现）')
+  if (!/logAudit\(rec, 'arm-retracted'/.test(src)) problems.push('撤回没有审计留痕（静默忽略不可接受）')
+  if (!/armRetracted/.test(src)) problems.push('撤回没有计数（撤回不可见）')
+  {
+    const gate = (src.match(/export function toolResultFailed\([\s\S]*?\n\}/) || [''])[0]
+    if (!gate) problems.push('取不到 toolResultFailed 的函数体（检查模式串失配）')
+    else {
+      if (!/d\.error/.test(gate) || !/isError === true/.test(gate)) {
+        problems.push('成功门没有用结构化字段（data.error / isError）判定')
+      }
+      // **负向**：不许文本匹配——结果文本里完全可能带着 "Error"（读到的代码/日志），
+      // 按文本判会把**成功**的写当成失败 ⇒ 把 L1 说哑（本项目栽过两次的"能力其实没在跑"）。
+      if (/\.test\(/.test(gate)) problems.push('成功门用了文本匹配（会误撤成功的写，把 L1 说哑）')
+    }
+  }
+  {
+    const retract = (src.match(/function retractArm\(rec, event\)[\s\S]*?\n\}/) || [''])[0]
+    if (!retract) problems.push('取不到 retractArm 的函数体（检查模式串失配）')
+    // 明确口径：**验证 mark 不许被成功门撤回**——命令跑过就是跑过，报错/非零退出同样携带信息。
+    else if (/verifyMarks/.test(retract)) {
+      problems.push('成功门动了验证 mark（验证命令报错也必须算"验证过"）')
+    }
+  }
   // 门槛必须**按原因**分别判定：统一要求"解析出提示锚点"会让自由形态的长会话永远沉默
   // （实测：用例 ⑬ 的 n=0 就是被这道统一门槛挡住的 ⇒ L1 停在"存在但从不运行"）。
   {
