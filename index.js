@@ -132,6 +132,10 @@ const DEFAULTS = {
   pullbackEnabled: false,
   // 每会话最多说几次（节流见 allostasis 的 admitPerTurn：同一 turn 至多一次）。
   pullbackMaxPerSession: 3,
+  // **对照组比例**（L4 在线对照）：触发时以该概率"故意不说"，从而拿到"说了 vs 没说"的配对。
+  // 默认 0 = 不抑制（不在未授权时改变行为）；做效果测量时才调大（如 0.3）。
+  // 为什么必须有对照组：没有它就只剩"说过之后的行为"这一侧观测，无法区分"起了作用"与"本来就会这样"。
+  pullbackControlRate: 0,
   // ── L2 重锚定（最强干预：把首轮 Minimal 载荷重新灌回近因位置）────────────────
   // 默认关，且**不与 L1 共用同一道门**：它额外要求一份**在线证据件**（reanchorEvidencePath），
   // 该证据件由真实会话累积的结果生成（见 recordPullbackOutcome），且必须 verdict=PASS-online、未过期。
@@ -1812,16 +1816,26 @@ function reanchorDecision(rec, turn) {
 function recordPullbackOutcome(rec) {
   try {
     if (CONFIG.pullbackEnabled !== true) return
-    if (rec.pullback.count === 0) return
+    // L4：**两条臂都要记账**——对照组（触发但故意没说）是估计效果的必要条件；
+    // 以前只在"说过话"时写，于是日志里根本没有对照组，效果永远估不出来。
+    const triggered = rec.pullback.count + rec.pullback.controls
+    if (triggered === 0) return
     const outcome = {
       at: Date.now(),
       sessionId: rec.sessionId,
+      arm: rec.pullback.count > 0 ? 'intervened' : 'control',
+      intervened: rec.pullback.count > 0,
       pullbacks: rec.pullback.count,
+      controls: rec.pullback.controls,
       lastReason: rec.pullback.lastReason,
       lastTurn: rec.pullback.lastTurn,
+      family: rec.family ? familyKeyOf(rec).full : null,
       verifiesAfterPullback: rec.pullback.verifiesAfter,
       scopeViolationsAfter: rec.pullback.scopeViolationsAfter,
       claimedUnverifiedAfter: rec.pullback.claimedUnverifiedAfter === true,
+      // 结局代理（与 L3 第三层同一口径，便于跨层比对）
+      endedNarrowed: rec.surfacePhase === 'narrowed' || rec.machineState === 'drift',
+      sawUnknownTool: rec.sawUnknownTool === true,
       finalState: { machineState: rec.machineState, surfacePhase: rec.surfacePhase, anchored: rec.anchored, lifted: rec.lifted },
     }
     rec.pullbackOutcome = outcome
@@ -1975,6 +1989,8 @@ function adopt(agent, doAnchor, channel) {
       // L1 效果采集用的"说过之后"计数器（由 noteTaskSignal / turn-end 维护）
       verifiesAfter: 0, scopeViolationsAfter: 0, claimedUnverifiedAfter: false,
       suppressed: { throttled: 0, cap: 0, noAnchors: 0 },
+      arm: null,          // intervened | control | null（未触发）
+      controls: 0,        // 被"故意不说"的次数（对照组）
     },
     // L2 重锚定状态（每会话只做一次）
     reanchor: { count: 0, lastTurn: null, lastPullbackCount: null, lastAt: null, suppressed: { alreadyDone: 0, noPriorPullback: 0, noNewEvidence: 0 } },
@@ -2367,6 +2383,8 @@ function summaryOf(rec) {
       pendingCodeEdits: rec.codeEditsAfterVerify.length,
       lastVerifyAt: rec.lastVerifyAt,
       suppressed: { ...rec.pullback.suppressed },
+      arm: rec.pullback.arm,
+      controls: rec.pullback.controls,
     },
     // L2 重锚定：状态、门与在线证据
     reanchor: {
@@ -2452,6 +2470,7 @@ function buildSummary(filter) {
       suppressSkillCatalog: CONFIG.suppressSkillCatalog,
       pullbackEnabled: CONFIG.pullbackEnabled === true,
       pullbackMaxPerSession: CONFIG.pullbackMaxPerSession,
+      pullbackControlRate: CONFIG.pullbackControlRate,
       reanchorEnabled: CONFIG.reanchorEnabled === true,
       reanchorEvidencePath: CONFIG.reanchorEvidencePath || null,
       pullbackOutcomePath: CONFIG.pullbackOutcomePath || null,
@@ -2575,6 +2594,42 @@ export function apply(ctx, config) {
       console.error(`[${name}] failed to load lexicon from "${lexiconPath}": ${e && e.message}; keeping default lexicon`)
     }
   }
+  // ⚠ 顺序很重要：先验必须在**标定件之前**加载——标定件要按"先验是否真的在用"
+  // 在两套 α（derived / derivedWithFamilyPrior）之间选一套。反过来就会出现
+  // "装了先验却用了无先验的 α"（实测踩到：门禁用例 ⑫ 抓出来的）。
+  // L3 族先验加载（tools/family-priors.mjs 的产物）。fail-safe：任何一步不通过 ⇒ **不收缩**
+  // （退回固定 Jeffreys 伪计数，即本轮之前的行为），并留响亮告警。
+  const envPriors = typeof process !== 'undefined' && process.env && process.env.TRAJECTORY_ANCHOR_FAMILY_PRIORS
+  const priorPath = (config && typeof config.familyPriorPath === 'string' && config.familyPriorPath) || envPriors || ''
+  if (priorPath) {
+    try {
+      const p = isAbsolute(priorPath) ? priorPath : resolvePath(process.cwd(), priorPath)
+      const art = JSON.parse(readFileSync(p, 'utf8'))
+      const byKey = {}
+      for (const fam of (Array.isArray(art && art.families) ? art.families : [])) {
+        if (!fam || typeof fam.key !== 'string' || !fam.baseRates) continue
+        const rates = {}
+        for (const ch of ['inaction', 'repetition', 'failure']) {
+          const v = fam.baseRates[ch]
+          if (Number.isFinite(v)) rates[ch] = v
+        }
+        if (Object.keys(rates).length > 0) byKey[fam.key] = { key: fam.key, sessions: fam.sessions ?? null, steps: fam.steps ?? null, baseRates: rates }
+      }
+      if (Object.keys(byKey).length === 0) {
+        familyPriors = null
+  for (const k of Object.keys(channelFeedback)) delete channelFeedback[k]
+        noteConfigWarning(`family priors at "${p}" contained no usable families; shrinkage disabled`)
+      } else {
+        familyPriors = { source: p, byKey, generatedAtUtc: art.generatedAtUtc ?? null, corpus: art.corpus ?? null }
+        console.log(`[${name}] family priors loaded from ${p} (${Object.keys(byKey).length} families)`)
+      }
+    } catch (e) {
+      familyPriors = null
+  for (const k of Object.keys(channelFeedback)) delete channelFeedback[k]
+      noteConfigWarning(`failed to load family priors from "${priorPath}": ${msg(e)}; shrinkage disabled (fixed Jeffreys)`)
+    }
+  }
+
   // 标定件加载（B3 门禁）：给了路径就按它决定"哪些通道有资格动能力面"。
   // 任何一步不通过都**只观察**——fail-safe 而不是 fail-open（能力面不同于工具面：
   // 工具面出错要暴露全量，能力面出错必须不动手）。
@@ -2600,9 +2655,15 @@ export function apply(ctx, config) {
       } else {
         const eligible = Array.isArray(art.capabilityEligibleChannels) ? art.capabilityEligibleChannels : []
         const applied = []
+        const derivedSource = {}
         for (const chName of eligible) {
           if (!CONFIG.responseChannels[chName]) continue
-          const derived = (art.channels && art.channels[chName] && art.channels[chName].derived) || null
+          const chArt = (art.channels && art.channels[chName]) || {}
+          // **两套 α，按估计器选**：先验真的装载了才用"带先验反解"的那一套。
+          // 为什么必须分开：收缩会改变 null 率（实测让判定更敏感），带先验反解出的 α 严得多
+          // （A′ 0.001 → 0.0001，10 倍）。只写一套的话，无论哪边错配都等于**悄悄改了预算**。
+          const usePrior = Boolean(familyPriors) && Boolean(chArt.derivedWithFamilyPrior)
+          const derived = (usePrior ? chArt.derivedWithFamilyPrior : chArt.derived) || null
           CONFIG.responseChannels[chName] = {
             ...CONFIG.responseChannels[chName],
             capabilityEligible: true,
@@ -2610,9 +2671,13 @@ export function apply(ctx, config) {
             ...(derived && Number.isFinite(derived.alpha) ? { actAlpha: derived.alpha } : {}),
           }
           applied.push(chName)
+          derivedSource[chName] = usePrior ? 'derivedWithFamilyPrior' : 'derived'
         }
-        policyArtifact = { source: p, verdict: art.verdict, eligibleChannels: applied, corpusFingerprint: art.corpusFingerprint ?? null, generatedAtUtc: art.generatedAtUtc ?? null }
-        console.log(`[${name}] response policy loaded from ${p} (verdict=${art.verdict}; eligible: ${applied.join(', ') || '(none)'})`)
+        policyArtifact = {
+          source: p, verdict: art.verdict, eligibleChannels: applied, derivedSource,
+          corpusFingerprint: art.corpusFingerprint ?? null, generatedAtUtc: art.generatedAtUtc ?? null,
+        }
+        console.log(`[${name}] response policy loaded from ${p} (verdict=${art.verdict}; eligible: ${applied.join(', ') || '(none)'}; α 来源: ${Object.values(derivedSource).join(',') || '-'})`)
       }
     } catch (e) {
       policyArtifact = { source: policyPath, verdict: 'REJECTED', rejectReason: msg(e), eligibleChannels: [] }
@@ -2653,38 +2718,6 @@ export function apply(ctx, config) {
     }
   }
 
-  // L3 族先验加载（tools/family-priors.mjs 的产物）。fail-safe：任何一步不通过 ⇒ **不收缩**
-  // （退回固定 Jeffreys 伪计数，即本轮之前的行为），并留响亮告警。
-  const envPriors = typeof process !== 'undefined' && process.env && process.env.TRAJECTORY_ANCHOR_FAMILY_PRIORS
-  const priorPath = (config && typeof config.familyPriorPath === 'string' && config.familyPriorPath) || envPriors || ''
-  if (priorPath) {
-    try {
-      const p = isAbsolute(priorPath) ? priorPath : resolvePath(process.cwd(), priorPath)
-      const art = JSON.parse(readFileSync(p, 'utf8'))
-      const byKey = {}
-      for (const fam of (Array.isArray(art && art.families) ? art.families : [])) {
-        if (!fam || typeof fam.key !== 'string' || !fam.baseRates) continue
-        const rates = {}
-        for (const ch of ['inaction', 'repetition', 'failure']) {
-          const v = fam.baseRates[ch]
-          if (Number.isFinite(v)) rates[ch] = v
-        }
-        if (Object.keys(rates).length > 0) byKey[fam.key] = { key: fam.key, sessions: fam.sessions ?? null, steps: fam.steps ?? null, baseRates: rates }
-      }
-      if (Object.keys(byKey).length === 0) {
-        familyPriors = null
-  for (const k of Object.keys(channelFeedback)) delete channelFeedback[k]
-        noteConfigWarning(`family priors at "${p}" contained no usable families; shrinkage disabled`)
-      } else {
-        familyPriors = { source: p, byKey, generatedAtUtc: art.generatedAtUtc ?? null, corpus: art.corpus ?? null }
-        console.log(`[${name}] family priors loaded from ${p} (${Object.keys(byKey).length} families)`)
-      }
-    } catch (e) {
-      familyPriors = null
-  for (const k of Object.keys(channelFeedback)) delete channelFeedback[k]
-      noteConfigWarning(`failed to load family priors from "${priorPath}": ${msg(e)}; shrinkage disabled (fixed Jeffreys)`)
-    }
-  }
 
   agentsSvc = ctx.get('agents')
   fsSvc = ctx.get('fs')
@@ -2834,8 +2867,23 @@ export function apply(ctx, config) {
       // 固定前缀离输出最远，长会话里纠偏信号会被近因压过去；这条必须落在近因位置。
       // 为什么是 messages 追加而不是改写 system：不改写基线语义，且天然可逆（只有这一条）。
       const pull = pullbackDecision(rec, typeof payload.turn === 'number' ? payload.turn : null)
+      // ── L4 在线对照：触发时以 pullbackControlRate 的概率**故意不说**，从而拿到对照组 ──
+      // 没有对照组就只能看见"说过之后"的那一侧，无法区分"起了作用"与"本来就会这样"。
+      // 默认 rate=0（不抑制）；做效果测量时才调大。被抑制的会话同样记账（arm='control'）。
+      if (pull && CONFIG.pullbackControlRate > 0 && Math.random() < CONFIG.pullbackControlRate) {
+        rec.pullback.controls += 1
+        rec.pullback.arm = 'control'
+        rec.pendingPullback = null
+        logAudit(rec, 'pullback-control', {
+          reason: pull.reason, turn: payload.turn, step: payload.step,
+          controls: rec.pullback.controls, rate: CONFIG.pullbackControlRate,
+          note: '触发但按对照组比例故意不说（用于在线对照估计效果）',
+        })
+        return decision
+      }
       if (pull && decision && Array.isArray(decision.messages)) {
         rec.pullback.count += 1
+        rec.pullback.arm = 'intervened'
         rec.pullback.lastTurn = typeof payload.turn === 'number' ? payload.turn : null
         rec.pullback.lastReason = pull.reason
         rec.pullback.lastInfo = { path: pull.info.path || null, lastVerifyAt: pull.info.lastVerifyAt || null }

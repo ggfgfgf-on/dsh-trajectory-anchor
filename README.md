@@ -488,6 +488,41 @@ core behavior that has been redesigned twice: absolute bands → baseline-relati
 (v0.4.x) → **session-local reference test** (this version). Each redesign was driven by a
 measurement, and the measurements are recorded below.
 
+### Full automation loop (L4): produced, gated, and measured by itself
+
+`tools/auto-loop.mjs` is the closure: it regenerates the family priors, re-derives α **with**
+the prior active (shrinkage changes the null rate, so re-deriving is not optional — measured:
+A′ goes from `0.001` to `0.0001`, 10× tighter, otherwise the budget is silently widened),
+runs the 20 invariants **plus all fourteen suites as its own gate**, produces the online
+evidence when outcome data exists, and prints the enablement checklist. Any failing step exits
+non-zero: "refuse to publish" is a hard failure, not a warning.
+
+Two structures make that measurement possible rather than aspirational:
+
+- **Two α sets in one artifact.** `derived` (no prior) and `derivedWithFamilyPrior` both ship;
+  the runtime picks by whether priors are *actually loaded* and records
+  `policyArtifact.derivedSource`. Load order matters — the test caught the reversed order as
+  "priors loaded, but the no-prior α used."
+- **A control arm.** `pullbackControlRate` (default `0`) suppresses the message on a trigger
+  with that probability, so the outcome log contains *intervened* and *control* sessions
+  rather than only the treated side. `analyze-pullback-outcomes.mjs` then does a one-sided
+  Fisher exact comparison and demands direction **and** significance **and** an absolute
+  level: single-arm ⇒ `INSUFFICIENT` ("cannot estimate"), control better ⇒ `FAIL`, a tie ⇒
+  `FAIL` (not demonstrated better), positive-but-not-significant ⇒ `INSUFFICIENT` (keep
+  sampling, don't gamble). Only a significant positive effect opens L2.
+
+Running the loop for the first time immediately caught a silent loosening: without a recall
+report it produced a *looser* artifact (`PARTIAL-PASS`, two channels granted). C16 and gate
+case ⑪ refused to publish it, but the fix belongs at the source — the calibrator now makes
+"no recall evidence ⇒ no eligibility" a hard rule (`recallOk = Boolean(recallSide) && …`),
+and invariant **C20** pins that, the loop's gate coverage, and its non-zero exit.
+
+**Enablement checklist** (each step requires evidence first; shipping everything off is the
+design, not an unfinished state): observe → L1 (`pullbackEnabled`) → collect both arms
+(`pullbackControlRate` 0.2–0.3) → require `PASS-online` → L2 (`reanchorEnabled` + evidence
+path) → L3 (`familyPriorPath` + `outcomeFeedbackEnabled`) — with `measurementSafe` or the
+self-demotion available at any point.
+
 ## Calibration findings (measured, important)
 
 1. **The anchoring effect holds on this deployment's model (deepseek-v4-flash)**: with only pwsh

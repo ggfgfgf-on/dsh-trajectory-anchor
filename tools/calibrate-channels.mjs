@@ -17,7 +17,7 @@ import { walk } from './session-log-core.mjs'
 const args = process.argv.slice(2)
 // 带值选项（--out/--budget）的**值**不属于位置参数：否则 `--out <前缀>` 的值会被当成
 // 会话目录，于是"测了 0 个会话"——实测踩到（脚本正确地 fail-loud 退出，但根因是这里）。
-const FLAGS_WITH_VALUE = new Set(['--out', '--budget', '--recall', '--min-recall'])
+const FLAGS_WITH_VALUE = new Set(['--out', '--budget', '--recall', '--min-recall', '--priors', '--prior-strength'])
 const positional = []
 for (let i = 0; i < args.length; i++) {
   if (FLAGS_WITH_VALUE.has(args[i])) { i += 1; continue }
@@ -43,6 +43,27 @@ if (recallPath) {
     process.exit(1)
   }
 }
+// 族先验（L3 第二层）：给了就**带着先验**重新反解 α。
+// 为什么必须能带先验标定：收缩把 null 率往族基频拉，实测让判定更敏感（α=0.01 时会话命中率
+// +2.6 ~ +3.9pp）；若仍按"无先验"的 α 上线，等于**悄悄放宽了预算**——"离线合格、线上超标"
+// 只是换了个入口。先验生效后 α 必须重解，这不是可选项。
+const priorsPath = args.includes('--priors') ? resolve(args[args.indexOf('--priors') + 1]) : null
+let priorArtifact = null
+const priorStrength = Number(args.includes('--prior-strength') ? args[args.indexOf('--prior-strength') + 1] : 20)
+if (priorsPath) {
+  try { priorArtifact = JSON.parse(readFileSync(priorsPath, 'utf8')) } catch (e) {
+    console.error(`读不到族先验 ${priorsPath}：${e && e.message}`)
+    process.exit(1)
+  }
+}
+/** 该会话在某通道上的先验（族基频 + 强度）。没有族信息 ⇒ null（退回固定 Jeffreys）。 */
+const priorOf = (sid, ch) => {
+  if (!priorArtifact) return null
+  const key = priorArtifact.sessionKeys ? priorArtifact.sessionKeys[sid] : null
+  const fam = key && Array.isArray(priorArtifact.families) ? priorArtifact.families.find((f) => f.key === key) : null
+  const v = fam && fam.baseRates ? fam.baseRates[ch] : null
+  return Number.isFinite(v) ? { rate: v, strength: priorStrength } : null
+}
 
 // 通道参数（与 index.js DEFAULTS.responseChannels 对齐）
 const CHANNELS = [
@@ -67,15 +88,21 @@ const results = []
 console.log('')
 console.log('① 空转侧扫描：会话命中率（行=连续确认 k，列=每次检验的 α）')
 for (const ch of CHANNELS) {
-  console.log(`\n${ch.theme}`)
+  console.log(`\n${ch.theme}${priorsPath ? '（带族先验）' : ''}`)
   console.log('  k\\α     ' + ALPHAS.map((a) => String(a).padStart(8)).join(''))
   const grid = {}
+  // 带先验时：逐会话按其族取先验（walkChannel 支持每会话不同先验），必须**单个会话**走查。
+  const walkOne = (s, alpha, k) => walkChannel([s], ch.key, {
+    testWindow: ch.testWindow, refMinSteps: ch.refMinSteps, alpha, consecutive: k, prior: priorOf(s.sid, ch.key),
+  }).sessionsHit
   for (const k of KS) {
     const cells = []
     for (const alpha of ALPHAS) {
-      const r = walkChannel(sessions, ch.key, { testWindow: ch.testWindow, refMinSteps: ch.refMinSteps, alpha, consecutive: k })
-      grid[`${k}:${alpha}`] = r.rate
-      cells.push((r.rate * 100).toFixed(1).padStart(7) + '%')
+      const rate = priorArtifact
+        ? sessions.filter((s) => walkOne(s, alpha, k) > 0).length / Math.max(1, sessions.length)
+        : walkChannel(sessions, ch.key, { testWindow: ch.testWindow, refMinSteps: ch.refMinSteps, alpha, consecutive: k }).rate
+      grid[`${k}:${alpha}`] = rate
+      cells.push((rate * 100).toFixed(1).padStart(7) + '%')
     }
     console.log(`  ${String(k).padStart(2)}      ` + cells.join(''))
   }
@@ -109,20 +136,46 @@ for (const ch of CHANNELS) {
       minRecallToAct: minRecall,
     }
   }
-  const recallOk = !recallSide || (recallSide.bestRecallAnyAlpha ?? 0) >= minRecall
+  // **没有召回证据就不许授予资格**（硬性规定，不是靠事后不变量兜底）。
+  // 实测教训：自动闭环某次跑时忘了传召回报告，标定器就产出了一个**更松**的产物
+  // （verdict=PARTIAL-PASS + 授予两个通道资格）——"只在空转侧合格"正是我们反复要防的那种
+  // 静默放宽。当时被 C16 与门禁用例 ⑪ 拦下了，但源头就该拦：证据不足 ⇒ 不予资格。
+  const recallOk = Boolean(recallSide) && (recallSide.bestRecallAnyAlpha ?? 0) >= minRecall
+  // ── 无先验基线（对照）：无论是否带先验，都算一份，写进产物供运行时按"先验是否在用"选 ──
+  // 为什么必须两套都给：出厂 `familyPriorPath` 是 null（不装先验），而**带先验**反解出的 α
+  // 要严得多（实测 A′ 从 0.001 → 0.0001，10 倍）。若只写一套，那么"装先验的人拿到无先验的 α"
+  // 或反之，都等于**悄悄改了预算**——正是我们反复要防的那种静默错配。
+  const gridBase = {}
+  if (priorArtifact) {
+    for (const k of KS) {
+      for (const alpha of ALPHAS) {
+        gridBase[`${k}:${alpha}`] = walkChannel(sessions, ch.key, { testWindow: ch.testWindow, refMinSteps: ch.refMinSteps, alpha, consecutive: k }).rate
+      }
+    }
+  }
+  const gridToUse = priorArtifact ? gridBase : grid
+  let chosenBase = null
+  for (const k of KS) {
+    for (const alpha of ALPHAS) {
+      if (gridToUse[`${k}:${alpha}`] <= budget) { chosenBase = { consecutive: k, alpha, rate: gridToUse[`${k}:${alpha}`] }; break }
+    }
+    if (chosenBase) break
+  }
   results.push({
     ...ch,
     grid,
-    derived: chosen,
+    gridNoPrior: priorArtifact ? gridBase : null,
+    derived: priorArtifact ? chosenBase : chosen,
+    derivedWithFamilyPrior: priorArtifact ? chosen : null,
     // 预算内的全部候选（α 宽→严），供"召回已知后在同预算下挑最灵敏者"使用。
     withinBudget: KS.flatMap((k) => ALPHAS.filter((a) => grid[`${k}:${a}`] <= budget).map((a) => ({ consecutive: k, alpha: a, rate: grid[`${k}:${a}`] })))
       .sort((x, y) => (y.alpha - x.alpha) || (x.consecutive - y.consecutive)),
     floor: best,
     recallSide,
-    capabilityEligible: !ch.notifyOnly && Boolean(chosen) && recallOk,
+    capabilityEligible: !ch.notifyOnly && Boolean(chosenBase) && recallOk,
     verdict: ch.notifyOnly ? 'notify-only(设计)'
-      : !chosen ? `FAIL(无解：最低仍 ${(best.rate * 100).toFixed(1)}%)`
-        : !recallOk ? `FAIL(召回不足：全 α 范围内最好 ${((recallSide.bestRecallAnyAlpha ?? 0) * 100).toFixed(1)}% < ${(minRecall * 100).toFixed(0)}%)`
+      : !chosenBase ? `FAIL(无解：最低仍 ${(best.rate * 100).toFixed(1)}%)`
+        : !recallOk ? `FAIL(${recallSide ? '召回不足' : '召回未测（未提供 --recall）'}：全 α 范围内最好 ${(((recallSide && recallSide.bestRecallAnyAlpha) ?? 0) * 100).toFixed(1)}% < ${(minRecall * 100).toFixed(0)}%)`
           : `PASS(k=${chosen.consecutive}, α=${chosen.alpha})`,
   })
 }
@@ -167,6 +220,7 @@ const artifact = {
   generatedAtUtc: new Date().toISOString(),
   scope: { pluginVersion, release: 'B3-calibration', taskFamily: 'dsh-sessions' },
   corpusFingerprint: fingerprint(sessionsDir),
+  calibration: { withFamilyPrior: Boolean(priorArtifact), priorStrength: priorArtifact ? priorStrength : null, priorsSource: priorsPath || null },
   budget: { targetFprPerSession: budget },
   channels: Object.fromEntries(results.map((r) => [r.key, {
     testWindow: r.testWindow,
@@ -180,6 +234,8 @@ const artifact = {
     // 之前这里只写了 testWindow/refMinSteps 与几个读数，于是"反解出来的 (k,α)"
     // 永远上不了线——标定产物与可用参数之间断了一截。
     derived: (!r.notifyOnly && r.derived) ? { consecutive: r.derived.consecutive, alpha: r.derived.alpha, sessionHitRate: r.derived.rate } : null,
+    // 带族先验反解出的 α（更严）。运行时只有在**先验真的装载**时才用它——见 index.js 的装载器。
+    derivedWithFamilyPrior: (!r.notifyOnly && r.derivedWithFamilyPrior) ? { consecutive: r.derivedWithFamilyPrior.consecutive, alpha: r.derivedWithFamilyPrior.alpha, sessionHitRate: r.derivedWithFamilyPrior.rate } : null,
     recallSide: r.recallSide,
     // 预算内的**全部**候选，按 α 从宽到严排序（越宽越灵敏 ⇒ 召回越高、误报越贴着预算）。
     // 现在选的是最保守的那个（召回侧还没测，不能拿灵敏度换风险）；等 B4/T4 测出召回，

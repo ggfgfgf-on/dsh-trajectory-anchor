@@ -106,6 +106,8 @@ const artifact = {
   corpus: { sessionsScanned: files.length, sessionsUsed },
   axes: { modelFamilies: [...modelSeen.entries()].map(([k, v]) => ({ key: k, sessions: v })), presets: [...presetSeen.entries()].map(([k, v]) => ({ key: k, sessions: v })) },
   families: rows,
+  // 逐会话的族键（供标定器把先验 join 回每个会话；否则标定器无法按族收缩）
+  sessionKeys: Object.fromEntries(sidToKey),
   note: '族键 = provider/model @ agentPreset @ 任务范围名。baseRates 是各行为通道在该族的**每步命中率**（收缩先验用）。',
 }
 

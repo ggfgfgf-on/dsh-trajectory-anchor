@@ -545,6 +545,38 @@ if (existsSync(readmePath)) {
   else oks.push('C19 L3 族先验：默认不收缩、先验与本会话数据共同估计、族键只来自事件流、加载失败明确退回、先验可见')
 }
 
+// ── C20 硬：L4 闭环（自产产物 + 自门禁 + 无召回证据不授权）─────────────────────
+// 由来：自动闭环某次跑时忘了传召回报告，标定器就产出了一个**更松的**产物
+// （PARTIAL-PASS + 授予资格）——被 C16 与门禁用例 ⑪ 拦下了，但源头就该拦。
+{
+  const problems = []
+  const cal = resolve(dirname(indexPath), 'tools', 'calibrate-channels.mjs')
+  const loop = resolve(dirname(indexPath), 'tools', 'auto-loop.mjs')
+  if (!existsSync(cal)) problems.push('找不到 tools/calibrate-channels.mjs')
+  else {
+    const c = readFileSync(cal, 'utf8')
+    // 没有召回报告 ⇒ 不予资格（不得写成 `!recallSide || ...` 那种"没数据就放过"）
+    if (/const recallOk = !recallSide \|\|/.test(c)) {
+      problems.push('标定器在"召回未测"时仍可能授予资格（应为 Boolean(recallSide) && …）')
+    }
+    if (!/const recallOk = Boolean\(recallSide\) &&/.test(c)) problems.push('标定器缺少"无召回证据不授权"的硬性判定')
+    if (!/withFamilyPrior: Boolean\(priorArtifact\)/.test(c)) problems.push('标定件未记录"标定时是否带先验"（两套 α 会无从解释）')
+    if (!/derivedWithFamilyPrior/.test(c)) problems.push('标定器未产出 derivedWithFamilyPrior（带先验的 α 上不了线）')
+  }
+  if (!existsSync(loop)) problems.push('缺少 tools/auto-loop.mjs（L4 闭环入口）')
+  else {
+    const l = readFileSync(loop, 'utf8')
+    if (!/check-invariants\.mjs/.test(l)) problems.push('闭环的自门禁没有包含不变量检查')
+    if (!/test-policy-gate\.mjs/.test(l) || !/test-reanchor\.mjs/.test(l) || !/test-outcome-feedback\.mjs/.test(l)) {
+      problems.push('闭环的自门禁没有覆盖关键套件（门禁/重锚定/回灌）')
+    }
+    if (!/analyze-pullback-outcomes\.mjs/.test(l)) problems.push('闭环没有产出在线证据（L2 的门会永远缺数据）')
+    if (!/process\.exit\(ok \? 0 : 1\)/.test(l)) problems.push('闭环失败时没有以非零码退出（"拒绝发布"必须是硬失败）')
+  }
+  if (problems.length) for (const p of problems) fails.push(`C20 ${p}`)
+  else oks.push('C20 L4 闭环：自产先验+标定件+在线证据、自门禁覆盖全部关键套件、失败即拒绝发布、且"召回未测不授权"写在源头')
+}
+
 // ── 输出 ────────────────────────────────────────────────────────────────
 for (const s of oks) console.log(`  OK    ${s}`)
 for (const s of debts) console.log(`  DEBT  ${s}`)

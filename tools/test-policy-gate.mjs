@@ -364,6 +364,45 @@ await boot({ ...ARMED, responsePolicyPath: write('broken.json', null) })
   check('⑪ 未授权的通道保持无资格', lex && lex.eligible === false, JSON.stringify(lex && { e: lex.eligible }))
 }
 
+// ── ⑫ 两套 α 按估计器选（装先验 vs 不装先验必须给出不同门限）──────────────────
+// 由来：族先验会改变 null 率（实测让判定更敏感），带先验反解出的 α 严得多（A′ 0.001 → 0.0001）。
+// 若只写一套，无论哪边错配都等于**悄悄改了预算**，所以标定件同时携带两套、运行时按
+// "先验是否真的在用"选，并由本条断言守住（否则错配是静默的）。
+{
+  const shipped = resolve(here, '..', 'responsePolicy.json')
+  const priors = resolve(here, '..', 'familyPriors.json')
+  const art = JSON.parse(readFileSync(shipped, 'utf8'))
+  const armed = JSON.parse(JSON.stringify(art))
+  armed.verdict = 'PASS'
+  armed.capabilityEligibleChannels = ['inaction']
+  armed.channels.inaction.derived = { consecutive: 1, alpha: 0.001 }
+  armed.channels.inaction.derivedWithFamilyPrior = { consecutive: 1, alpha: 0.0001 }
+  const armedPath = write('dual-alpha.json', armed)
+  await boot({ rollbackEnabled: true, notifyEnabled: true, responsePolicyPath: armedPath })
+  {
+    const { session } = adoptAndLift('gate-dual-noprior')
+    deviate(session)
+    const row = await rowOf('gate-dual-noprior')
+    const ina = (row.channels || []).find((c) => c.name === 'inaction')
+    const s = await statusOf()
+    check('⑫ 不装先验 ⇒ 用 derived（0.001）', ina && ina.actAlpha === 0.001, JSON.stringify(ina && { a: ina.actAlpha }))
+    check('⑫ 并记录 α 来源为 derived', s.policyArtifact?.derivedSource?.inaction === 'derived',
+      JSON.stringify(s.policyArtifact?.derivedSource))
+  }
+  await boot({ rollbackEnabled: true, notifyEnabled: true, responsePolicyPath: armedPath, familyPriorPath: priors })
+  {
+    const { session } = adoptAndLift('gate-dual-prior')
+    deviate(session)
+    const row = await rowOf('gate-dual-prior')
+    const ina = (row.channels || []).find((c) => c.name === 'inaction')
+    const s = await statusOf()
+    check('⑫ 装先验 ⇒ 用 derivedWithFamilyPrior（0.0001，更严）', ina && ina.actAlpha === 0.0001,
+      JSON.stringify(ina && { a: ina.actAlpha }))
+    check('⑫ 并记录 α 来源为 derivedWithFamilyPrior', s.policyArtifact?.derivedSource?.inaction === 'derivedWithFamilyPrior',
+      JSON.stringify(s.policyArtifact?.derivedSource))
+  }
+}
+
 console.warn = origWarn
 console.error = origError
 console.log(`\n${pass} pass, ${fail} fail`)

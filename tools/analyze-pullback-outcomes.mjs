@@ -53,18 +53,68 @@ if (synth !== null) {
 
 const improved = rows.filter((r) => (r.verifiesAfterPullback > 0) || (r.scopeViolationsAfter === 0 && r.claimedUnverifiedAfter !== true))
 const rate = rows.length ? improved.length / rows.length : 0
+
+// ── L4 在线对照：两条臂的**配对比较** ────────────────────────────────────────
+// 只有"说过话"的一侧是观测，无法区分"起了作用"与"本来就会这样"；所以插件在触发时可按
+// pullbackControlRate 故意不说，形成对照组。这里做两侧比例比较并给出**方向性**判定。
+const armOf = (r) => (r.arm === 'control' || r.intervened === false ? 'control' : 'intervened')
+const good = (r) => (r.verifiesAfterPullback > 0) && r.scopeViolationsAfter === 0 && r.claimedUnverifiedAfter !== true
+const byArm = { intervened: [], control: [] }
+for (const r of rows) byArm[armOf(r)].push(r)
+const rateOfArm = (a) => (byArm[a].length ? byArm[a].filter(good).length / byArm[a].length : null)
+
+/** Fisher 精确检验（单侧：干预臂是否更好）。纯函数，小样本也准。 */
+function fisherGreater(a, b, c, d) {
+  const logFact = (n) => { let s = 0; for (let i = 2; i <= n; i++) s += Math.log(i); return s }
+  const hyper = (x) => Math.exp(
+    logFact(a + b) + logFact(c + d) + logFact(a + c) + logFact(b + d) - logFact(a + b + c + d)
+    - logFact(x) - logFact(a + b - x) - logFact(a + c - x) - logFact(d - a + x))
+  const minX = Math.max(0, a - d)
+  const maxX = Math.min(a + b, a + c)
+  const list = []
+  for (let x = minX; x <= maxX; x++) list.push([x, hyper(x)])
+  let p = 0
+  for (const [x, v] of list) if (x >= a) p += v
+  return Math.min(1, p)
+}
+
+const cmp = {
+  intervened: { n: byArm.intervened.length, goodRate: rateOfArm('intervened') },
+  control: { n: byArm.control.length, goodRate: rateOfArm('control') },
+}
+if (byArm.intervened.length > 0 && byArm.control.length > 0) {
+  const a = byArm.intervened.filter(good).length
+  const b = byArm.intervened.length - a
+  const c = byArm.control.filter(good).length
+  const d = byArm.control.length - c
+  cmp.table = { intervenedGood: a, intervenedBad: b, controlGood: c, controlBad: d }
+  cmp.oneSidedP = fisherGreater(a, b, c, d)
+  cmp.effectPP = (rateOfArm('intervened') - rateOfArm('control')) * 100
+}
+
+// 判定（方向性 + 显著性 + 绝对水平，三者都要过）：
+//   · 单臂 ⇒ INSUFFICIENT（无法估效果；这正是"只记说过话的会话"时的老状态）
+//   · 干预臂不比对照好 ⇒ FAIL（并且这是**该被采纳的**结论，不是"测不出来"）
+//   · 方向为正但未达显著 ⇒ INSUFFICIENT（继续攒样本，不冒险）
 let verdict = 'FAIL'
-if (rows.length < minSamples) verdict = 'INSUFFICIENT'
-else if (rate >= minImprove) verdict = 'PASS-online'
+let verdictReason = ''
+if (rows.length < minSamples) { verdict = 'INSUFFICIENT'; verdictReason = `样本 ${rows.length} < ${minSamples}` }
+else if (!cmp.table) { verdict = 'INSUFFICIENT'; verdictReason = '只有单臂（无对照数据）⇒ 无法估计效果' }
+else if (cmp.effectPP <= 0) { verdict = 'FAIL'; verdictReason = `干预臂并不更好（${cmp.effectPP.toFixed(1)}pp）` }
+else if (cmp.oneSidedP > 0.05) { verdict = 'INSUFFICIENT'; verdictReason = `方向为正但未显著（单侧 p=${cmp.oneSidedP.toFixed(3)}）` }
+else if (rate >= minImprove) { verdict = 'PASS-online'; verdictReason = `干预臂显著更好（+${cmp.effectPP.toFixed(1)}pp，单侧 p=${cmp.oneSidedP.toFixed(3)}）` }
+else { verdict = 'FAIL'; verdictReason = `显著但绝对产出率不足（${(rate * 100).toFixed(1)}% < ${(minImprove * 100).toFixed(0)}%）` }
 
 const artifact = {
   generatedAtUtc: new Date().toISOString(),
   expiresAtUtc: new Date(Date.now() + days * 24 * 3600 * 1000).toISOString(), // time-ok: artifact-expiry
   kind: 'reanchor-online-evidence',
   verdict,
+  verdictReason,
   pullbacksObserved: rows.length,
   minSamples,
   minImprove,
+  comparison: cmp,
   effectiveness: {
     improvedRate: Number(rate.toFixed(4)),
     verifyAfterRate: rows.length ? Number((rows.filter((r) => r.verifiesAfterPullback > 0).length / rows.length).toFixed(4)) : null,
@@ -73,10 +123,16 @@ const artifact = {
   },
   synthetic: synth !== null,
   note: synth !== null
-    ? '**合成数据**：仅用于验证"采集→分析→门禁"链路，不得当作效果证据'
-    : '由真实会话的拉回效果采集聚合而来；样本不足时 verdict=INSUFFICIENT（不开门）',
+    ? '**合成数据**：仅用于验证"采集→分析→门禁"链路，不得当作效果证据（装载器会拒绝 synthetic:true）'
+    : '由真实会话的拉回效果采集聚合而来；**两条臂**（intervened/control）都要有样本才可能 PASS-online',
 }
 writeFileSync(`${outPrefix}.json`, JSON.stringify(artifact, null, 2), 'utf8')
 console.log(`样本 ${rows.length}（要求 ≥${minSamples}）  改善率 ${(rate * 100).toFixed(1)}%（要求 ≥${(minImprove * 100).toFixed(0)}%）`)
-console.log(`verdict=${verdict}${verdict === 'INSUFFICIENT' ? '（样本不足 ⇒ 重锚定保持关闭）' : ''}`)
+if (cmp.table) {
+  console.log(`对照：干预臂 ${(cmp.intervened.goodRate * 100).toFixed(1)}%（n=${cmp.intervened.n}） vs 对照臂 ${(cmp.control.goodRate * 100).toFixed(1)}%（n=${cmp.control.n}）`
+    + `  效应 ${cmp.effectPP >= 0 ? '+' : ''}${cmp.effectPP.toFixed(1)}pp  单侧 p=${cmp.oneSidedP.toFixed(4)}`)
+} else {
+  console.log('对照：**只有单臂** ⇒ 无法估计效果（需要 pullbackControlRate > 0 攒对照数据）')
+}
+console.log(`verdict=${verdict}（${verdictReason}）`)
 console.log(`产物：${outPrefix}.json`)
