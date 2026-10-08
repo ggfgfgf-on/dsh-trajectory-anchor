@@ -154,6 +154,25 @@ is meant to be flipped by a calibration artifact; until then every channel is
 audit-only. Channel windows are visible live in `anchor_status` (`channels` = the
 snapshot used by the last decision, `channelWindows` = the live ledger window).
 
+**Why the per-test α cannot be a round number (B2).** α is the false-alarm rate of
+*one test*, but the budget is per *session* — and a session runs hundreds of tests,
+so the family-wise rate is ≈ `1 − (1 − α)^N`. Measured on the full corpus
+(77 sessions / 41,731 post-anchor steps, `tools/calibrate-channels.mjs`):
+
+| Channel | sessions falsely fired at α=0.01, k=1 | derived from a 5% budget |
+|---|---|---|
+| `inaction` (A′) | 27.3% | **k=1, α=1e-5** → 2.6% (k=2 → 0.0%) |
+| `repetition` (C) | 32.5% | k=1, α=1e-5 → 0.0% |
+| `failure` (B) | 41.6% | notify-only by design |
+| *negative control*: inaction **without** the turn-end exclusion | 26.0% | correctly judged **unfit** |
+
+So the hand-picked `actAlpha: 0.01` was ~3 orders of magnitude too loose; the
+budget-derived value is `1e-5`, optionally relaxed by requiring k consecutive
+confirmations (the observation-unit hysteresis the community uses too: allostasis
+`trackLoop(..., CONSECUTIVE_STEPS=2)`). **Recall is still unmeasured** — the corpus
+contains no labelled drift — hence `recallSide.status = UNMEASURED` in the
+artifact and the capability layer stays off until labels exist.
+
 **Effective warm-up is `testWindow + refMinSteps` = 16 steps (defaults).** The
 p-value needs a reference segment *outside* the test window
 (`refLen = history − testWindow ≥ refMinSteps`), so the first real decision can
