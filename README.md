@@ -174,21 +174,43 @@ snapshot used by the last decision, `channelWindows` = the live ledger window).
 **Why the per-test α cannot be a round number (B2).** α is the false-alarm rate of
 *one test*, but the budget is per *session* — and a session runs hundreds of tests,
 so the family-wise rate is ≈ `1 − (1 − α)^N`. Measured on the full corpus
-(77 sessions / 41,731 post-anchor steps, `tools/calibrate-channels.mjs`):
+(77 sessions / 41,584 post-anchor steps, `tools/calibrate-channels.mjs`):
 
 | Channel | sessions falsely fired at α=0.01, k=1 | derived from a 5% budget |
 |---|---|---|
-| `inaction` (A′) | 27.3% | **k=1, α=1e-5** → 2.6% (k=2 → 0.0%) |
-| `repetition` (C) | 32.5% | k=1, α=1e-5 → 0.0% |
+| `inaction` (A′) | 14.3% | **k=1, α=0.001** → 2.6% (k=3, α=0.005 → 3.9%) |
+| `repetition` (C) | 31.2% | k=1, α=1e-5 → 0.0% (k=2, α=1e-4 → 3.9%) |
 | `failure` (B) | 41.6% | notify-only by design |
 | *negative control*: inaction **without** the turn-end exclusion | 26.0% | correctly judged **unfit** |
 
-So the hand-picked `actAlpha: 0.01` was ~3 orders of magnitude too loose; the
-budget-derived value is `1e-5`, optionally relaxed by requiring k consecutive
-confirmations (the observation-unit hysteresis the community uses too: allostasis
-`trackLoop(..., CONSECUTIVE_STEPS=2)`). **Recall is still unmeasured** — the corpus
-contains no labelled drift — hence `recallSide.status = UNMEASURED` in the
-artifact and the capability layer stays off until labels exist.
+So the hand-picked `actAlpha: 0.01` was ~2 orders of magnitude too loose;
+consecutive confirmations (k) are the second lever — the observation-unit
+hysteresis the community uses too (allostasis `trackLoop(..., CONSECUTIVE_STEPS=2)`).
+Every candidate (k, α) that fits the budget is written into the artifact as
+`withinBudgetCandidates`, so once recall is measured the most sensitive
+configuration can be picked **without re-sweeping**.
+
+> ⚠ **These numbers were recomputed in 2026-10, and the earlier ones were wrong.**
+> The offline core used to carry its own ledger-finalization rule, which counted a
+> legal turn ending (no tool call, last step of the turn) as an A′ hit — while the
+> runtime excludes exactly those. Result: **123 of 128 sessions had a different
+> sequence, and the A′ hit rate was 0.16% (runtime) vs 8.10% (offline) — a factor
+> of 51.** So the old α was derived for a channel the runtime does not implement;
+> the give-away was that the G3 "negative control" (26.0%) looked nearly identical
+> to the "real" channel (27.3%) — a control that agrees with the thing it is
+> supposed to falsify is not a control. The ledger now has **one** implementation
+> (`buildLedgerFromEvents`, exported by `index.js`) and two guards:
+> `tools/test-ledger-parity.mjs` drives decoded **real events plus synthetic
+> streams** through a real `apply()` and compares every decision point against the
+> batch ledger, and `tools/test-ledger-semantics.mjs` pins the four finalization
+> cases against hand-computed truth (invariant C15). Both were negative-tested:
+> breaking the turn-end exclusion or the cross-turn rule makes them fail.
+
+**Recall is still unmeasured** — the corpus contains no labelled drift — hence
+`recallSide.status = UNMEASURED` in the artifact and the capability layer stays
+off until labels exist. The label plan (T4, automatic delayed labelling from
+*after-the-fact confirmations* such as runtime tool errors, `unknown tool`, user
+corrections and abandoned turns) is what `tools/drift-label-core.mjs` exists for.
 
 **Effective warm-up is `testWindow + refMinSteps` = 16 steps (defaults).** The
 p-value needs a reference segment *outside* the test window
@@ -386,14 +408,27 @@ node tools\export-layer4.mjs `
   and the per-channel snapshot (`channels`, `channelWindows`) with the effective
   `actAlpha` / `notifyAlpha` / `consecutive` and the two live run counters
 - Assertion suites (all must stay green; each is run against `index.js` by path):
-  `tools/check-invariants.mjs` — 14 static invariants (C1–C14), 0 debt;
+  `tools/check-invariants.mjs` — 16 static invariants (C1–C16), 0 debt;
   `tools/test-runtime-lexicon.mjs` — 64 pure-function cases;
   `tools/test-anchor-contract.mjs` — 24 install-and-use / contract cases (incl. the
   "apply() with no config at all" mount and a lossless-JSON walk over live rows);
   `tools/test-response-policy.mjs` — 30 end-to-end policy cases (A…J);
-  `tools/test-policy-gate.mjs` — 39 B3 gate cases (artifact / expiry / evaluation
-  protection / auto-demote / two-tier counters, each with its opposite direction);
+  `tools/test-policy-gate.mjs` — 46 B3 gate cases (artifact / expiry / evaluation
+  protection / auto-demote / two-tier counters / the shipped artifact end-to-end,
+  each with its opposite direction);
+  `tools/test-ledger-semantics.mjs` — 11 hand-computed finalization cases (ground truth
+  for the four ledger paths, including the two the real corpus never exercises);
+  `tools/test-ledger-parity.mjs` — 14 live-vs-batch parity runs (4 synthetic streams +
+  3 real sessions, every decision point compared);
   `tools/replay-interventions.mjs` — bounded episodes, compliant end reasons, replayable
+- Shipped calibration artifact: `responsePolicy.json` (verdict `PARTIAL-PASS`,
+  capability-eligible `inaction` + `repetition` with their derived `(k, α)`,
+  `withinBudgetCandidates`, corpus fingerprint, and the G3 negative control recorded).
+  It is **not auto-loaded** — `responsePolicyPath` defaults to `null`, so a fresh
+  install observes only. Point the config (or `TRAJECTORY_ANCHOR_POLICY_PATH`) at it to
+  arm the capability layer, and note that a copy with `measurementSafe: true` forces
+  observe-only (that is the evaluation-protection switch, not a property of a
+  well-formed artifact — invariant C16 fails the build if the shipped one carries it)
 - Event-sequence assertion: `adopted → anchored → context-suppressed → maxTokens-rewrite →
   gate-armed → lift(anchor-gate:minimal-like | max-steps) → context-restored →
   maxTokens-strip → score… → closed + record(incl. reward)`

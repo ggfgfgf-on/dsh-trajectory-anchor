@@ -1,0 +1,206 @@
+{
+  "generatedAtUtc": "2026-10-08T03:44:50.203Z",
+  "scope": {
+    "pluginVersion": "0.5.0",
+    "release": "B3-calibration",
+    "taskFamily": "dsh-sessions"
+  },
+  "corpusFingerprint": "sessions:128:481540007:1791431022847",
+  "budget": {
+    "targetFprPerSession": 0.05
+  },
+  "channels": {
+    "inaction": {
+      "testWindow": 3,
+      "refMinSteps": 20,
+      "capabilityEligible": true,
+      "verdict": "PASS(k=1, α=0.001)",
+      "derived": {
+        "consecutive": 1,
+        "alpha": 0.001,
+        "sessionHitRate": 0.025974025974025976
+      },
+      "withinBudgetCandidates": [
+        {
+          "consecutive": 3,
+          "alpha": 0.005,
+          "sessionHitRate": 0.03896103896103896
+        },
+        {
+          "consecutive": 1,
+          "alpha": 0.001,
+          "sessionHitRate": 0.025974025974025976
+        },
+        {
+          "consecutive": 2,
+          "alpha": 0.001,
+          "sessionHitRate": 0.025974025974025976
+        },
+        {
+          "consecutive": 3,
+          "alpha": 0.001,
+          "sessionHitRate": 0.012987012987012988
+        },
+        {
+          "consecutive": 1,
+          "alpha": 0.0001,
+          "sessionHitRate": 0
+        },
+        {
+          "consecutive": 2,
+          "alpha": 0.0001,
+          "sessionHitRate": 0
+        },
+        {
+          "consecutive": 3,
+          "alpha": 0.0001,
+          "sessionHitRate": 0
+        },
+        {
+          "consecutive": 1,
+          "alpha": 0.00001,
+          "sessionHitRate": 0
+        },
+        {
+          "consecutive": 2,
+          "alpha": 0.00001,
+          "sessionHitRate": 0
+        },
+        {
+          "consecutive": 3,
+          "alpha": 0.00001,
+          "sessionHitRate": 0
+        },
+        {
+          "consecutive": 1,
+          "alpha": 0.000001,
+          "sessionHitRate": 0
+        },
+        {
+          "consecutive": 2,
+          "alpha": 0.000001,
+          "sessionHitRate": 0
+        },
+        {
+          "consecutive": 3,
+          "alpha": 0.000001,
+          "sessionHitRate": 0
+        }
+      ]
+    },
+    "repetition": {
+      "testWindow": 3,
+      "refMinSteps": 20,
+      "capabilityEligible": true,
+      "verdict": "PASS(k=1, α=0.00001)",
+      "derived": {
+        "consecutive": 1,
+        "alpha": 0.00001,
+        "sessionHitRate": 0
+      },
+      "withinBudgetCandidates": [
+        {
+          "consecutive": 2,
+          "alpha": 0.0001,
+          "sessionHitRate": 0.03896103896103896
+        },
+        {
+          "consecutive": 3,
+          "alpha": 0.0001,
+          "sessionHitRate": 0.025974025974025976
+        },
+        {
+          "consecutive": 1,
+          "alpha": 0.00001,
+          "sessionHitRate": 0
+        },
+        {
+          "consecutive": 2,
+          "alpha": 0.00001,
+          "sessionHitRate": 0
+        },
+        {
+          "consecutive": 3,
+          "alpha": 0.00001,
+          "sessionHitRate": 0
+        },
+        {
+          "consecutive": 1,
+          "alpha": 0.000001,
+          "sessionHitRate": 0
+        },
+        {
+          "consecutive": 2,
+          "alpha": 0.000001,
+          "sessionHitRate": 0
+        },
+        {
+          "consecutive": 3,
+          "alpha": 0.000001,
+          "sessionHitRate": 0
+        }
+      ]
+    },
+    "failure": {
+      "testWindow": 3,
+      "refMinSteps": 20,
+      "capabilityEligible": false,
+      "verdict": "notify-only(设计)",
+      "derived": null,
+      "withinBudgetCandidates": [
+        {
+          "consecutive": 3,
+          "alpha": 0.0001,
+          "sessionHitRate": 0
+        },
+        {
+          "consecutive": 1,
+          "alpha": 0.00001,
+          "sessionHitRate": 0
+        },
+        {
+          "consecutive": 2,
+          "alpha": 0.00001,
+          "sessionHitRate": 0
+        },
+        {
+          "consecutive": 3,
+          "alpha": 0.00001,
+          "sessionHitRate": 0
+        },
+        {
+          "consecutive": 1,
+          "alpha": 0.000001,
+          "sessionHitRate": 0
+        },
+        {
+          "consecutive": 2,
+          "alpha": 0.000001,
+          "sessionHitRate": 0
+        },
+        {
+          "consecutive": 3,
+          "alpha": 0.000001,
+          "sessionHitRate": 0
+        }
+      ]
+    }
+  },
+  "negativeControl": {
+    "channel": "inaction",
+    "variant": "turn-end-exclusion-removed",
+    "nullSessionRate": 0.2597402597402597,
+    "expected": "unfit",
+    "observed": "unfit"
+  },
+  "recallSide": {
+    "status": "UNMEASURED",
+    "note": "语料里没有漂移标签（会话日志里只有\"确认性劣化\"事件，没有\"离题\"的金标准），因此召回与延迟仍未测。B4/T4 方案：用事后确认信号做**自动延迟标注**，把确认点之前 k 步标为正样本，从而算出召回/延迟与误报的联合曲线（工具：tools/drift-label-core.mjs）。"
+  },
+  "measurementSafe": false,
+  "verdict": "PARTIAL-PASS",
+  "capabilityEligibleChannels": [
+    "inaction",
+    "repetition"
+  ]
+}

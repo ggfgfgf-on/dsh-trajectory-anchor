@@ -329,6 +329,59 @@ if (existsSync(readmePath)) {
   }
 }
 
+// ── C15 硬：行为台账必须只有**一份**实现（离线不得自带一套定稿规则）──────────
+// 由来（实测，2026-10）：tools/behaviour-channel-core.mjs 曾自带 done 规则
+//   done = step < maxStepOfTurn(turn) || turnsWithEnd.has(turn)
+// 与运行时不一致（末步只要所在回合有 turn/end 就被收进序列，而它其实是合法收尾）。
+// 后果：128 会话中 123 个序列不同；A′ 命中率 运行时 0.16% 对 离线 8.10%（差 51 倍），
+// 于是 B2 的 α 是给一条运行时**不存在**的通道算的。这条断言把"共用同一实现"钉住。
+{
+  const problems = []
+  const corePath = resolve(dirname(indexPath), 'tools', 'behaviour-channel-core.mjs')
+  if (!existsSync(corePath)) problems.push('找不到 tools/behaviour-channel-core.mjs')
+  else {
+    const core = readFileSync(corePath, 'utf8')
+    if (!/import\s*\{[^}]*buildLedgerFromEvents[^}]*\}\s*from\s*'\.\.\/index\.js'/.test(core)) {
+      problems.push('离线核心未从 index.js 导入 buildLedgerFromEvents（台账必须共用一份实现）')
+    }
+    if (/turnsWithEnd|maxStepOfTurn/.test(core.replace(/^\s*\*.*$/gm, ''))) {
+      problems.push('离线核心里又出现了本地定稿规则（turnsWithEnd / maxStepOfTurn）——这正是 51 倍偏差的来源')
+    }
+  }
+  if (!/export function buildLedgerFromEvents\(/.test(src)) problems.push('index.js 未导出 buildLedgerFromEvents（离线无法共用）')
+  for (const t of ['test-ledger-parity.mjs', 'test-ledger-semantics.mjs']) {
+    if (!existsSync(resolve(dirname(indexPath), 'tools', t))) problems.push(`缺少对拍/语义测试 tools/${t}`)
+  }
+  if (problems.length) for (const p of problems) fails.push(`C15 ${p}`)
+  else oks.push('C15 行为台账单一实现：离线核心共用 buildLedgerFromEvents，且带逐步对拍 + 手算语义测试')
+}
+
+// ── C16 硬：出厂标定件必须"能用"（不得自带 measurementSafe、有资格通道必须带 derived）──
+// 由来（实测，2026-10）：标定工具曾 (a) 不产出 derived(k,α) ⇒ 反解永远上不了线；
+// (b) 写 measurementSafe: true ⇒ 装载即强制只观察，现象是"有资格却永远不动手"。
+{
+  const artPath = resolve(dirname(indexPath), 'responsePolicy.json')
+  if (!existsSync(artPath)) warns.push('C16 未找到出厂标定件 responsePolicy.json（跳过；安装即用时能力层本就不动）')
+  else {
+    const problems = []
+    let art = null
+    try { art = JSON.parse(readFileSync(artPath, 'utf8')) } catch (e) { problems.push(`解析失败：${e && e.message}`) }
+    if (art) {
+      if (art.measurementSafe === true) problems.push('标定件自带 measurementSafe: true ⇒ 装载即强制只观察，"授权"这条路永远走不通')
+      const eligible = Array.isArray(art.capabilityEligibleChannels) ? art.capabilityEligibleChannels : []
+      if (!['PASS', 'PARTIAL-PASS'].includes(art.verdict)) problems.push(`verdict=${art.verdict}（装载后会被判非法并只观察，等于白给）`)
+      for (const c of eligible) {
+        const d = art.channels && art.channels[c] && art.channels[c].derived
+        if (!d || !Number.isFinite(d.alpha) || !Number.isFinite(d.consecutive)) {
+          problems.push(`有资格通道 ${c} 没有 derived(k,α) ⇒ 反解参数到不了运行时`)
+        }
+      }
+    }
+    if (problems.length) for (const p of problems) fails.push(`C16 ${p}`)
+    else oks.push(`C16 出厂标定件可用：verdict=${art.verdict}，授权 ${(art.capabilityEligibleChannels || []).length} 个通道且都带 derived，未带 measurementSafe`)
+  }
+}
+
 // ── 输出 ────────────────────────────────────────────────────────────────
 for (const s of oks) console.log(`  OK    ${s}`)
 for (const s of debts) console.log(`  DEBT  ${s}`)

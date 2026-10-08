@@ -1,47 +1,34 @@
 /**
  * behaviour-channel-core.mjs —— 行为通道的离线核心（只读，零依赖）
  *
- * 与运行时**同一套语义**：从会话日志重建每步台账（与 index.js 的 ledgerCell /
- * ledgerAdvanceStep / ledgerCloseTurn 一致），再按同一个 binomialLowerP 做会话内
- * 自参考检验。数学必须同源，否则"离线标定"与"在线判定"会各说各话。
+ * 台账**不再在本文件里复制规则**，而是调用运行时导出的 `buildLedgerFromEvents`
+ * （index.js），再按同一个 `binomialLowerP` 做会话内自参考检验。
+ *
+ * 为什么改成共用（实测教训）：本文件曾自带一套 `done` 规则
+ *     done = step < maxStepOfTurn(turn) || turnsWithEnd.has(turn)
+ * 它与运行时的定稿规则不一致——所在回合有 `turn/end` 时它把**末步**也收进序列，
+ * 而"末步无工具调用"正是**合法收尾**（运行时定稿为 false）。后果（128 个真实会话实测）：
+ *     A′ 命中率  运行时 65/41,735 = 0.16%   离线 3,410/42,104 = 8.10%   ← 差 51 倍
+ *     128 个会话里 123 个序列不同
+ * 也就是说 B2 反解出来的 α 是给一条**运行时不存在**的通道算的；而当时 G3 的"反向对照"
+ * （不分回合末步，26.0%）与"真通道"（27.3%）几乎一样，本该早就暴露这件事。
+ * 现在由 tools/test-ledger-parity.mjs 拿真实会话**逐步入对拍**（解码后的真实事件喂进
+ * apply()，逐步比对通道快照 observed/window/refLen/refHits）。
  *
  * 关键口径（与运行时一致，见 index.js「行为通道台账」一节）：
  *   · 一步有工具调用 ⇒ 它不是"中途停手"；
  *   · 一步没有工具调用，但**同回合后面还有步** ⇒ 中途停手（命中）；
- *   · 一步没有工具调用，且它就是本回合最后一步 ⇒ 合法收尾（不命中）。
+ *   · 一步没有工具调用，且它就是本回合最后一步 ⇒ 合法收尾（不命中）；
+ *   · 既没有后续步、也没有 turn/end（会话断在这里）⇒ 永不定稿，不进序列。
  * 另有 legacyNoTool：**不分回合末步**的旧口径，只用于反向对照门（必须被判不合格）。
  */
 import { decodeSessionLog, walk } from './session-log-core.mjs'
 import { basename, join } from 'node:path'
-import { binomialLowerP } from '../index.js'
-
-/** 与 index.js 的 FAILURE_MARKERS 一致（断言 C8 守护）。 */
-const FAILURE_MARKERS = [
-  /\[exit code:\s*[1-9]\d*\]/,
-  /\[sandbox: file access denied/,
-  /Traceback \(most recent call last\)/,
-  /AssertionError/,
-  /\bFAILED\b/,
-  /Command failed/,
-]
-
-const normalizeArgs = (args) => String(args ?? '').replace(/\s+/g, ' ').replace(/\\/g, '/').trim().slice(0, 300)
-
-function toolResultText(rec) {
-  const blocks = rec && rec.message && rec.message.content
-  if (!Array.isArray(blocks)) return ''
-  const parts = []
-  for (const b of blocks) {
-    if (b && b.type === 'tool-result' && Array.isArray(b.content)) {
-      for (const c of b.content) if (c && c.type === 'text' && typeof c.text === 'string') parts.push(c.text)
-    }
-  }
-  return parts.join('\n')
-}
+import { binomialLowerP, buildLedgerFromEvents } from '../index.js'
 
 /**
- * 逐会话重建通道序列。
- * @returns [{ sid, steps, inaction: number[], repetition: number[], failure: number[], legacyNoTool: number[] }]
+ * 逐会话重建通道序列（台账来自运行时导出的同一实现）。
+ * @returns [{ sid, steps, inaction: number[], repetition: number[], failure: number[], stepKeys: string[] }]
  */
 export function channelSeriesFromSessions(sessionsDir, opts = {}) {
   const minSteps = opts.minSteps ?? 10
@@ -49,61 +36,20 @@ export function channelSeriesFromSessions(sessionsDir, opts = {}) {
   for (const sf of walk(sessionsDir, []).filter((f) => f.endsWith('session.jsonl.zstd'))) {
     let text
     try { text = decodeSessionLog(sf) } catch { continue }
-    const cells = new Map()          // key → { turn, step, tools, failures, repeated, lastOfTurn }
-    const recentCalls = []
-    const turnsWithEnd = new Set()
+    const events = []
     for (const line of text.split('\n')) {
       if (!line.trim()) continue
-      let o
-      try { o = JSON.parse(line) } catch { continue }
-      const d = o.data || {}
-      const turn = typeof d.turn === 'number' ? d.turn : null
-      const step = typeof d.step === 'number' ? d.step : null
-      if (o.type === 'turn/end') {
-        if (turn !== null) turnsWithEnd.add(turn)
-        continue
-      }
-      if (turn === null || step === null) continue
-      const key = `${turn}#${step}`
-      if (!cells.has(key)) cells.set(key, { turn, step, tools: 0, failures: 0, repeated: false })
-      const cell = cells.get(key)
-      if (o.type === 'tool/call') {
-        cell.tools += 1
-        const name = typeof d.name === 'string' ? d.name : ''
-        if (!name) continue
-        const sig = `${name}\u0000${normalizeArgs(d.arguments)}`
-        recentCalls.push({ sig, turn, step })
-        if (recentCalls.length > 40) recentCalls.shift()
-        const window = opts.repetitionWindow ?? 5
-        const minRepeats = opts.minRepeats ?? 2
-        const distinct = []
-        let hits = 0
-        for (let i = recentCalls.length - 1; i >= 0; i--) {
-          const c = recentCalls[i]
-          if (c.turn === turn && c.step === step && c.sig === sig && distinct.length > 0) { hits += 1; continue }
-          const k2 = `${c.turn}#${c.step}`
-          if (!distinct.includes(k2)) { if (distinct.length >= window) break; distinct.push(k2) }
-          if (c.sig === sig) hits += 1
-        }
-        if (hits >= minRepeats) cell.repeated = true
-      } else if (o.type === 'tool/result') {
-        const t = toolResultText(d)
-        if (t && FAILURE_MARKERS.some((re) => re.test(t))) cell.failures += 1
-      }
+      try { events.push(JSON.parse(line)) } catch { /* 坏行忽略 */ }
     }
-    const ordered = [...cells.values()].sort((a, b) => (a.turn - b.turn) || (a.step - b.step))
-    // 定稿：同回合后面还有步 ⇒ 中途停手；否则若该回合有 turn/end 或它已是最后一个观测 ⇒ 合法收尾
-    const maxStepOfTurn = new Map()
-    for (const c of ordered) maxStepOfTurn.set(c.turn, Math.max(maxStepOfTurn.get(c.turn) ?? -1, c.step))
-    const done = ordered.filter((c) => c.step < (maxStepOfTurn.get(c.turn) ?? c.step) || turnsWithEnd.has(c.turn))
-    if (done.length < minSteps) continue
+    const { series } = buildLedgerFromEvents(events, opts)
+    if (series.inaction.length < minSteps) continue
     out.push({
       sid: basename(join(sf, '..')).slice(0, 12),
-      steps: done.length,
-      inaction: done.map((c) => (c.tools === 0 ? 1 : 0)),
-      legacyNoTool: done.map((c) => (c.tools === 0 ? 1 : 0)),
-      repetition: done.map((c) => (c.repeated ? 1 : 0)),
-      failure: done.map((c) => (c.failures > 0 ? 1 : 0)),
+      steps: series.inaction.length,
+      inaction: series.inaction,
+      repetition: series.repetition,
+      failure: series.failure,
+      stepKeys: series.steps.map((s) => `${s.turn}#${s.step}`),
     })
   }
   return out

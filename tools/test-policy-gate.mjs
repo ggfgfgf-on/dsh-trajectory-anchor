@@ -16,7 +16,7 @@
  */
 import { pathToFileURL, fileURLToPath } from 'node:url'
 import { resolve, join } from 'node:path'
-import { writeFileSync, mkdtempSync } from 'node:fs'
+import { writeFileSync, readFileSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 
 const here = fileURLToPath(new URL('.', import.meta.url))
@@ -319,6 +319,41 @@ await boot({ ...ARMED, responsePolicyPath: write('broken.json', null) })
   const s = await statusOf()
   check('⑧ 标定件无法解析 → 只观察（fail-safe）', row.narrowedNow === false && s.capabilityGate === 'policy-REJECTED', String(s.capabilityGate))
   check('⑧ 解析失败有响亮告警', warnings.some((w) => /failed to load response policy/.test(w)), JSON.stringify(warnings.slice(0, 1)))
+}
+
+// ── ⑪ 出厂标定件必须真的能授权（端到端：标定工具产物 → 运行时加载器 → 生效参数）──
+// 守两个实测踩到的断点：
+//   · 标定工具以前**不产出** derived(k,α) ⇒ 反解结果永远上不了线（加载器支持但没人写）；
+//   · 标定工具以前写 measurementSafe: true ⇒ 装载即强制只观察，"有资格却永远不动手"。
+{
+  const shipped = resolve(here, '..', 'responsePolicy.json')
+  const art = JSON.parse(readFileSync(shipped, 'utf8'))
+  check('⑪ 出厂标定件存在且裁决为 PASS/PARTIAL-PASS',
+    ['PASS', 'PARTIAL-PASS'].includes(art.verdict), String(art.verdict))
+  check('⑪ 出厂标定件不得自带 measurementSafe（否则装载即永久只观察）', art.measurementSafe !== true, String(art.measurementSafe))
+  check('⑪ 每个有资格通道都带 derived(k,α)',
+    (art.capabilityEligibleChannels || []).every((c) => art.channels?.[c]?.derived
+      && Number.isFinite(art.channels[c].derived.alpha) && Number.isFinite(art.channels[c].derived.consecutive)),
+    JSON.stringify(art.capabilityEligibleChannels || []))
+  await boot({ rollbackEnabled: true, notifyEnabled: true, responsePolicyPath: shipped })
+  const s = await statusOf()
+  check('⑪ 装载出厂标定件后卡口放行', s.capabilityGate === null, String(s.capabilityGate))
+  check('⑪ 授权通道与产物一致', JSON.stringify(s.policyArtifact?.eligibleChannels) === JSON.stringify(art.capabilityEligibleChannels),
+    JSON.stringify(s.policyArtifact?.eligibleChannels))
+  const { session } = adoptAndLift('gate-shipped')
+  deviate(session)
+  const row = await rowOf('gate-shipped')
+  let ok = true
+  const seen = {}
+  for (const name of art.capabilityEligibleChannels || []) {
+    const ch = (row.channels || []).find((c) => c.name === name)
+    const d = art.channels[name].derived
+    seen[name] = ch ? { a: ch.actAlpha, k: ch.consecutive } : null
+    if (!ch || ch.actAlpha !== d.alpha || ch.consecutive !== d.consecutive) ok = false
+  }
+  check('⑪ 反解参数真正写进生效配置', ok, JSON.stringify(seen))
+  const failCh = (row.channels || []).find((c) => c.name === 'failure')
+  check('⑪ notify-only 通道未被授予资格', failCh && failCh.eligible === false, JSON.stringify(failCh && { e: failCh.eligible, a: failCh.actAlpha }))
 }
 
 console.warn = origWarn

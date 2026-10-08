@@ -92,11 +92,19 @@ const DEFAULTS = {
   autoDemoteBudget: 0.05,
   // ── 行为通道（B1）────────────────────────────────────────────────────────
   // 为什么加：词表信号实测无判别力（会话级误触发 15.9%–43.2%，预算 5%）；行为通道
-  //   的空转侧在**全语料**（77 会话 / 41731 步）上实测如下（tools/calibrate-channels.mjs）：
-  //     α=0.01, k=1 → A′ 27.3%、C 32.5%、B 41.6%（远超 5% 预算）
-  //     按预算反解 → k=1, α=1e-5 → A′ 2.6%、C 0.0%、B 0.0%；k=2 时 A′ 0.0%
+  //   的空转侧在**全语料**（77 会话 / 41584 步）上实测如下（tools/calibrate-channels.mjs）：
+  //     α=0.01, k=1 → A′ 14.3%、C 31.2%、B 41.6%（远超 5% 预算）
+  //     按预算反解 → A′ k=1, α=0.001 → 2.6%；C k=1, α=1e-5 → 0.0%；B 只允许通知
   //   根因：α 是**单次检验**的误报率，而预算是**每会话**的（会话几百步，族错误率
-  //   1−(1−α)^N 会放大几十倍）。所以默认就用反解值：actAlpha=1e-5、k=1（可配 k=2）。
+  //   1−(1−α)^N 会放大几十倍）。
+  //   ⚠ 这组数在 2026-10 被**重算过**：此前离线核心自带一套台账定稿规则，与运行时不一致
+  //     （把"回合末步=合法收尾"也记成 A′ 命中），128 会话里 123 个序列不同、A′ 命中率
+  //     0.16% 对 8.10%（差 51 倍），因此那时的 α 是给一条**运行时不存在**的通道算的。
+  //     现在台账只有一份实现（本文件导出的 buildLedgerFromEvents），由
+  //     tools/test-ledger-parity.mjs（逐步对拍）+ tools/test-ledger-semantics.mjs（手算真值）守着。
+  // 这里的 actAlpha=1e-5 是**比标定值更严的默认**：通道默认无资格（capabilityEligible=false），
+  //   资格只能由标定件授予，而标定件会带来它自己反解出来的 α/k（装载器会覆盖这两个键）。
+  //   若有人手写 capabilityEligible: true 又不给标定件，得到的是一套保守参数——这是有意的方向。
   // A′ 的定义**必须**带"回合未结束"硬条件：实测 67 个"无工具调用"步 100% 是回合末步
   //   （代理干完活回答了），不分回合末步就是 100% 误判（G3 反向对照门常驻验证）。
   // capabilityEligible 默认全 false：由标定件按预算翻转。
@@ -1086,6 +1094,179 @@ function ledgerCloseTurn(rec, turn) {
   if (typeof turn !== 'number') return
   for (const c of rec.ledger) {
     if (!c.finalized && c.turn === turn) ledgerFinalize(rec, c, false)
+  }
+}
+
+/**
+ * 批量重建台账与通道序列（**导出**，供 tools/ 的离线标定共用；纯函数，无副作用）。
+ *
+ * 为什么必须共用而不是各写一份（实测教训，2026-10 修）：
+ *   tools/behaviour-channel-core.mjs 曾自己写了一套 `done` 规则
+ *       done = step < maxStepOfTurn(turn) || turnsWithEnd.has(turn)
+ *   它与运行时的定稿规则**不一致**：所在回合有 turn/end 时，它把**末步**也收进序列，
+ *   而"末步无工具调用"正是**合法收尾**（运行时定稿为 false）。后果：同一批 128 个会话
+ *   里 123 个序列不同，A′ 命中率 0.16%（运行时）对 8.10%（离线）——**差 51 倍**；
+ *   于是 B2 反解出来的 α 是给一条**运行时不存在**的通道算的，
+ *   而 G3"反向对照"（26.0%）与"真通道"（27.3%）几乎相同，本该早就暴露这一点。
+ * 现在：运行时的实时路径与这里的批量路径用同一套规则，并由 tools/test-ledger-parity.mjs
+ * 拿真实会话逐步入对拍（把解码后的真实事件喂进 apply()，逐步比对通道快照）。
+ *
+ * @param {Array<object>} events 会话事件（session.jsonl 解码后的对象数组）
+ * @param {{repetitionWindow?:number, minRepeats?:number, trace?:boolean, testWindow?:number}} [opts]
+ *   `trace: true` 时额外返回每一步事件的通道快照（O(n)，供逐步对拍与离线标注使用）：
+ *   `trace[i] = { len, refLen, window, win:{inaction,repetition,failure}, ref:{...} }`
+ * @returns {{cells:Array, allCells:Array, series:object, trace?:Array}}
+ */
+export function buildLedgerFromEvents(events, opts = {}) {
+  const repetitionWindow = opts.repetitionWindow ?? 5
+  const minRepeats = opts.minRepeats ?? 2
+  const traceOn = opts.trace === true
+  const traceWindow = opts.testWindow ?? 3
+  const cells = new Map()
+  const recentCalls = []
+  const turnsWithEnd = new Set()
+  const order = []
+  const list = Array.isArray(events) ? events : Array.from(events || [])
+
+  // ── 逐步轨迹（可选）：定稿顺序上的序列 + 前缀和。
+  // 为什么需要：对拍若对每个事件前缀重算整段台账就是 O(n²)（实测在长会话上直接超时）。
+  // 这里在**同一个实现内部**维护 O(1) 可读的快照，语义与最终 series 完全相同。
+  const seriesNames = traceOn ? ['inaction', 'repetition', 'failure'] : []
+  const vals = traceOn ? { inaction: [], repetition: [], failure: [] } : null
+  const totals = traceOn ? { inaction: 0, repetition: 0, failure: 0 } : null
+  const trace = traceOn ? [] : null
+  const valueOf = (c, name) => (name === 'inaction' ? (c.midTurnInaction === true ? 1 : 0)
+    : name === 'repetition' ? (c.repeated ? 1 : 0) : (c.failures > 0 ? 1 : 0))
+  const snapshot = () => {
+    const len = vals.inaction.length
+    const refLen = len - traceWindow
+    const win = {}
+    const ref = {}
+    for (const nm of seriesNames) {
+      let w = 0
+      for (let i = Math.max(0, len - traceWindow); i < len; i++) w += vals[nm][i]
+      win[nm] = w
+      ref[nm] = totals[nm] - w
+    }
+    return { len, refLen, window: traceWindow, win, ref }
+  }
+  /** 已定稿格的序列值变化时同步前缀和（乱序事件可能晚到）。 */
+  const refresh = (c) => {
+    if (!traceOn || c.seriesIdx === undefined) return
+    for (const nm of seriesNames) {
+      const v = valueOf(c, nm)
+      const old = vals[nm][c.seriesIdx]
+      if (old !== v) {
+        vals[nm][c.seriesIdx] = v
+        totals[nm] += v - old
+      }
+    }
+  }
+  const cellFor = (turn, step) => {
+    if (typeof turn !== 'number' || typeof step !== 'number') return null
+    const key = `${turn}#${step}`
+    let c = cells.get(key)
+    if (!c) {
+      c = { turn, step, tools: 0, failures: 0, repeated: false, finalized: false, midTurnInaction: null }
+      cells.set(key, c)
+      order.push(key)
+    }
+    return c
+  }
+  const finalize = (c, midTurnInaction) => {
+    if (!c || c.finalized) return
+    c.finalized = true
+    c.midTurnInaction = midTurnInaction
+    if (traceOn) {
+      c.seriesIdx = vals.inaction.length
+      for (const nm of seriesNames) {
+        const v = valueOf(c, nm)
+        vals[nm].push(v)
+        totals[nm] += v
+      }
+    }
+  }
+  const advanceStep = (turn, step) => {
+    for (const c of cells.values()) {
+      if (c.finalized) continue
+      if (c.turn === turn && c.step < step) finalize(c, c.tools === 0)
+      else if (c.turn < turn) finalize(c, false)
+    }
+  }
+  const closeTurn = (turn) => {
+    for (const c of cells.values()) if (!c.finalized && c.turn === turn) finalize(c, false)
+  }
+  const processEvent = (ev) => {
+    if (!ev || typeof ev.type !== 'string') return
+    const d = ev.data || {}
+    const turn = typeof d.turn === 'number' ? d.turn : null
+    const step = typeof d.step === 'number' ? d.step : null
+    if (ev.type === 'turn/end') {
+      if (turn !== null) { turnsWithEnd.add(turn); closeTurn(turn) }
+      return
+    }
+    if (ev.type === 'tool/call') {
+      if (turn === null || step === null) return
+      // 注意：与运行时**逐字一致**——tool/call 只记账，**不推进步**。
+      // （运行时只在 assistant/message 分支调用 ledgerAdvanceStep；这里若多推一次，
+      //   定稿时机会提前，序列就会与在线判定不同——这正是本函数要消灭的那类漂移。）
+      const c = cellFor(turn, step)
+      if (!c) return
+      c.tools += 1
+      const nm = typeof d.name === 'string' ? d.name : ''
+      if (!nm) { refresh(c); return }
+      const sig = `${nm}\u0000${normalizeArgs(d.arguments)}`
+      recentCalls.push({ sig, turn, step })
+      if (recentCalls.length > 40) recentCalls.shift()
+      const distinct = []
+      let hits = 0
+      for (let i = recentCalls.length - 1; i >= 0; i--) {
+        const rc = recentCalls[i]
+        if (rc.turn === turn && rc.step === step && rc.sig === sig && distinct.length > 0) { hits += 1; continue }
+        const k = `${rc.turn}#${rc.step}`
+        if (!distinct.includes(k)) { if (distinct.length >= repetitionWindow) break; distinct.push(k) }
+        if (rc.sig === sig) hits += 1
+      }
+      if (hits >= minRepeats) c.repeated = true
+      refresh(c)
+      return
+    }
+    if (ev.type === 'assistant/message') {
+      if (turn === null || step === null) return
+      // 与运行时同序：先为本步建格，再推进（新步出现 ⇒ 上一步"无工具调用"是中途停手）。
+      cellFor(turn, step)
+      advanceStep(turn, step)
+      return
+    }
+    if (ev.type === 'tool/result') {
+      if (turn === null || step === null) return
+      const c = cellFor(turn, step)
+      if (!c) return
+      const text = toolResultText(ev)
+      if (text && FAILURE_MARKERS.some((re) => re.test(text))) c.failures += 1
+      refresh(c)
+    }
+  }
+  // trace[i] = 处理完 list[i] 之后的通道快照 ⇒ 下标与输入事件一一对应，
+  // 对拍时可直接用同一个事件下标比对（运行时只在 assistant/message 时重算，
+  // 因此只在这些下标上比对，但 trace 每步都记，避免两套下标换算再引入漂移）。
+  for (let i = 0; i < list.length; i++) {
+    processEvent(list[i])
+    if (traceOn) trace.push(snapshot())
+  }
+  const done = order.map((k) => cells.get(k)).filter((c) => c.finalized)
+  return {
+    cells: done,
+    // 全部格（含未定稿）：供对拍用——运行时的 rec.ledger 同时含未定稿格，
+    // 只比"已定稿"会漏掉"该定稿却没定稿"的差异。
+    allCells: order.map((k) => cells.get(k)),
+    series: {
+      inaction: done.map((c) => (c.midTurnInaction === true ? 1 : 0)),
+      repetition: done.map((c) => (c.repeated ? 1 : 0)),
+      failure: done.map((c) => (c.failures > 0 ? 1 : 0)),
+      steps: done.map((c) => ({ turn: c.turn, step: c.step, tools: c.tools, failures: c.failures, repeated: c.repeated, midTurnInaction: c.midTurnInaction === true })),
+    },
+    ...(traceOn ? { trace } : {}),
   }
 }
 
