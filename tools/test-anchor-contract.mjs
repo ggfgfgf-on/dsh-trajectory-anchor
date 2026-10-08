@@ -91,5 +91,36 @@ check('surface: 无 name 的条目不抛错，且按 fail-open 保留（不误�
     out === asm, JSON.stringify(out && out.threw ? out : 'ok'))
 }
 
+// ---- 安装即用：完全不给配置（新装用户的真实情形）----
+// 说明：CONFIG 是模块级状态，本文件前面那次 apply 只覆盖了 rollbackEnabled=false
+// （与 DEFAULTS 相同）并忽略了一个未知键，所以此处 apply(undefined) 之后的生效值
+// 与"全新 import + 零配置"一致——这正是 bundle patch 不声明任何 config 所对应的情形。
+{
+  const tools2 = {}
+  const warns2 = []
+  const orig2 = console.warn
+  console.warn = (...a) => { warns2.push(a.join(' ')) }
+  try {
+    const ctx2 = {
+      get: (n) => (n === 'tools' ? { register: (t) => { tools2[t.name] = t; return () => {} } } : undefined),
+      on: () => () => {},
+      effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {} },
+    }
+    await mod.apply(ctx2)                     // ← 无 config 参数
+    const s2 = await tools2.anchor_status.execute({})
+    check('安装即用: apply() 不带 config 也能挂载', typeof tools2.anchor_status === 'object')
+    check('安装即用: 无配置告警（bundle patch 不声明任何键）', warns2.length === 0, JSON.stringify(warns2))
+    check('安装即用: 出厂即安全（双关 + 有界上限 + 锚定默认开）',
+      s2.config.rollbackEnabled === false && s2.config.notifyEnabled === false
+      && s2.config.maxDriftSteps > 0 && s2.config.gateEnabled === true
+      && s2.config.suppressContextOnBootstrap === true,
+      JSON.stringify({ r: s2.config.rollbackEnabled, n: s2.config.notifyEnabled, m: s2.config.maxDriftSteps, g: s2.config.gateEnabled }))
+    check('安装即用: 策略键全部有出厂默认',
+      ['refMinSteps', 'testWindow', 'notifyAlpha', 'actAlpha'].every((k) => typeof s2.config[k] === 'number'))
+  } finally {
+    console.warn = orig2
+  }
+}
+
 console.log(`\n${pass} pass, ${fail} fail`)
 if (fail > 0) process.exit(1)
