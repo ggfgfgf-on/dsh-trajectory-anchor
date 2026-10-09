@@ -12,7 +12,7 @@
  *
  * 退出码：0 = 无硬失败（可能有 DEBT/WARN）；1 = 有硬失败。
  */
-import { readFileSync, existsSync } from 'node:fs'
+import { readFileSync, existsSync, readdirSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -1100,6 +1100,112 @@ if (existsSync(readmePath)) {
   }
   if (problems.length) for (const p of problems) fails.push(`C27 ${p}`)
   else oks.push('C27 确认即恢复：默认关、三种确认信号共用离线判据、硬闸门优先、每会话一次、有对照臂、落盘区分动作、只开它也照样记账、分析器分开报')
+}
+
+// ── C28 硬：被实测否定的判据不得回到判断面（风格/词典通道的"结构性关闭"）────────
+// 由来：词典/风格通道作为**漂移判据**已被实测否定——60 会话判别力评估里召回 24.2% 对
+// **同预算随机** 36.8%（0.64×），部署口径（节流后）1.06× ≈ 随机；它对强锚点的精度倍数
+// 也不到 1；它自己的标定件 verdict=FAIL。2026-10-09 因此把它移出判据面（出厂 enabled=false）。
+// 这条守的**不是默认值写没写对**（那只是配置，会被随手改回去），而是三件事：
+//   ① 通道行在 enabled===false 时**根本不构造** ⇒ live 判断面（level/action/收窄）拿不到它；
+//   ② 于是两条**既有**的 grant 通道——标定件授权（写 CONFIG 的 capabilityEligible）与
+//      人工试运行放行（只遍历已产出的行）——都碰不到已关闭的通道，不需要在那两处各加
+//      一个特判（特判会被下一次改写悄悄删掉，而"行不产出"这个结构不会）；
+//   ③ 反过来，谁把默认改回 true，本条会立刻失败 —— 负向副本必须被抓住。
+// 另外把"放行了却没生效"这条治理失效做成可见：试运行是 L3.3 攒样本的**唯一**入口，
+// 静默无效等于实验永远攒不到样本，而操作者以为它在跑。
+{
+  const problems = []
+  const toolsDir = resolve(dirname(indexPath), 'tools')
+  // ① 出厂默认关闭，且"关的是判据、不是锚定机制"这层区分必须写在旁边
+  if (!/lexicon: \{ enabled: false,/.test(src)) problems.push('词典/风格通道的出厂默认不是 enabled:false')
+  if (!/词典\/风格通道\*\*默认关闭\*\*/.test(src)) problems.push('缺少"默认关闭"的由来注释（后人会把它当成随手关的开关）')
+  if (!/CONFIG\.lexicon\.positive/.test(src)) problems.push('缺少"锚定机制仍在用 CONFIG.lexicon，与这条通道无关"的代码证据')
+  // ② live 判断面的通道行只有一处来源，且词典行在该来源的 enabled 守卫**之内**
+  if (!/const perChannel = channelTests\(rec\)/.test(src)) {
+    problems.push('live 判断面不再由 channelTests(rec) 供行（关掉的通道可能从别处回到判据面）')
+  }
+  const ct = (src.match(/function channelTests\(rec\)[\s\S]*?\n\}/) || [''])[0]
+  if (!ct) problems.push('缺少 channelTests（live 判断面的唯一通道行来源）')
+  else if (!/if \(lexCfg\.enabled !== false\) \{[\s\S]{0,900}?name: 'lexicon'[\s\S]{0,700}?\s*\n\s*\}\s*\n\s*const series = channelSeries\(rec\)/.test(ct)) {
+    problems.push('词典通道行不在 enabled!==false 守卫之内（关闭失效：行照样产出 ⇒ 关闭只是配置而非结构）')
+  }
+  // 兼容 façade 只能有一处（定义本身）：它构造一条词典行并直接判，
+  // 一旦被接到 live 路径上，结构性关闭就被绕过了。
+  const facade = (src.match(/policyDecision\(/g) || []).length
+  if (facade !== 1) problems.push(`policyDecision 出现 ${facade} 次 ≠ 1（兼容 façade 被接进 live 路径就会绕过结构性关闭）`)
+  // ③ 两条 grant 都只作用于"已产出的行 / 配置"，不得自带复活开关
+  if (!/for \(const c of out\) \{[\s\S]{0,400}?trial\.channels\.includes\(c\.name\)/.test(src)) {
+    problems.push('试运行放行不再只遍历已产出的通道行（可能复活被判据面移除的通道）')
+  }
+  if (!/for \(const chName of eligible\)[\s\S]{0,200}?if \(!CONFIG\.responseChannels\[chName\]\) continue/.test(src)) {
+    problems.push('标定件授权不再只写配置里的既有通道（授权面可能凭空造出通道）')
+  }
+  // ④ 放行了却没生效必须可见
+  //    ⚠ 只钉声明（const notGranted = ...）是个洞：负向副本把守卫改成 `if (false)` 后
+  //    声明还在，结构面照样通过（只被行为面抓到）。所以这里必须钉到**使用**。
+  if (!/const notGranted = trial\.channels/.test(src)) problems.push('缺少"未生效的放行"判定')
+  if (!/if \(notGranted\.length( > 0)?\) \{/.test(src)) problems.push('"未生效"判定没有被使用（声明在场而守卫可被改成 if(false)）')
+  if (!/logAudit\(rec, 'trial-release-unavailable'/.test(src)) problems.push('试运行放行未生效时没有留痕（实验会静默攒不到样本）')
+  if (!/noteConfigWarning\(`trialRelease 放行的通道没有生效/.test(src)) problems.push('试运行放行未生效没有进 configWarnings（status 里看不见）')
+  if (!/trialReleaseUnavailable: rec\.trialReleaseUnavailable \|\| null/.test(src)) problems.push('status 没有暴露 trialReleaseUnavailable')
+  // ⑤ 可测面：审计**类型集合**必须可达（auditTail 只有 8 条，开局一次的治理事件看不见）
+  if (!/auditKinds: \[\.\.\.new Set\(rec\.events\.map\(e => e\.kind\)\)\]/.test(src)) {
+    problems.push('status 行缺少 auditKinds（早期审计不翻文件就无法断言"到底发生过没有"）')
+  }
+  // ⑥ 四路对照齐全，且共用同一段偏离驱动（不共用就不可比）
+  const rp = resolve(toolsDir, 'test-response-policy.mjs')
+  if (!existsSync(rp)) problems.push('缺少 test-response-policy.mjs')
+  else {
+    const r = readFileSync(rp, 'utf8')
+    for (const m of ['K1 前置', 'K2 试运行放行不产出该行', 'K3 反向对照', 'K4 正向对照', 'K5 出厂默认']) {
+      if (!r.includes(m)) problems.push(`场景 K 缺少对照路：${m}`)
+    }
+    if (!/const LEX_DRIFT = \(session\) =>/.test(r)) problems.push('场景 K 的四路没有共用同一段偏离驱动（不可比）')
+  }
+  const loop5 = resolve(toolsDir, 'auto-loop.mjs')
+  if (existsSync(loop5) && !/test-response-policy\.mjs/.test(readFileSync(loop5, 'utf8'))) {
+    problems.push('闭环的自门禁没有覆盖响应策略套件')
+  }
+  if (problems.length) for (const p of problems) fails.push(`C28 ${p}`)
+  else oks.push('C28 被否定的判据不得回到判断面：词典通道结构性关闭（行不产出）、两条 grant 都碰不到、放行未生效必须可见、status 有 auditKinds 可测面、四路对照齐全')
+}
+
+// ── C29 硬：工具链/元数据不得说谎（本轮的闭环真的抓到了一条）────────────────────
+// 由来：本轮我用 PowerShell `Set-Content -Encoding UTF8` 改 package.json —— 当前 shell 是
+// Windows PowerShell **5.1**，它写的 UTF-8 **带 BOM**。于是：
+//   ① 不变量自己 `JSON.parse(package.json)` 直接抛（闭环报 FAIL，是我自己发现的入口）；
+//   ② 更隐蔽的是 `calibrate-channels.mjs` 读版本失败后**保底写 "unknown"**，
+//      于是出厂标定件里的 `pluginVersion` 与 package.json 不符，而**没有任何地方会报错**。
+// 所以这条不变量钉两件事：源文件不许带 BOM；出厂产物里的版本号必须与 package.json 一致。
+{
+  const problems = []
+  const rel = ['package.json', 'index.js', ...readdirSync(resolve(dirname(indexPath), 'tools')).filter((f) => f.endsWith('.mjs')).map((f) => `tools/${f}`),
+    ...readdirSync(dirname(indexPath)).filter((f) => f.endsWith('.json') && !f.startsWith('.')).map((f) => f)]
+  const bom = []
+  for (const f of rel) {
+    const p = resolve(dirname(indexPath), f)
+    if (!existsSync(p)) continue
+    const b = readFileSync(p)
+    if (b.length >= 3 && b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf) bom.push(f)
+  }
+  if (bom.length) problems.push(`源文件带 BOM（让 JSON 解析器直接抛，且会把假值写进产物）：${bom.slice(0, 6).join(', ')}`)
+  // 出厂产物必须写明**当前**版本（否则"标定件是为哪个版本算的"就是假的）
+  const pkgPath = resolve(dirname(indexPath), 'package.json')
+  const artPath = resolve(dirname(indexPath), 'responsePolicy.json')
+  if (existsSync(pkgPath) && existsSync(artPath)) {
+    let pkgVersion = null
+    let art = null
+    try { pkgVersion = JSON.parse(readFileSync(pkgPath, 'utf8').replace(/^\uFEFF/, '')).version } catch (e) { problems.push(`package.json 解析失败：${e.message}`) }
+    try { art = JSON.parse(readFileSync(artPath, 'utf8').replace(/^\uFEFF/, '')) } catch (e) { problems.push(`responsePolicy.json 解析失败：${e.message}`) }
+    if (art && pkgVersion) {
+      const v = art.scope && art.scope.pluginVersion
+      if (v !== pkgVersion) problems.push(`标定件的 pluginVersion=${v} 与 package.json 的 ${pkgVersion} 不符（改版本号后必须重跑 calibrate-channels.mjs）`)
+      if (!Number.isFinite(Date.parse(art.generatedAtUtc))) problems.push('标定件缺可解析的 generatedAtUtc')
+    }
+  }
+  if (problems.length) for (const p of problems) fails.push(`C29 ${p}`)
+  else oks.push(`C29 元数据不说谎：源文件无 BOM（${rel.length} 个），标定件 pluginVersion 与 package.json 一致`)
 }
 
 // ── 输出 ────────────────────────────────────────────────────────────────

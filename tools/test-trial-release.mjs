@@ -67,7 +67,7 @@ async function boot(config) {
     on: (n, fn) => { handlers[n] = fn; return () => {} },
     effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {} },
   }
-  await mod.apply(ctx, { adaptiveStateEnabled: false, ...config })
+  await mod.apply(ctx, { adaptiveStateEnabled: false, responseChannels: { lexicon: { enabled: true } }, ...config })
 }
 const dispatch = (name, ...args) => handlers['internal/dispatch']('x', name, args, null)
 const sessionEvent = (session, event) => dispatch('session/event', session, event)

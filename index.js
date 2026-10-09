@@ -1,4 +1,4 @@
-﻿/**
+/**
  * dsh-trajectory-anchor — self-contained bundle plugin.
  *
  * All mechanisms live-validated on this harness family via dynamic-plugin
@@ -132,16 +132,22 @@ const DEFAULTS = {
     failure: { enabled: true, refMinSteps: 20, testWindow: 3, actAlpha: 1e-5, notifyAlpha: 1e-4, consecutive: 1, capabilityEligible: false },
     // 词表通道：α **必须各自标定**——行为通道反解出的 1e-5 不能套到它头上（两者标度不同）。
     // 它的会话级空转率实测 15.9%（α=1e-3）～43.2%（α=0.01），按 5% 预算同样需要 ~1e-5；
-    // 但它的能力层资格本就是 false（标定 FAIL），所以这里保留历史值 0.01/0.05 并在
-    // 标定件接入后按各自的反解值覆盖。
+    // 但它的能力层资格本就是 false（标定 FAIL），所以这里保留历史值 0.01/0.05，
+    // 万一被显式打开，装载器仍会按各自的反解值覆盖。
     // ⚠ 词典/风格通道**默认关闭**（2026-10-09，实测否定后移除判据面）：
     // 它作为**漂移判据**已被实测否定——在真实语料上 α=0.05 时召回 4.3%、精确率 6.2%
-    // （低于 20% 的随机基线）；对强锚点的精度倍数也不到 1。留着它只会扩大噪音面
-    // （多一条可能误触发的通道、多一列要解释的状态）。
+    // （低于 20% 的随机基线）；对强锚点的精度倍数也不到 1；60 会话判别力实测
+    // 召回 24.2% 对**同预算随机** 36.8%（0.64×），部署口径（节流后）1.06× ≈ 随机。
+    // 留着它只会扩大噪音面（多一条可能误触发的通道、多一列要解释的状态）。
+    // **关闭是结构性关闭**：channelTests 在 enabled===false 时**根本不构造这一行**
+    // （index.js 的 `if (lexCfg.enabled !== false)`），所以它既不会被标定件授权、
+    // 也不会被试运行放行重新拉回判断面——这条由 C28 不变量 + 反向对照守着。
     // **但它作为"锚定机制的判据"仍在用**：首轮 persona/工具面/上下文抑制三件套与晋升门
     // （`anchor-gate:minimal-like` = 最近推理窗有 we、无 let me）依赖的是 `CONFIG.lexicon`
     // 与逐分块的 `updateWindow`，**不是这条通道**——所以关掉它不影响锚定本身。
-    lexicon: { enabled: true, refMinSteps: 12, testWindow: 4, actAlpha: 0.01, notifyAlpha: 0.05, consecutive: 1, capabilityEligible: false },
+    // 离线测量件（evaluate-signals / test-ledger-parity 等）要复现历史口径时显式传
+    // `responseChannels: { lexicon: { enabled: true } }` 即可。
+    lexicon: { enabled: false, refMinSteps: 12, testWindow: 4, actAlpha: 0.01, notifyAlpha: 0.05, consecutive: 1, capabilityEligible: false },
   },
   // ── L1 任务锚定拉回（信息型，默认关）──────────────────────────────────────────
   // 它是**第一个把话直接说给模型听**的动作。机制已验证（注入漂移必须触发、措辞/节流/豁免合规），
@@ -1618,9 +1624,10 @@ function channelTests(rec) {
   const series = channelSeries(rec)
   for (const name of ['inaction', 'repetition', 'failure']) out.push(channelTest(name, series[name] || [], priorForFamily(rec, name)))
   // 人工试运行放行（**唯一**入口，且默认不存在）：把名单里的通道的资格与工作点显式抬起来。
-  // 两条纪律：
+  // 三条纪律：
   //   · 试运行**只**绕"标定件给不给资格"，不绕数据质量（lexicon-degenerate 依然挡住该通道）；
-  //   · 动手**不是静默的**——这里留一次 trial-release-armed 审计，status 里也能看到 α 与到期时间。
+  //   · 动手**不是静默的**——这里留一次 trial-release-armed 审计，status 里也能看到 α 与到期时间；
+  //   · 放行了却没生效也**不是静默的**（trial-release-unavailable，见下）。
   const trial = trialReleaseActive()
   if (trial) {
     const granted = []
@@ -1638,6 +1645,29 @@ function channelTests(rec) {
         channels: granted, alpha: trial.alpha, until: trial.until, note: trial.note,
         why: '标定件未授权，按人工放行进入试运行（会写 didNarrow，供 L3.3 结局回灌积累样本）',
       })
+    }
+    // 第三条纪律：**放行了却没生效必须可见**。
+    // 试运行是 L3.3 攒样本的唯一入口，而它只作用于"已经产出的通道行"——名单里写了一条
+    // 出厂关闭的通道（如 lexicon）、写错名字、或该通道正被 lexicon-degenerate 挡着时，
+    // 放行会**静静地什么都不做**：操作者以为试运行在跑，实际样本永远是 0。
+    // 这正是"失败不得静默"这一条在治理配置上的落点（此前只能靠人对着 status 猜）。
+    const notGranted = trial.channels
+      .filter((n) => !granted.includes(n))
+      .map((n) => {
+        if (!CONFIG.responseChannels || !CONFIG.responseChannels[n]) return `${n}:unknown-channel`
+        const row = out.find((c) => c.name === n)
+        return row ? `${n}:${row.blockedBy || 'not-granted'}` : `${n}:channel-disabled`
+      })
+    if (notGranted.length > 0) {
+      const sig = notGranted.join('+')
+      if (rec.trialReleaseUnavailable !== sig) {
+        rec.trialReleaseUnavailable = sig
+        logAudit(rec, 'trial-release-unavailable', {
+          channels: notGranted, configured: trial.channels.slice(), available: out.map((c) => c.name),
+          why: '试运行名单里这些通道没有生效：既不会动手，也不会为 L3.3 积累任何样本',
+        })
+        noteConfigWarning(`trialRelease 放行的通道没有生效（不会积累样本）：${sig}`)
+      }
     }
   }
   return out
@@ -3038,6 +3068,7 @@ function summaryOf(rec) {
     capabilityBudgetExhausted: rec.capabilityBudgetExhausted,
     // 本会话的资格是否由**人工试运行**授予（null = 本会话没走到那条路径）
     trialReleaseArmed: rec.trialReleaseArmed || null,
+    trialReleaseUnavailable: rec.trialReleaseUnavailable || null,
     policy: rec.lastPolicy,
     policyAction: rec.lastPolicyAction,
     policyChannel: rec.lastPolicyChannel,
@@ -3115,6 +3146,11 @@ function summaryOf(rec) {
     // 最近审计种类摘要：让"判定为何没启动"这类问题不必翻日志就能看见
     // （也是 policy-skipped 两档留痕的可测面）。
     auditTail: rec.events.slice(-8).map(e => e.kind),
+    // 同一缓冲里的**去重**种类集合：`auditTail` 只有最近 8 条，凡在更早位置发生的种类
+    // （例如开局一次的 trial-release-* 治理事件）在那 8 条里看不见，于是"这条审计到底
+    // 发生过没有"只能靠翻文件。范围与 auditTail 完全同源（当前内存缓冲，即上次成块
+    // 落盘之后的事件），条数上界是种类数而不是事件数，所以可以安全地全量给出。
+    auditKinds: [...new Set(rec.events.map(e => e.kind))],
     maxTokensRewritten: rec.maxTokensRewritten,
     maxTokensStripped: rec.maxTokensStripped,
     reward: rec.reward,

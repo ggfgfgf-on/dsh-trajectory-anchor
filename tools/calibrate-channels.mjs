@@ -214,8 +214,14 @@ const eligible = results.filter((r) => r.capabilityEligible).map((r) => r.key)
 // 版本号从 package.json 读（单一来源；硬编码曾在提交文案与 package.json 之间漂移）。
 let pluginVersion = 'unknown'
 try {
-  pluginVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
-} catch { /* 保底 unknown，不因此中断标定 */ }
+  // ⚠ **BOM 容忍**：PowerShell 5.1 的 `Set-Content -Encoding UTF8` 会写 BOM，而 `JSON.parse`
+  //    遇到 BOM 直接抛 —— 本轮真的发生过：标定件被写成 `"pluginVersion": "unknown"`，
+  //    与 package.json 的 0.5.0 不符，而**没有任何地方会因此报错**（是闭环的不变量对不上才暴露）。
+  pluginVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8').replace(/^\uFEFF/, '')).version
+} catch (e) {
+  // 保底 unknown，不因此中断标定 —— 但**不许静默**：产物里的假值必须当场能看见。
+  console.warn(`[calibrate] 读不到 package.json 的版本，产物会写 "unknown"：${e.message}`)
+}
 const artifact = {
   generatedAtUtc: new Date().toISOString(),
   scope: { pluginVersion, release: 'B3-calibration', taskFamily: 'dsh-sessions' },

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * test-policy-gate.mjs —— B3 运行时门禁回归（合成会话驱动真实 apply）
  *
  * 覆盖"必须只观察"的五类情形与"必须放开"的一类情形：
@@ -93,7 +93,7 @@ function deviate(session) {
 const statusOf = async () => registeredTools.anchor_status.execute({})
 const rowOf = async (sid) => (await statusOf()).rows.find((r) => r.sessionId === sid)
 const closeSession = (sid) => dispatch('agent/disposed', { agent: agentsById.get(sid) })
-const LEX = { lexicon: { capabilityEligible: true, actAlpha: 0.01, notifyAlpha: 0.05 } }
+const LEX = { lexicon: { enabled: true, capabilityEligible: true, actAlpha: 0.01, notifyAlpha: 0.05 } }
 const ARMED = { rollbackEnabled: true, notifyEnabled: true, responseChannels: LEX }
 
 // ── ① 未提供标定件：配置即生效（门禁不得误拦）──────────────────────────────
@@ -156,7 +156,7 @@ await boot({ ...ARMED, responsePolicyPath: write('safe.json', { verdict: 'PASS',
 await boot({
   rollbackEnabled: true, notifyEnabled: true,
   responsePolicyPath: write('pass-wide.json', { verdict: 'PASS', capabilityEligibleChannels: ['lexicon'] }),
-  responseChannels: { lexicon: { capabilityEligible: false, actAlpha: 0.01, notifyAlpha: 0.05 } },
+  responseChannels: { lexicon: { enabled: true, capabilityEligible: false, actAlpha: 0.01, notifyAlpha: 0.05 } },
 })
 {
   const s = await statusOf()
@@ -175,7 +175,7 @@ await boot({
     verdict: 'PASS', capabilityEligibleChannels: ['lexicon'],
     channels: { lexicon: { derived: { consecutive: 1, alpha: 0.00001 } } },
   }),
-  responseChannels: { lexicon: { capabilityEligible: false, actAlpha: 0.01, notifyAlpha: 0.05 } },
+  responseChannels: { lexicon: { enabled: true, capabilityEligible: false, actAlpha: 0.01, notifyAlpha: 0.05 } },
 })
 {
   const { session } = adoptAndLift('gate-E2')
@@ -199,7 +199,7 @@ await boot({
     verdict: 'PASS', capabilityEligibleChannels: ['lexicon'],
     channels: { lexicon: { derived: { consecutive: 3, alpha: 0.01 } } },
   }),
-  responseChannels: { lexicon: { capabilityEligible: false, actAlpha: 0.01, notifyAlpha: 0.05, consecutive: 1 } },
+  responseChannels: { lexicon: { enabled: true, capabilityEligible: false, actAlpha: 0.01, notifyAlpha: 0.05, consecutive: 1 } },
 })
 {
   const { session } = adoptAndLift('gate-K')
@@ -237,7 +237,7 @@ await boot({
 // 第 5 步则证明计数器终究会到位（否则"永不动作"也能通过，等于没有断言）。
 await boot({
   rollbackEnabled: true, notifyEnabled: true,
-  responseChannels: { lexicon: { capabilityEligible: true, actAlpha: 0.0003, notifyAlpha: 0.05, consecutive: 3 } },
+  responseChannels: { lexicon: { enabled: true, capabilityEligible: true, actAlpha: 0.0003, notifyAlpha: 0.05, consecutive: 3 } },
 })
 {
   const { session } = adoptAndLift('gate-tier')
@@ -270,7 +270,7 @@ await boot({
 for (const [label, na, expect] of [['宽档 0.05', 0.05, 'notice'], ['窄档 1e-4', 0.0001, 'none']]) {
   await boot({
     rollbackEnabled: true, notifyEnabled: true,
-    responseChannels: { lexicon: { capabilityEligible: true, actAlpha: 0.01, notifyAlpha: na } },
+    responseChannels: { lexicon: { enabled: true, capabilityEligible: true, actAlpha: 0.01, notifyAlpha: na } },
   })
   const { session } = adoptAndLift('gate-alpha-' + na)
   for (let i = 0; i < 16; i++) sessionEvent(session, text('We will run the full build and verify each artifact carefully.'))
@@ -350,7 +350,9 @@ await boot({ ...ARMED, responsePolicyPath: write('broken.json', null) })
   armed.capabilityEligibleChannels = ['inaction']
   armed.channels.inaction.derived = { consecutive: 2, alpha: 0.002 }
   const armedPath = write('armed.json', armed)
-  await boot({ rollbackEnabled: true, notifyEnabled: true, responsePolicyPath: armedPath })
+  // 词典通道出厂默认已关（实测否定后移出判据面），这里**显式打开**——
+  // 本条的断言对象是"标定件没授权的通道不得获得资格"，需要那条行**在场**才有意义。
+  await boot({ rollbackEnabled: true, notifyEnabled: true, responsePolicyPath: armedPath, responseChannels: { lexicon: { enabled: true } } })
   const s2 = await statusOf()
   check('⑪ 同一标定件改成 PASS 后卡口放行（授权路径确实通）', s2.capabilityGate === null, String(s2.capabilityGate))
   check('⑪ 并且只授权写明的通道', JSON.stringify(s2.policyArtifact?.eligibleChannels) === JSON.stringify(['inaction']),
@@ -360,8 +362,13 @@ await boot({ ...ARMED, responsePolicyPath: write('broken.json', null) })
   const row = await rowOf('gate-shipped')
   const ina = (row.channels || []).find((c) => c.name === 'inaction')
   check('⑪ 反解参数真正写进生效配置', ina && ina.actAlpha === 0.002 && ina.consecutive === 2, JSON.stringify(ina && { a: ina.actAlpha, k: ina.consecutive }))
-  const lex = (row.channels || []).find((c) => c.name === 'lexicon')
-  check('⑪ 未授权的通道保持无资格', lex && lex.eligible === false, JSON.stringify(lex && { e: lex.eligible }))
+  const rows = row.channels || []
+  const lex = rows.find((c) => c.name === 'lexicon')
+  const others = rows.filter((c) => c.name !== 'inaction')
+  // "行在场"是硬条件：否则这条会因通道整行不产出而**空过**（词典默认关闭后正是这个陷阱）。
+  check('⑪ 未授权的通道保持无资格（且被断言的行确实在场）',
+    rows.length >= 4 && others.length >= 3 && lex && lex.eligible === false && others.every((c) => c.eligible === false),
+    JSON.stringify({ rows: rows.map((c) => c.name + ':' + c.eligible) }))
 }
 
 // ── ⑫ 两套 α 按估计器选（装先验 vs 不装先验必须给出不同门限）──────────────────

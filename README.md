@@ -117,7 +117,7 @@ agent/disposed: RewardAnnotator process reward + trajectory JSONL final archive
 | `lexicon` / `ratioWeights` | monitor-calibrated | weighted lexicon scoring (we/let's/we'll/"we need"/our vs "let me"; neutral i will/i'll/i need/check/verify) |
 | `specMax` / `reactMin` | `0.2` / `0.5` | persona_ratio band boundaries (spec/mixed/react) |
 | `refMinSteps` / `testWindow` | `12` / `4` | **session-local reference test**: the last `testWindow` observations are compared against the session's own earlier history |
-| `responseChannels` | 4 channels, all `capabilityEligible: false` | per-channel overrides (`refMinSteps`, `testWindow`, `window`, `minRepeats`, `consecutive`, `capabilityEligible`). Merged **per channel** — overriding one channel never wipes the others |
+| `responseChannels` | 4 channels, all `capabilityEligible: false` (**the style/`lexicon` channel additionally ships `enabled: false`**) | per-channel overrides (`enabled`, `refMinSteps`, `testWindow`, `window`, `minRepeats`, `consecutive`, `capabilityEligible`). Merged **per channel** — overriding one channel never wipes the others |
 | `actAlpha` / `notifyAlpha` | `0.01` / `0.05` | budgets for the capability layer / notification layer (one-sided Mann-Whitney p-value thresholds for the lexicon channel; exact one-sided binomial for the behavioural channels) |
 | `responsePolicyPath` | `null` | calibration artifact (`responsePolicy.json`) that decides which channels may act; `TRAJECTORY_ANCHOR_POLICY_PATH` is an equivalent source. Missing / unparseable / expired / `verdict ≠ PASS` ⇒ observe-only |
 | `measurementSafe` | `false` | evaluation protection: `true` forces observe-only (both layers), so a measured score cannot be attributed to the plugin |
@@ -168,7 +168,7 @@ can never block another that is:
 
 | Channel | What it measures | Window / min reference | Capability-eligible | Evidence |
 |---|---|---|---|---|
-| `lexicon` | one-sided Mann-Whitney on the session's own weighted-ratio series | 4 / 12 | **no** | calibration FAIL: 42.2% of sessions falsely narrowed at α=0.01 |
+| `lexicon` | one-sided Mann-Whitney on the session's own weighted-ratio series | 4 / 12 | **no** | calibration FAIL: 42.2% of sessions falsely narrowed at α=0.01. **Ships `enabled: false`** (v0.5.1): as a *drift criterion* it was measured worse than chance — 60-session discriminative power 24.2% recall vs **36.8% same-budget chance** (0.64×), 1.06× ≈ chance in its throttled deployed form, and <1× precision against strong anchors; on the live session it was degenerate anyway (`positive-bucket-never-hit` over 12 scored steps). The channel row is not even *built* while disabled, so neither a calibration artifact nor a trial release can bring it back (invariant C28). It remains in use as the *anchoring* criterion (`CONFIG.lexicon` + per-chunk windows drive the bootstrap persona/tool-surface/promotion gate) — that is a different mechanism and is unaffected |
 | `inaction` (A′) | a step with **no tool call** that is *not* the last step of its turn. Double-judged: a later step in the same turn proves it was mid-turn; `turn/end` demotes it to a legal ending | 3 / 20 | yes | 67 no-tool steps measured: **100% were turn-final** — without the turn-end exclusion this channel is a 100% false positive |
 | `repetition` (C) | same tool + normalized args ≥2 times within the last 5 steps | 3 / 20 | yes | 0/26 sessions fired (community precedent: allostasis `repetition.js`, `REPEAT_MIN_COUNT=3` + `CONSECUTIVE_STEPS=2`) |
 | `failure` (B) | the step's tool result carries an explicit failure marker (6 markers; runtime and calibration tool must agree — invariant C8) | 3 / 20 | **no** (notify only) | 12/26 sessions fired at k=2 — far above the 5% budget |
@@ -177,6 +177,13 @@ can never block another that is:
 is meant to be flipped by a calibration artifact; until then every channel is
 audit-only. Channel windows are visible live in `anchor_status` (`channels` = the
 snapshot used by the last decision, `channelWindows` = the live ledger window).
+A channel with `enabled: false` produces **no row at all** (it is not merely
+ineligible), which is why disabling the style channel is structural: the two
+existing grant paths — a calibration artifact writing `capabilityEligible`, and a
+hand-run trial release iterating the produced rows — cannot reach it. A trial
+release naming a channel that cannot take effect is reported instead of failing
+silently (`trial-release-unavailable` audit + `configWarnings` + status field),
+because the trial is how the L3.3 outcome-feedback loop accumulates samples.
 
 **Why the per-test α cannot be a round number (B2).** α is the false-alarm rate of
 *one test*, but the budget is per *session* — and a session runs hundreds of tests,

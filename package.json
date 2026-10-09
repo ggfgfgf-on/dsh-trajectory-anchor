@@ -1,6 +1,6 @@
 {
   "name": "@dsh-ext/trajectory-anchor",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Self-contained DeepSeek Harness bundle: first-round trajectory anchoring (bootstrap tool surface + Minimal persona + context suppression), per-step trajectory scoring with an append-only audit log, assembly-time derived tool surface, session-local reference drift test with bounded episodes, anchorGate promotion gating, and Layer-4 training-data aggregation. Zero community-plugin dependencies.",
   "type": "module",
   "main": "index.js",

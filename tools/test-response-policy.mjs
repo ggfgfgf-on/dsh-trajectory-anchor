@@ -1,4 +1,4 @@
-﻿/**
+/**
  * test-response-policy.mjs —— P1+P3+P4+P5+P6 的端到端契约回归（合成会话驱动真实 apply）
  *
  * 覆盖：
@@ -12,7 +12,9 @@
  * 用法：node tools/test-response-policy.mjs [index.js 路径]
  */
 import { pathToFileURL, fileURLToPath } from 'node:url'
-import { resolve } from 'node:path'
+import { resolve, join } from 'node:path'
+import { writeFileSync, mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 
 const here = fileURLToPath(new URL('.', import.meta.url))
 const target = resolve(here, process.argv[2] || '../index.js')
@@ -86,7 +88,7 @@ async function adoptAndLiftByRequests(sid, requests = 5) {
 const summaryOf = async (sid) => (await registeredTools.anchor_status.execute({})).rows.find((r) => r.sessionId === sid)
 
 // ── 场景 A：参考段不足 ───────────────────────────────────────────────────
-await boot({ rollbackEnabled: true })
+await boot({ rollbackEnabled: true, responseChannels: { lexicon: { enabled: true } } })
 {
   const { session } = await adoptAndLift('sess-A')
   for (let i = 0; i < 6; i++) sessionEvent(session, text('let me check the failing assertion once more'))
@@ -99,7 +101,7 @@ await boot({ rollbackEnabled: true })
 }
 
 // ── 场景 G：会话最开头（连检验窗都没有）也必须留痕 ───────────────────────
-await boot({ rollbackEnabled: true, notifyEnabled: true })
+await boot({ rollbackEnabled: true, notifyEnabled: true, responseChannels: { lexicon: { enabled: true } } })
 {
   const { session } = await adoptAndLift('sess-G')
   // 锚定后只有 1 步：history < testWindow(4) → refLen ≤ 0 → no-observation
@@ -111,7 +113,7 @@ await boot({ rollbackEnabled: true, notifyEnabled: true })
 }
 
 // ── 场景 B：偏离触发 → 收窄 + 组装期派生 + notice ─────────────────────────
-await boot({ rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 3, responseChannels: { lexicon: { capabilityEligible: true, actAlpha: 0.01, notifyAlpha: 0.05 } } })
+await boot({ rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 3, responseChannels: { lexicon: { enabled: true, capabilityEligible: true, actAlpha: 0.01, notifyAlpha: 0.05 } } })
 {
   const { session } = await adoptAndLift('sess-B')
   for (let i = 0; i < 16; i++) sessionEvent(session, text('We will run the full build and verify each artifact carefully.'))
@@ -139,7 +141,7 @@ await boot({ rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 3, respo
 }
 
 // ── 场景 C：能力层关、通知层开（P0 保守档语义）────────────────────────────
-await boot({ rollbackEnabled: false, notifyEnabled: true })
+await boot({ rollbackEnabled: false, notifyEnabled: true, responseChannels: { lexicon: { enabled: true } } })
 {
   const { session } = await adoptAndLift('sess-C')
   for (let i = 0; i < 16; i++) sessionEvent(session, text('We will run the full build and verify each artifact carefully.'))
@@ -151,7 +153,7 @@ await boot({ rollbackEnabled: false, notifyEnabled: true })
 }
 
 // ── 场景 F：双关（出厂默认 + 当前 profile 配置）→ 只观察，什么都不做 ──────
-await boot({ rollbackEnabled: false, notifyEnabled: false })
+await boot({ rollbackEnabled: false, notifyEnabled: false, responseChannels: { lexicon: { enabled: true } } })
 {
   const { session } = await adoptAndLift('sess-F')
   for (let i = 0; i < 16; i++) sessionEvent(session, text('We will run the full build and verify each artifact carefully.'))
@@ -164,7 +166,7 @@ await boot({ rollbackEnabled: false, notifyEnabled: false })
 }
 
 // ── 场景 D：词典退化闸门（正桶 0 命中，但偏离真实存在）────────────────────
-await boot({ rollbackEnabled: true, notifyEnabled: true })
+await boot({ rollbackEnabled: true, notifyEnabled: true, responseChannels: { lexicon: { enabled: true } } })
 {
   const { session } = await adoptAndLiftByRequests('sess-D')
   // 参考段：只有负词/中性词命中（正桶 0 命中），ratio ≈ 0.07
@@ -180,7 +182,7 @@ await boot({ rollbackEnabled: true, notifyEnabled: true })
 }
 
 // ── 场景 E：轨迹恢复 → 回到 stable ───────────────────────────────────────
-await boot({ rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 50, responseChannels: { lexicon: { capabilityEligible: true, actAlpha: 0.01, notifyAlpha: 0.05 } } })
+await boot({ rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 50, responseChannels: { lexicon: { enabled: true, capabilityEligible: true, actAlpha: 0.01, notifyAlpha: 0.05 } } })
 {
   const { session } = await adoptAndLift('sess-E')
   for (let i = 0; i < 16; i++) sessionEvent(session, text('We will run the full build and verify each artifact carefully.'))
@@ -262,7 +264,7 @@ await boot({ rollbackEnabled: true, notifyEnabled: true, responseChannels: { rep
 }
 
 // ── 场景 J：B 工具失败 → 只能通知，不得驱动能力层（D1 分层）─────────────
-await boot({ rollbackEnabled: true, notifyEnabled: true })
+await boot({ rollbackEnabled: true, notifyEnabled: true, responseChannels: { lexicon: { enabled: true } } })
 {
   const { session } = await adoptAndLift('sess-J')
   cleanSteps(session, 1, 1, 24)
@@ -294,6 +296,119 @@ await boot({ rollbackEnabled: true, notifyEnabled: true })
   }
   walk(row, 'row')
   check('驱动过的会话行可无损 JSON 序列化（无 undefined/NaN/function）', bad.length === 0, bad.slice(0, 6).join(', '))
+}
+
+// ── 场景 K：词典/风格通道出厂关闭后，**任何** grant 都不得把它拉回判据面 ──────
+// 由来：它作为漂移判据已被实测否定（60 会话判别力：召回 24.2% 对**同预算随机** 36.8%
+// = 0.64×；部署口径节流后 1.06× ≈ 随机；对强锚点精度倍数 < 1），2026-10-09 移出判据面、
+// 出厂 enabled=false。这里要钉的**不是默认值是多少**，而是"关闭是结构性的"：
+// 判断面上的通道行在 enabled===false 时根本不构造（channelTests 的
+// `if (lexCfg.enabled !== false)`），所以"标定件授权"与"人工试运行放行"这两条
+// **已有的** grant 通道都碰不到它——不需要在那两处各加一个特判。
+// 四路：K1 标定件授权（须无效）/ K2 试运行放行（须无效且**可见地**无效）/
+//       K3 反向对照：同一段偏离在显式打开下确实收窄 / K4 正向对照：放行生效时不报"未生效"。
+const LEX_DRIFT = (session) => {
+  for (let i = 0; i < 16; i++) sessionEvent(session, text('We will run the full build and verify each artifact carefully.'))
+  for (let i = 0; i < 4; i++) sessionEvent(session, text('let me just try something quick here'))
+}
+const kDir = mkdtempSync(join(tmpdir(), 'response-policy-k-'))
+const lexGrantPath = join(kDir, 'lex-grant.json')
+writeFileSync(lexGrantPath, JSON.stringify({
+  verdict: 'PASS',
+  capabilityEligibleChannels: ['lexicon'],
+  channels: { lexicon: { derived: { consecutive: 1, alpha: 0.01 } } },
+}, null, 2), 'utf8')
+const TRIAL = (channels, note) => ({ trialRelease: { channels, alpha: 0.01, until: '2099-01-01T00:00:00Z', note } })
+
+// K1：标定件**真的**写入了 lexicon 授权，但判断面上连这一行都没有
+await boot({ rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 3, responsePolicyPath: lexGrantPath })
+{
+  const { session } = await adoptAndLift('sess-K1')
+  LEX_DRIFT(session)
+  const st = await registeredTools.anchor_status.execute({})
+  const row = await summaryOf('sess-K1')
+  const names = (row.channels || []).map((c) => c.name)
+  check('K1 前置：标定件确实声明并写入了 lexicon 授权（否则本条空过）',
+    JSON.stringify(st.policyArtifact && st.policyArtifact.eligibleChannels) === JSON.stringify(['lexicon']),
+    JSON.stringify(st.policyArtifact && { v: st.policyArtifact.verdict, e: st.policyArtifact.eligibleChannels }))
+  check('K1 判断面上没有词典行（结构性关闭：行不产出）',
+    !names.includes('lexicon') && names.length === 3, JSON.stringify(names))
+  check('K1 同一段偏离不产生任何收窄（被否定的信号不得回到判据面）',
+    row.policy === 'stable' && row.surfacePhase === 'stable' && row.narrowedNow === false,
+    `${row.policy}/${row.policyReason}/${row.surfacePhase}`)
+}
+
+// K2：试运行放行名单里写了已关闭的通道 → 无效，且**必须可见**
+await boot({ rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 3, ...TRIAL(['lexicon'], 'K2：放行已关闭的通道') })
+{
+  const { session } = await adoptAndLift('sess-K2')
+  LEX_DRIFT(session)
+  const st = await registeredTools.anchor_status.execute({})
+  const row = await summaryOf('sess-K2')
+  const names = (row.channels || []).map((c) => c.name)
+  check('K2 试运行放行不产出该行', !names.includes('lexicon') && names.length === 3, JSON.stringify(names))
+  check('K2 放行了却没生效 → 明文审计（L3.3 的样本入口不许静默失效）',
+    Array.isArray(row.auditKinds) && row.auditKinds.includes('trial-release-unavailable'), JSON.stringify(row.auditKinds))
+  check('K2 原因写明是"通道被配置关掉"而不是别的',
+    row.trialReleaseUnavailable === 'lexicon:channel-disabled', String(row.trialReleaseUnavailable))
+  check('K2 也进 configWarnings（治理配置失效在 status 里看得见）',
+    (st.configWarnings || []).some((w) => /trialRelease/.test(w) && /lexicon/.test(w)), JSON.stringify(st.configWarnings))
+  check('K2 不动手', row.policy === 'stable' && row.surfacePhase === 'stable', `${row.policy}/${row.surfacePhase}`)
+}
+
+// K3：反向对照——同一段偏离，显式打开词典通道后必须真的收窄
+//     （没有这一条，K1/K2 可能只是因为"这段文本本来就检不出偏离"而空过）
+await boot({
+  rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 3,
+  responseChannels: { lexicon: { enabled: true, capabilityEligible: true, actAlpha: 0.01, notifyAlpha: 0.05 } },
+})
+{
+  const { session } = await adoptAndLift('sess-K3')
+  LEX_DRIFT(session)
+  const row = await summaryOf('sess-K3')
+  check('K3 反向对照：同一段偏离在显式打开下确实收窄',
+    row.narrowedNow === true && (row.channels || []).some((c) => c.name === 'lexicon' && c.eligible === true),
+    `${row.policy}/${row.surfacePhase}/${JSON.stringify((row.channels || []).map((c) => c.name + ':' + c.eligible))}`)
+}
+
+// K4：正向对照——放行**确实生效**时不得报"未生效"（证明 K2 的标记是判别性的，不是常亮）
+await boot({
+  rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 3, ...TRIAL(['lexicon'], 'K4：放行一个在线的通道'),
+  responseChannels: { lexicon: { enabled: true, capabilityEligible: false } },
+})
+{
+  const { session } = await adoptAndLift('sess-K4')
+  LEX_DRIFT(session)
+  const row = await summaryOf('sess-K4')
+  check('K4 正向对照：放行生效 → trialReleaseArmed=lexicon 且不报未生效',
+    row.trialReleaseArmed === 'lexicon' && row.trialReleaseUnavailable === null,
+    JSON.stringify({ armed: row.trialReleaseArmed, un: row.trialReleaseUnavailable }))
+  check('K4 且留的是 armed 审计（与 unavailable 互斥）',
+    Array.isArray(row.auditKinds) && row.auditKinds.includes('trial-release-armed') && !row.auditKinds.includes('trial-release-unavailable'),
+    JSON.stringify(row.auditKinds))
+  check('K4 试运行工作点写进了行（α 不沿用任何默认）',
+    (row.channels || []).some((c) => c.name === 'lexicon' && c.trialRelease === true && c.actAlpha === 0.01),
+    JSON.stringify((row.channels || []).map((c) => `${c.name}:${c.actAlpha}:${c.trialRelease}`)))
+}
+
+// K5：关掉词典之后，"**默认配置下**唯一还活着的执行路径"必须端到端可用：
+//     行为通道（inaction）够强 ⇒ 能力层收窄 ⇒ 组装期**真的摘工具** + 注入可见 notice。
+//     为什么必须补：场景 H/I 只断言到 narrowedNow，场景 B 断言了组装面但那条路现在要显式
+//     打开词典；不补这一条，"出厂默认下到底还能不能真的动手"就只能靠读代码相信。
+await boot({ rollbackEnabled: true, notifyEnabled: true, responseChannels: { inaction: { capabilityEligible: true } } })
+{
+  const { session } = await adoptAndLift('sess-K5')
+  cleanSteps(session, 1, 1, 24)
+  for (let i = 25; i <= 28; i++) sessionEvent(session, msgAt(1, i, OK_TEXT))   // 无工具调用但回合继续
+  const row = await summaryOf('sess-K5')
+  const out = await handlers['system-prompt/assemble'](asm(), { agent: { id: 'sess-K5' } }, async () => asm())
+  const names = out.tools.map((t) => t.name).join(',')
+  check('K5 出厂默认（词典关）下行为通道照样驱动收窄',
+    row.narrowedNow === true && row.policyChannel === 'inaction', `${row.policyChannel}/${row.surfacePhase}`)
+  check('K5 且组装期真的摘工具（不是只改了状态）', names === 'pwsh,read,edit,grep', names)
+  check('K5 且注入了模型可见 notice',
+    (out.sections || []).some((s) => s.name === 'trajectory-anchor:notice'),
+    JSON.stringify((out.sections || []).map((s) => s.name)))
 }
 
 console.log(`\n${pass} pass, ${fail} fail`)
