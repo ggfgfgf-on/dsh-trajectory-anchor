@@ -1,0 +1,29 @@
+{
+  "generatedAtUtc": "2026-10-09T10:08:05.954Z",
+  "kind": "anchoring-effect-reproduction",
+  "command": "node tools/reproduce-anchor-effect.mjs",
+  "planClaim": "plan README: with only pwsh plus the Minimal persona the first reasoning block of a fresh subagent is pure \"we\" (lexicon ratio 282-290, spec band)",
+  "anchored": {
+    "n": 55,
+    "bandCount": {
+      "spec": 23,
+      "react": 25,
+      "undefined": 6,
+      "mixed": 1
+    },
+    "specRate": 0.41818181818181815,
+    "meanRatio": 19.882,
+    "meanPersonaRatio": 0.45454545454545453
+  },
+  "unanchored": {
+    "n": 34,
+    "bandCount": {
+      "react": 23,
+      "spec": 11
+    },
+    "specRate": 0.3235294117647059,
+    "meanRatio": 0.8423529411764706,
+    "meanPersonaRatio": 0.6647058823529413
+  },
+  "note": "计划书核心证据（首轮复现 Minimal 条件 => 纯 we / spec band）在今天真实日志里只能部分复现：锚定会话首条评分 42% 落 spec band（未锚定组 32%，但两组不可比——未锚定是 resumed/历史会话，其\"首条评分\"并非首轮）；量纲也不同（计划书 282-290，现语料 0-66）=> 无法直接比对。关键：没有任何测量表明\"像 Minimal => 做得更好\"——机制有效性与效果有效性是两件事。"
+}

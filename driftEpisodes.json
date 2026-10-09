@@ -1,23 +1,37 @@
 {
-  "generatedAtUtc": "2026-10-09T08:55:47.064Z",
+  "generatedAtUtc": "2026-10-09T10:07:24.863Z",
+  "kind": "max-drift-steps-derivation",
   "command": "node tools/measure-drift-episodes.mjs [日志目录] --out <前缀>",
   "dir": "D:\\deepseek-harness-dsh-v0.1.1-rc.2\\.dsh-trajectory-logs",
-  "files": 126,
+  "files": 129,
   "sessions": 96,
-  "sessionsWithNarrowing": 0,
-  "sessionsStuckOpen": 0,
-  "closedEpisodes": {
-    "n": 0,
-    "p50": null,
-    "p90": null,
-    "p95": null,
-    "max": null
+  "sessionsWithDrift": 33,
+  "sessionsStuckOpen": 32,
+  "driftEpisodes": {
+    "n": 14,
+    "p50": 19,
+    "p75": 40,
+    "p90": 43,
+    "p95": 56,
+    "max": 122,
+    "truncatedBy12": 9
   },
-  "openEpisodes": {
-    "n": 0,
-    "p50": null,
-    "max": null
+  "stillOpenEpisodes": {
+    "n": 32,
+    "p50": 19,
+    "max": 136
   },
-  "recommendedMaxDriftSteps": null,
-  "note": "上界来自\"自然恢复片段\"的 p95：太小会截断正常片段，缺了它会出现\"收窄后永不恢复\"（本项目最重那次事故）。"
+  "surfaceEpisodes": {
+    "n": 0
+  },
+  "planClaim": {
+    "p50": 5,
+    "p75": 9,
+    "p90": 12,
+    "p95": 19,
+    "max": 22,
+    "episodes": 53
+  },
+  "recommendedMaxDriftSteps": 56,
+  "note": "主口径 = `state drift → stable` 片段长度（maxDriftSteps 约束的正是它）；次口径 = 工具面收窄片段（P1 后才有，能力层关着时为 0）。上界应 ≥ p95(自然片段)：太小会截断正常片段，缺了它会出现\"收窄后永不恢复\"（本项目最重那次事故）。"
 }

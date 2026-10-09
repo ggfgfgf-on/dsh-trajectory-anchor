@@ -1,4 +1,4 @@
-﻿/**
+/**
  * check-invariants.mjs —— 静态不变量断言（零依赖，只读）
  *
  * 由来：v0.4.1–v0.4.3 的归还分支引用了一个 DEFAULTS 里不存在的键
@@ -990,9 +990,18 @@ if (existsSync(readmePath)) {
   } else {
     try {
       const j = JSON.parse(readFileSync(ep, 'utf8'))
-      const n = (j.closedEpisodes && j.closedEpisodes.n) || 0
-      if (j.recommendedMaxDriftSteps === null) {
-        debtsLocal.push(`C26 maxDriftSteps 仍是静态 ${/maxDriftSteps: (\d+)/.exec(src)?.[1] ?? '?'}：审计目录里自然恢复的收窄片段 ${n} 个 ⇒ **零样本无法反解**（工具已就位，等试运行产出片段后重跑即可）`)
+      const d = j.driftEpisodes || {}
+      const cur = /maxDriftSteps: (\d+)/.exec(src)?.[1] ?? '?'
+      const plan = j.planClaim || {}
+      // ⚠ 第一次我把这条写成"零样本无法反解"——**那是量错了事件**：我量的是 `surface phase`
+      // 事件（P1 之后才有、能力层关着 ⇒ 0），而 `maxDriftSteps` 约束的是**漂移片段**
+      // （`state drift → stable`，日志里有 50/45 个）。现在这条债务记的是**真问题**：
+      // 计划书声称 12 = p90 of 自然片段（p50=5/p90=12/p95=19），而现语料实测
+      // p50=19/p90=43/p95=56、且 32/46 片段**永不关闭** ⇒ 文档依据与当前语料差 3-4 倍。
+      if (Number.isFinite(d.p90) && Number.isFinite(plan.p90) && d.p90 > plan.p90 * 1.5) {
+        debtsLocal.push(`C26 maxDriftSteps=${cur} 的**文档依据与现语料不符**：计划书称 p90=${plan.p90}（旧定义"degraded run"，mean 4.27 步），`
+          + `而现语料实测 p50=${d.p50} p90=${d.p90} p95=${d.p95} max=${d.max}；${d.n} 个自然片段里 ${d.truncatedBy12} 个被 ${cur} 截断，`
+          + `另有 ${(j.stillOpenEpisodes || {}).n} 个永不关闭 ⇒ 要么按现定义重新反解、要么在文档里明确标注它是"继承值"`)
       }
     } catch (e) { debtsLocal.push(`C26 driftEpisodes.json 解析失败：${e.message}`) }
   }
