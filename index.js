@@ -45,6 +45,9 @@ import {
   parseTaskAnchors, inScope, isIgnorablePath, changeInvalidatesVerification, pathsFromCallStrict, isWriteTool,
   verifyCommandKind,
 } from './tools/task-anchor-core.mjs'
+// 纠偏线索**共用离线标注那一份**（`drift-label-core` 零依赖、只读）：避免"标注用的判据"
+// 与"运行时触发的判据"各写一份、然后悄悄漂移（本项目在台账与形态识别上各栽过一次）。
+import { CORRECTION_CUES } from './tools/drift-label-core.mjs'
 
 const DEFAULTS = {
   anchorEnabled: true,
@@ -152,6 +155,14 @@ const DEFAULTS = {
   // 所以凡是要动**上下文内容**的动作，一律先要在线证据。
   reanchorEnabled: false,
   reanchorEvidencePath: null,
+  // L2'（**确认即恢复**）：不要求"拉回有效"的在线效果件，只在**当场确认出问题**时重锚定一次。
+  // 为什么它可以在没有效果证据时存在：载荷是**信息型**的——把首轮 Minimal 载荷放回近因位置，
+  // 不改工具面、不改系统基线、不删任何信息 —— 与 L1 同一风险类别；而它的前提不是"预测未来"，
+  // 是**当场确认**（用户纠正 / 工具不存在 / 验证未通过）。仍然：measurementSafe 与 autoDemote
+  // 优先、每会话一次、全程留痕；并用同一套随机化对照（reanchorConfirmControlRate）
+  // ⇒ 它的**效果**照样能被估出来（落盘行 action='reanchor'），而不是靠相信它有用。
+  reanchorOnConfirm: false,
+  reanchorConfirmControlRate: 0,
   // 拉回效果采集：会话结束时把"说过之后行为有没有变"写成一行 JSONL（默认在 baseDir 下）。
   pullbackOutcomePath: null,
   // ── 累积状态（记忆）的持久化 ─────────────────────────────────────────────────
@@ -2127,7 +2138,9 @@ function effectiveActAlpha(name, base) {
  * 同样按 L1 的措辞纪律：陈述事实 + 建议，不用命令式。
  */
 export function reanchorText(persona, info, count) {
-  const why = info && info.path ? `（上次提醒针对 ${info.path}）` : ''
+  const CONFIRM_LABEL = { 'user-correction': '人类指出不对', 'unknown-tool': '调用了不存在的工具', 'verify-failed': '验证命令未通过' }
+  const whyConfirm = info && info.confirm ? `（本节确认信号：${CONFIRM_LABEL[info.confirm] || info.confirm}）` : ''
+  const why = whyConfirm || (info && info.path ? `（上次提醒针对 ${info.path}）` : '')
   return `[trajectory-anchor] 重锚定${count > 1 ? `（第 ${count} 次）` : ''}：前面的提醒之后轨迹仍未回到任务骨架${why}，`
     + '这里把首轮的工作方式原样带回来：'
     + `\n\n${persona}`
@@ -2136,15 +2149,50 @@ export function reanchorText(persona, info, count) {
 }
 
 /**
- * L2：是否该重锚定。比 L1 严得多——要过在线证据门、每会话只做一次、且必须"L1 已经说过话"
- * （先轻后重：能一句话解决就不动上下文）。
+ * 记一个**确认信号**（不是预测，是"当场能确证出问题了"）。三类：
+ *   · `user-correction` —— 人类消息里出现纠偏线索（共用 `CORRECTION_CUES` 那一份判据）
+ *   · `unknown-tool`    —— 工具面/计划不匹配的确认症状（本插件最重那次事故的可见形态）
+ *   · `verify-failed`   —— 刚跑过的验证命令输出里仍有失败标记
+ * 只保留**最近一个未被消费**的确认；一旦被"确认即恢复"消费就标 handled（每会话至多一次动作）。
+ */
+function noteConfirmation(rec, reason, turn, step, detail) {
+  if (rec.confirm && rec.confirm.handled === true) return false
+  rec.confirm = { reason, turn: turn ?? null, step: step ?? null, at: Date.now(), detail: detail ?? null, handled: false }
+  logAudit(rec, 'confirm-signal', { reason, turn, step, detail: detail ?? null })
+  return true
+}
+
+/** L2'（确认即恢复）是否被允许：**先判两道硬闸门**，再看装配开关。
+ *  顺序与 trialRelease 一致（都由 C27 的"次序断言"守着）：硬闸门必须排在开关之前，
+ *  否则将来一次改动就可能让开关绕过硬闸门。 */
+function confirmReanchorAllowed(rec) {
+  if (CONFIG.measurementSafe === true) return false
+  if (autoDemote) return false
+  if (CONFIG.reanchorOnConfirm !== true) return false
+  return true
+}
+
+/**
+ * L2 重锚定决策：**两条路径，判据不同**（混在一起会让人以为门被放宽了）。
+ *   ① 证据路径（原样）：`reanchorEnabled` ∧ 在线效果件 PASS-online ∧ L1 已说过 ∧ 有新证据
+ *      —— 回答"拉回**有没有用**"；
+ *   ② 确认路径（L2'）：`reanchorOnConfirm` ∧ **当场确认过**（user-correction / unknown-tool /
+ *      verify-failed）—— 回答"**已经确认出问题了**，把已知有效的首轮载荷放回去"。
+ * 两条都保持：每会话一次、measurementSafe/autoDemote 优先、全程留痕。
  */
 function reanchorDecision(rec, turn) {
-  if (!effectiveReanchor()) return null
-  if (rec.reanchor.count > 0) { rec.reanchor.suppressed.alreadyDone += 1; return null }
-  if (rec.pullback.count === 0) { rec.reanchor.suppressed.noPriorPullback += 1; return null }
-  if (rec.reanchor.lastPullbackCount === rec.pullback.count) { rec.reanchor.suppressed.noNewEvidence += 1; return null }
-  return { info: rec.pullback.lastInfo || null, reason: 'reanchor' }
+  if (effectiveReanchor()) {
+    if (rec.reanchor.count > 0) { rec.reanchor.suppressed.alreadyDone += 1; return null }
+    if (rec.pullback.count === 0) { rec.reanchor.suppressed.noPriorPullback += 1; return null }
+    if (rec.reanchor.lastPullbackCount === rec.pullback.count) { rec.reanchor.suppressed.noNewEvidence += 1; return null }
+    return { info: rec.pullback.lastInfo || null, reason: 'reanchor', via: 'evidence' }
+  }
+  if (confirmReanchorAllowed(rec)) {
+    if (rec.reanchor.count > 0) { rec.reanchor.suppressed.alreadyDone += 1; return null }
+    if (!rec.confirm || rec.confirm.handled === true) { rec.reanchor.suppressed.noConfirmation = (rec.reanchor.suppressed.noConfirmation || 0) + 1; return null }
+    return { info: { confirm: rec.confirm.reason }, reason: `confirm-${rec.confirm.reason}`, via: 'confirm' }
+  }
+  return null
 }
 
 /**
@@ -2174,11 +2222,14 @@ function markObs(rec, kind, turn, step) {
 /** 记一次触发（两条臂走同一条记录路径——口径对称是靠"共用代码"保证的，不是靠自觉）。
  *  `rate` 记下**这次触发时生效的控制率**：它是这条单元的**随机化分层标识**。
  *  为什么要记：控制率中途调整**不产生偏差**（臂是在触发点上随机分配的，意向性比较依然有效），
- *  但会产生"时段效应"——所以分析器要能按比例分层复核，而不是把不同比例的单元混在一起说不清。 */
-function markTrigger(rec, arm, reason, turn, step) {
+ *  但会产生"时段效应"——所以分析器要能按比例分层复核，而不是把不同比例的单元混在一起说不清。
+ *  `action` 区分**哪一种动作**：`pullback`（L1 信息型提醒）与 `reanchor`（L2' 确认即恢复）。
+ *  两者风险类别不同、门也不同，混在一起算会把两种效果糊成一种。 */
+function markTrigger(rec, arm, reason, turn, step, action = 'pullback') {
   const n = (rec.pullback.obsN = (rec.pullback.obsN || 0) + 1)
   const t = {
     arm, n, turn: turn ?? null, step: step ?? null, at: Date.now(), reason: reason ?? null,
+    action: action === 'reanchor' ? 'reanchor' : 'pullback',
     rate: Number.isFinite(CONFIG.pullbackControlRate) ? CONFIG.pullbackControlRate : null,
   }
   rec.pullback.triggers.push(t)
@@ -2187,8 +2238,7 @@ function markTrigger(rec, arm, reason, turn, step) {
 }
 
 /** 某次触发之后的观测窗口（**唯一口径**：落盘行、状态、离线分析都从这里来）。 */
-function windowAfter(rec, trig) {
-  return {
+function windowAfter(rec, trig) {  return {
     verifiesAfterPullback: rec.pullback.verifyMarks.filter((m) => m.n > trig.n).length,
     scopeViolationsAfter: rec.pullback.violationMarks.filter((m) => m.n > trig.n).length,
   }
@@ -2198,7 +2248,10 @@ const SESSION_LEVEL_FIELDS = ['claimedUnverifiedAfter', 'endedNarrowed', 'sawUnk
 
 function recordPullbackOutcome(rec) {
   try {
-    if (CONFIG.pullbackEnabled !== true) return
+    // 落盘的判据是"**有没有信息型执行器在工作**"，而不是"L1 开没开"：
+    // 只开 L2'（确认即恢复）时，它的效果同样必须被记下来——否则那条路径的效果**永远测不出来**
+    // （"打开了但没人量"是本项目反复出现的形态：可测性必须跟着执行器走）。
+    if (CONFIG.pullbackEnabled !== true && CONFIG.reanchorOnConfirm !== true) return
     const triggers = rec.pullback.triggers || []
     // 没有触发点就没有观测窗口——**不再**用"会话里说过话"当兜底（那正是把两条臂
     // 揉成一条的旧口径）。
@@ -2222,6 +2275,8 @@ function recordPullbackOutcome(rec) {
         triggersInSession: triggers.length,
         triggerTurn: t.turn,
         triggerStep: t.step,
+        // 哪一种动作：pullback（L1 信息型提醒）| reanchor（L2' 确认即恢复）
+        action: t.action || 'pullback',
         // 随机化分层标识：这条单元是在多大的控制率下分配的（分析器按它做分层复核）
         controlRate: Number.isFinite(t.rate) ? t.rate : null,
         reason: t.reason,
@@ -2407,7 +2462,7 @@ function adopt(agent, doAnchor, channel) {
       controls: 0,        // 被"故意不说"的次数（对照组）
     },
     // L2 重锚定状态（每会话只做一次）
-    reanchor: { count: 0, lastTurn: null, lastPullbackCount: null, lastAt: null, suppressed: { alreadyDone: 0, noPriorPullback: 0, noNewEvidence: 0 } },
+    reanchor: { count: 0, lastTurn: null, lastPullbackCount: null, lastAt: null, suppressed: { alreadyDone: 0, noPriorPullback: 0, noNewEvidence: 0, noConfirmation: 0 } },
     // L3 第三层：本会话各通道的行动级触发次数 + 结局代理
     channelActFires: {},
     sawUnknownTool: false,
@@ -2490,7 +2545,19 @@ function feedSessionEvent(session, event) {
       }
     }
   } else if (event.type === 'user/message') {
+    // 纠偏检测必须在 noteHumanMessage **之前**判"是不是第一条"（首条是任务陈述，不是纠偏）
+    const wasFirst = rec.anchorsFromMessage === null
     noteHumanMessage(rec, event)
+    if (!wasFirst) {
+      try {
+        const d = event.data || {}
+        const blocks = Array.isArray(d.content) ? d.content : []
+        const txt = blocks.filter((b) => b && b.type === 'text').map((b) => b.text || '').join('\n')
+        if (txt && CORRECTION_CUES.some((re) => re.test(txt))) {
+          noteConfirmation(rec, 'user-correction', d.turn, d.step, txt.slice(0, 100))
+        }
+      } catch (e) { /* 观测侧永不抛 */ }
+    }
   } else if (event.type === 'request/header') {
     noteRequestHeader(rec, event)
   } else if (event.type === 'session') {
@@ -2510,6 +2577,19 @@ function feedSessionEvent(session, event) {
     if (toolResultFailed(event) && /\bunknown tool\b|not a known tool/i.test(toolResultText(event))) {
       rec.sawUnknownTool = true
       logAudit(rec, 'unknown-tool', { turn: event.data && event.data.turn, step: event.data && event.data.step })
+      noteConfirmation(rec, 'unknown-tool', event.data && event.data.turn, event.data && event.data.step)
+    }
+    // **验证未通过**也是确认信号：刚跑过的那条验证命令，它的输出里仍有失败标记。
+    // 与 unknown-tool 不同，这里必须确认"这次结果属于那次验证调用"（按 turn#step 对齐）。
+    {
+      const k = `${event.data && event.data.turn}#${event.data && event.data.step}`
+      if (rec.lastVerifyCallKey && rec.lastVerifyCallKey === k) {
+        const txt = toolResultText(event)
+        if (txt && FAILURE_MARKERS.some((re) => re.test(txt))) {
+          noteConfirmation(rec, 'verify-failed', event.data && event.data.turn, event.data && event.data.step, txt.slice(-120))
+        }
+        rec.lastVerifyCallKey = null
+      }
     }
   } else if (event.type === 'turn/end') {
     // A′ 的关键排除：回合到此结束 ⇒ 最后一格"无工具调用"是合法收尾，不是停手。
@@ -2691,6 +2771,8 @@ function noteTaskSignal(rec, event) {
       // 观测窗口：**与说不说无关**地记一个验证 mark（旧代码这里是
       // `if (rec.pullback.count > 0) …`，于是对照臂永远没有窗口 ⇒ 两臂口径不对称）。
       markObs(rec, 'verify', turn, step)
+      // 记住这次验证调用的位置：它的**结果**回来时才知道这次验证过没过（确认信号 verify-failed）
+      rec.lastVerifyCallKey = `${turn}#${step}`
       // 重新验证会**解决**"未验证"这件事 ⇒ 必须同时清掉待发的提醒，否则会说出过期的提醒。
       // （实测：验证→改码→再验证 之后仍注入了提醒，测试用例 ⑥ 抓出来的。）
       if (rec.pendingPullback && rec.pendingPullback.reason === 'unverified') rec.pendingPullback = null
@@ -2980,6 +3062,11 @@ function summaryOf(rec) {
       count: rec.reanchor.count,
       lastTurn: rec.reanchor.lastTurn,
       suppressed: { ...rec.reanchor.suppressed },
+      // L2'（确认即恢复）：开关、是否被允许、当前确认信号、对照比例 —— 全部可见
+      onConfirm: CONFIG.reanchorOnConfirm === true,
+      confirmAllowed: confirmReanchorAllowed(rec),
+      confirm: rec.confirm ? { reason: rec.confirm.reason, turn: rec.confirm.turn, step: rec.confirm.step, handled: rec.confirm.handled === true } : null,
+      confirmControlRate: CONFIG.reanchorConfirmControlRate,
     },
     pullbackOutcome: rec.pullbackOutcome || null,
     lexiconDegenerate: rec.lexiconDegenerate,
@@ -3578,17 +3665,33 @@ export function apply(ctx, config) {
         }
         return { ...withPullback, messages: kept }
       }
-      // ── L2 重锚定：先轻后重。只有"L1 已经说过、且仍有新证据"时才动上下文内容 ──
+      // ── L2 重锚定：先轻后重。两条路径（在线证据 / 当场确认），见 reanchorDecision 的注释 ──
       const re = reanchorDecision(rec, typeof payload.turn === 'number' ? payload.turn : null)
       if (re && decision && Array.isArray(decision.messages)) {
+        // 确认路径同样有**随机化对照**：按比例故意不恢复，这样"恢复有没有用"照样可估
+        // （否则又是一次"只有单臂 ⇒ 无法估计效果"）。
+        if (re.via === 'confirm' && CONFIG.reanchorConfirmControlRate > 0 && Math.random() < CONFIG.reanchorConfirmControlRate) {
+          rec.confirm.handled = true
+          const ct = markTrigger(rec, 'control', re.reason, payload.turn, payload.step, 'reanchor')
+          logAudit(rec, 'reanchor-control', {
+            reason: re.reason, turn: payload.turn, step: payload.step, n: ct.n,
+            rate: CONFIG.reanchorConfirmControlRate,
+            note: '确认信号成立但按对照比例**故意不恢复**（用于估计"确认即恢复"的效果）',
+          })
+          return decision
+        }
         const text = reanchorText(CONFIG.bootstrapPersona, re.info, rec.reanchor.count + 1)
+        if (re.via === 'confirm' && rec.confirm) rec.confirm.handled = true
         rec.reanchor.count += 1
         rec.reanchor.lastTurn = typeof payload.turn === 'number' ? payload.turn : null
         rec.reanchor.lastPullbackCount = rec.pullback.count
         rec.reanchor.lastAt = Date.now()
+        const trig = markTrigger(rec, 'intervened', re.reason, payload.turn, payload.step, 'reanchor')
         logAudit(rec, 'reanchor', {
-          turn: payload.turn, step: payload.step, count: rec.reanchor.count,
-          afterPullbacks: rec.pullback.count, evidence: reanchorEvidence ? reanchorEvidence.source : null, personaBytes: CONFIG.bootstrapPersona.length,
+          turn: payload.turn, step: payload.step, count: rec.reanchor.count, n: trig.n, via: re.via,
+          afterPullbacks: rec.pullback.count, evidence: reanchorEvidence ? reanchorEvidence.source : null,
+          confirm: re.info && re.info.confirm ? re.info.confirm : null,
+          personaBytes: CONFIG.bootstrapPersona.length,
         })
         const injected = { source: { kind: 'trajectory-anchor-reanchor' }, content: [{ type: 'text', text }] }
         return { ...decision, messages: [...decision.messages, injected] }

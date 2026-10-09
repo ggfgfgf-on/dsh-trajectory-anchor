@@ -65,8 +65,14 @@ if (synth !== null) {
 
 // ── v2 口径过滤：v1 行的窗口与 v2 不可比，必须排除，且**报出**排除条数 ──────────
 const isV2 = (r) => r.schemaVersion === 2 && (r.arm === 'intervened' || r.arm === 'control' || r.intervened === false)
-const rows = raw.filter(isV2)
-const legacyIgnored = raw.length - rows.length
+const allRows = raw.filter(isV2)
+const legacyIgnored = raw.length - allRows.length
+
+// ── 按**动作**分组（两种动作风险类别与门都不同，混在一起算会把两条效果糊成一条）──
+//   · `pullback`（L1 信息型提醒）—— L2 的门判定针对它；缺 action 的行按 pullback 处理（向后兼容）
+//   · `reanchor`（L2' 确认即恢复）—— 有它自己的随机化对照，样本够了再谈它自己的门
+const reanchorRows = allRows.filter((r) => r.action === 'reanchor')
+const rows = allRows.filter((r) => (r.action || 'pullback') === 'pullback')
 
 const improved = rows.filter((r) => (r.verifiesAfterPullback > 0) || (r.scopeViolationsAfter === 0 && r.claimedUnverifiedAfter !== true))
 const rate = rows.length ? improved.length / rows.length : 0
@@ -216,6 +222,15 @@ const artifact = {
     claimedUnverifiedAfterRate: rows.length ? Number((rows.filter((r) => r.claimedUnverifiedAfter === true).length / rows.length).toFixed(4)) : null,
   },
   armCounts: rows.reduce((a, r) => { const k = armOf(r); a[k] = (a[k] || 0) + 1; return a }, {}),
+  // L2'（确认即恢复）的效果：**单独一组**，同样的 Fisher 口径，样本够了才能谈它自己的门
+  reanchor: {
+    rows: reanchorRows.length,
+    sessions: [...new Set(reanchorRows.map((r) => r.sessionId))].length,
+    armCounts: reanchorRows.reduce((a, r) => { const k = armOf(r); a[k] = (a[k] || 0) + 1; return a }, {}),
+    comparison: compareRows(reanchorRows),
+    note: '由确认信号（用户纠正 / unknown-tool / 验证未通过）触发的重锚定；与 L1 提醒分开统计。',
+  },
+  actionsSeen: [...new Set(allRows.map((r) => r.action || 'pullback'))],
   synthetic: synth !== null,
   note: synth !== null
     ? '**合成数据**：仅用于验证"采集→分析→门禁"链路，不得当作效果证据（装载器会拒绝 synthetic:true）'

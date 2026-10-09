@@ -1,4 +1,4 @@
-/**
+﻿/**
  * check-invariants.mjs —— 静态不变量断言（零依赖，只读）
  *
  * 由来：v0.4.1–v0.4.3 的归还分支引用了一个 DEFAULTS 里不存在的键
@@ -695,7 +695,7 @@ if (existsSync(readmePath)) {
   // 测试隔离：持久化让状态跨挂载存活 ⇒ 各套件必须显式隔离（实测六个套件同时崩）
   const suitesNeedingIsolation = ['test-anchor-contract.mjs', 'test-response-policy.mjs', 'test-policy-gate.mjs',
     'test-reanchor.mjs', 'test-family-prior.mjs', 'test-outcome-feedback.mjs',
-    'test-pullback-arms.mjs', 'test-audit-durability.mjs', 'test-trial-release.mjs', 'test-context-suppression.mjs']
+    'test-pullback-arms.mjs', 'test-audit-durability.mjs', 'test-trial-release.mjs', 'test-context-suppression.mjs', 'test-reanchor-confirm.mjs']
   for (const s of suitesNeedingIsolation) {
     const p = resolve(toolsDir, s)
     if (!existsSync(p)) { problems.push(`找不到 ${s}`); continue }
@@ -726,7 +726,9 @@ if (existsSync(readmePath)) {
   // ① 两臂走同一条记录路径（口径对称靠共用代码保证，不靠自觉）
   if (!/markTrigger\(rec, 'control'/.test(src)) problems.push('对照臂没有记触发点（对照观测会被整条丢掉）')
   if (!/markTrigger\(rec, 'intervened'/.test(src)) problems.push('干预臂没有记触发点（两臂不是同一路径）')
-  if (!/function markTrigger\(rec, arm, reason, turn, step\)/.test(src)) {
+  if (!/function markTrigger\(rec, arm, reason, turn, step,/.test(src)) {
+    // 只要求"前五个参数与顺序不变"（两臂共用同一入口），允许后面追加参数
+    // （如 action）——否则每次扩展签名都会得到一个假失败。
     problems.push('缺少唯一的 markTrigger 实现（两臂必须共用）')
   }
   // 窗口必须只有一处实现，且落盘行必须用它
@@ -1013,6 +1015,73 @@ if (existsSync(readmePath)) {
   }
   for (const d of debtsLocal) debts.push(d)
   if (debtsLocal.length === 0) oks.push('C26 两个静态项都已解决（maxDriftSteps 已反解、反事实候选有消费者）')
+}
+
+// ── C27 硬：L2'「确认即恢复」的纪律（不做预测、只响应已确认的问题）──────────────
+// 由来：L2 原来的门要求"拉回**有效**"的在线证据（回答"有没有用"），而"防降智"因此长期**没有
+// 执行器**（通知层/能力层/L2 全关，只剩 L1 管任务事实）。L2' 把问题换成一个**当场可确认**的
+// 问题："已经确认出问题了（用户纠正/工具不存在/验证未通过），把已知有效的首轮载荷放回去"。
+// 它可以不需要效果件的前提是：载荷是**信息型**的（不改工具面、不改系统基线、不删信息），
+// 与 L1 同一风险类别；但必须——只响应确认、每会话一次、硬闸门优先、留痕、**有对照臂**。
+{
+  const problems = []
+  const toolsDir = resolve(dirname(indexPath), 'tools')
+  // ① 默认关 + 三种确认信号
+  if (!/reanchorOnConfirm: false/.test(src)) problems.push('缺少 reanchorOnConfirm 出厂默认 false')
+  if (!/function noteConfirmation\(rec, reason, turn, step, detail\)/.test(src)) problems.push('缺少 noteConfirmation（确认信号必须单一入口）')
+  for (const r of ['user-correction', 'unknown-tool', 'verify-failed']) {
+    if (!new RegExp(`noteConfirmation\\(rec, '${r}'`).test(src)) problems.push(`确认信号 ${r} 没有被接线`)
+  }
+  // ② 纠偏判据必须**共用离线标注那一份**（不许在运行时再写一份）
+  if (!/import \{ CORRECTION_CUES \} from '\.\/tools\/drift-label-core\.mjs'/.test(src)) {
+    problems.push('运行时没有共用 CORRECTION_CUES（判据会与离线标注悄悄漂移）')
+  }
+  // ③ 硬闸门必须在确认路径**之前**判 —— 用**相邻性**而不是"下标先后"：
+  //    下标比较会被"提前 return true"这类改写绕过（我的负向副本就是这么绕过第一版的）。
+  const cr = (src.match(/function confirmReanchorAllowed\(rec\)[\s\S]*?\n\}/) || [''])[0]
+  if (!cr) problems.push('缺少 confirmReanchorAllowed')
+  else {
+    if (!/if \(CONFIG\.measurementSafe === true\) return false/.test(cr) || !/if \(autoDemote\) return false/.test(cr)) {
+      problems.push('确认路径缺少某道硬闸门')
+    } else if (!/if \(autoDemote\) return false\s*\n\s*if \(CONFIG\.reanchorOnConfirm !== true\) return false/.test(cr)) {
+      problems.push('确认路径的硬闸门没有紧邻在开关之前（可能被提前 return 绕过）')
+    }
+  }
+  // ④ 每会话一次：**两条臂都要消费**确认信号（否则对照臂会无限重复触发）。
+  //    "存在一处赋值"太松——干预臂被删掉、对照臂那处还在，检查照样通过（负向副本抓到过）。
+  const handledCount = (src.match(/rec\.confirm\.handled = true/g) || []).length
+  if (handledCount < 2) {
+    problems.push(`确认信号被消费的处数 ${handledCount} < 2（干预臂与对照臂都必须消费）`)
+  }
+  if (!/reanchorConfirmControlRate > 0 && Math\.random\(\) < CONFIG\.reanchorConfirmControlRate/.test(src)) {
+    problems.push('确认路径没有随机化对照（只有单臂 ⇒ 效果永远估不出来）')
+  }
+  if (!/logAudit\(rec, 'reanchor-control'/.test(src)) problems.push('对照臂没有审计留痕')
+  // ⑤ 落盘行必须区分动作（两种动作混在一起算会把两条效果糊成一条）
+  if (!/action: t\.action \|\| 'pullback'/.test(src)) problems.push('落盘行没有 action 字段（pullback 与 reanchor 会混在一起）')
+  if (!/function markTrigger\(rec, arm, reason, turn, step, action = 'pullback'\)/.test(src)) {
+    problems.push('markTrigger 没有 action 参数（两种动作必须走同一入口但可区分）')
+  }
+  // ⑥ 可测性跟着执行器走：只开确认路径时也必须落盘
+  if (!/CONFIG\.pullbackEnabled !== true && CONFIG\.reanchorOnConfirm !== true/.test(src)) {
+    problems.push('只开确认路径（L1 关）时效果不会被落盘 ⇒ 那条路径的效果永远测不出来')
+  }
+  // ⑦ 分析器必须分开报
+  const an = resolve(toolsDir, 'analyze-pullback-outcomes.mjs')
+  if (existsSync(an)) {
+    const a = readFileSync(an, 'utf8')
+    if (!/r\.action === 'reanchor'/.test(a)) problems.push('分析器没有把 reanchor 行分出来')
+    if (!/reanchor: \{/.test(a)) problems.push('分析器没有单独报 reanchor 的效果')
+  }
+  for (const s of ['test-reanchor-confirm.mjs']) {
+    if (!existsSync(resolve(toolsDir, s))) problems.push(`缺少 ${s}`)
+  }
+  const loop4 = resolve(toolsDir, 'auto-loop.mjs')
+  if (existsSync(loop4) && !/test-reanchor-confirm\.mjs/.test(readFileSync(loop4, 'utf8'))) {
+    problems.push('闭环的自门禁没有覆盖确认即恢复套件')
+  }
+  if (problems.length) for (const p of problems) fails.push(`C27 ${p}`)
+  else oks.push('C27 确认即恢复：默认关、三种确认信号共用离线判据、硬闸门优先、每会话一次、有对照臂、落盘区分动作、只开它也照样记账、分析器分开报')
 }
 
 // ── 输出 ────────────────────────────────────────────────────────────────
