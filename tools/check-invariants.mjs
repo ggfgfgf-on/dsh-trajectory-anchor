@@ -1214,6 +1214,26 @@ if (existsSync(readmePath)) {
   else oks.push(`C29 元数据不说谎：源文件无 BOM（${rel.length} 个），标定件 pluginVersion 与 package.json 一致`)
 }
 
+// ── C30 硬：门禁不许漏接套件（"有测试但没接进门禁"= 等于没测）──────────────────
+// 由来：本轮为 A/B 实验新写了 tools/test-anchor-switch.mjs 之后，闭环的套件清单是**显式数组**，
+// 差一点就被漏掉——而"文件在、门禁没跑"与"没有这个测试"在效果上完全一样。
+// 所以这条直接把"每个 tools/test-*.mjs 都必须出现在闭环清单里"变成机器可查的一条。
+{
+  const problems = []
+  const toolsDir30 = resolve(dirname(indexPath), 'tools')
+  const loop = resolve(toolsDir30, 'auto-loop.mjs')
+  if (!existsSync(loop)) problems.push('缺少 tools/auto-loop.mjs（闭环门禁）')
+  else {
+    const loopSrc = readFileSync(loop, 'utf8')
+    const suites = readdirSync(toolsDir30).filter((f) => /^test-.*\.mjs$/.test(f)).sort()
+    const missing = suites.filter((f) => !loopSrc.includes(f))
+    if (missing.length) problems.push(`这些套件没有接进闭环门禁（等于没测）：${missing.join(', ')}`)
+    else if (suites.length < 18) problems.push(`只找到 ${suites.length} 个套件（数量异常，检查是否误删）`)
+  }
+  if (problems.length) for (const p of problems) fails.push(`C30 ${p}`)
+  else oks.push('C30 门禁不漏接：每个 tools/test-*.mjs 都出现在闭环 auto-loop.mjs 的套件清单里')
+}
+
 // ── 输出 ────────────────────────────────────────────────────────────────
 for (const s of oks) console.log(`  OK    ${s}`)
 for (const s of debts) console.log(`  DEBT  ${s}`)

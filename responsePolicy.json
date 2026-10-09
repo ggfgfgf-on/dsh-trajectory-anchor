@@ -1,11 +1,11 @@
 {
-  "generatedAtUtc": "2026-10-09T12:06:56.358Z",
+  "generatedAtUtc": "2026-10-09T13:15:02.497Z",
   "scope": {
     "pluginVersion": "0.5.1",
     "release": "B3-calibration",
     "taskFamily": "dsh-sessions"
   },
-  "corpusFingerprint": "sessions:139:494675342:1791547516918",
+  "corpusFingerprint": "sessions:151:497900288:1791551702443",
   "calibration": {
     "withFamilyPrior": true,
     "priorStrength": 20,
@@ -23,12 +23,12 @@
       "derived": {
         "consecutive": 1,
         "alpha": 0.005,
-        "sessionHitRate": 0.04878048780487805
+        "sessionHitRate": 0.045454545454545456
       },
       "derivedWithFamilyPrior": {
         "consecutive": 1,
         "alpha": 0.0001,
-        "sessionHitRate": 0.024390243902439025
+        "sessionHitRate": 0.022727272727272728
       },
       "recallSide": {
         "feasibleOperatingPoints": 8,
@@ -53,17 +53,17 @@
         {
           "consecutive": 1,
           "alpha": 0.0001,
-          "sessionHitRate": 0.024390243902439025
+          "sessionHitRate": 0.022727272727272728
         },
         {
           "consecutive": 2,
           "alpha": 0.0001,
-          "sessionHitRate": 0.024390243902439025
+          "sessionHitRate": 0.022727272727272728
         },
         {
           "consecutive": 3,
           "alpha": 0.0001,
-          "sessionHitRate": 0.024390243902439025
+          "sessionHitRate": 0.022727272727272728
         },
         {
           "consecutive": 1,
@@ -135,17 +135,17 @@
         {
           "consecutive": 3,
           "alpha": 0.001,
-          "sessionHitRate": 0.04878048780487805
+          "sessionHitRate": 0.045454545454545456
         },
         {
           "consecutive": 2,
           "alpha": 0.0001,
-          "sessionHitRate": 0.036585365853658534
+          "sessionHitRate": 0.03409090909090909
         },
         {
           "consecutive": 3,
           "alpha": 0.0001,
-          "sessionHitRate": 0.024390243902439025
+          "sessionHitRate": 0.022727272727272728
         },
         {
           "consecutive": 1,
@@ -209,17 +209,17 @@
         {
           "consecutive": 3,
           "alpha": 0.001,
-          "sessionHitRate": 0.04878048780487805
+          "sessionHitRate": 0.045454545454545456
         },
         {
           "consecutive": 2,
           "alpha": 0.0001,
-          "sessionHitRate": 0.04878048780487805
+          "sessionHitRate": 0.045454545454545456
         },
         {
           "consecutive": 3,
           "alpha": 0.0001,
-          "sessionHitRate": 0.012195121951219513
+          "sessionHitRate": 0.011363636363636364
         },
         {
           "consecutive": 1,
@@ -257,7 +257,7 @@
   "negativeControl": {
     "channel": "inaction",
     "variant": "turn-end-exclusion-removed",
-    "nullSessionRate": 0.24390243902439024,
+    "nullSessionRate": 0.22727272727272727,
     "expected": "unfit",
     "observed": "unfit"
   },
