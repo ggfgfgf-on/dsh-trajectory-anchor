@@ -92,6 +92,14 @@ const DEFAULTS = {
   responsePolicyPath: null,
   // 评测保护：true ⇒ 强制只观察（能力层与通知层都关），用于"分数归因不被插件污染"。
   // 可由标定件的 measurementSafe 或配置直接置位。
+  // 人工试运行放行（默认 null = 这条路径根本不存在）：
+  //   { channels: ['inaction'], alpha: 0.01, until: '2026-10-16T00:00:00Z', note: '为什么放行' }
+  // 它是**唯一**能绕过"标定件不合格"的动作路径，所以三重约束缺一不可：
+  //   · 必须显式列出通道（不许"放行全部"）；
+  //   · 必须显式给 α（试运行的工作点，不许默默沿用一个说不清的默认）；
+  //   · 必须给到期时间（**没有期限的执行器就是事故**——本插件最重那次事故的形态）。
+  // measurementSafe 与 autoDemote 仍然优先：试运行绕不过它们（见 effectiveRollback）。
+  trialRelease: null,
   measurementSafe: false,
   // 在线自动降档：最近 autoDemoteWindow 个已结束会话里，出现过收窄的比例超过
   // autoDemoteBudget ⇒ 自动降为只观察并留审计（防止"离线合格、线上超标"）。
@@ -319,11 +327,47 @@ function familyKeyOf(rec) {
  * 配置开关 ∧ 标定件允许 ∧ 未被自动降档 ∧ 不在评测保护下。
  * 任何一项不满足 → 只观察。这是"默认安全"的最后一道闸门。
  */
+/**
+ * 人工试运行放行是否**生效**（默认 null ⇒ 这条路径永不存在）。
+ * 归一路径（任何一项不合规 ⇒ null，回到只观察，并且从不静默）：
+ *   · 形状不对 / 通道表为空 / α 不在 (0,1) / **没有到期时间** / **已过期**。
+ * 它**不**绕过 measurementSafe 与 autoDemote —— 那是两道独立的更硬的闸门（见 effectiveRollback）。
+ * 为什么不给"放行全部"：一次只准放行你点名的通道，这样爆炸半径是写得出来的。
+ */
+function trialReleaseActive() {
+  const t = CONFIG.trialRelease
+  if (!t || typeof t !== 'object' || Array.isArray(t)) return null
+  const channels = Array.isArray(t.channels) ? t.channels.filter((c) => typeof c === 'string' && c.length > 0) : []
+  if (channels.length === 0) return null
+  const alpha = Number(t.alpha)
+  if (!Number.isFinite(alpha) || alpha <= 0 || alpha >= 1) return null
+  const until = typeof t.until === 'string' ? t.until : null
+  if (!until) return null
+  const untilMs = Date.parse(until)
+  if (!Number.isFinite(untilMs)) return null
+  // 人工试运行的**治理到期时间**：操作者设的硬期限，到点自动回到只观察。
+  // 这不是漂移判定（C10 禁的是"用墙钟判漂移"），而是"不许有无期限的执行器"这条纪律的实现：
+  // 期限的意义正是**逼一次重新决策**，所以它该与人的日历对齐，而不是与观测单元对齐。
+  if (untilMs <= Date.now()) return null    // time-ok: 治理期限（操作者设置，非漂移判定）
+  return { channels, alpha, until, untilMs, note: typeof t.note === 'string' ? t.note : null }
+}
+
+/** 通道是否在人工试运行放行名单里（拿不到生效的放行 ⇒ null）。 */
+function trialGrant(name) {
+  const t = trialReleaseActive()
+  if (!t) return null
+  return t.channels.includes(name) ? t : null
+}
+
 function effectiveRollback() {
   if (CONFIG.measurementSafe === true) return false
   if (autoDemote) return false
-  if (policyArtifact && policyArtifact.verdict !== 'PASS' && policyArtifact.verdict !== 'PARTIAL-PASS') return false
-  return CONFIG.rollbackEnabled === true
+  const trial = trialReleaseActive()
+  if (policyArtifact && policyArtifact.verdict !== 'PASS' && policyArtifact.verdict !== 'PARTIAL-PASS') {
+    // 标定件不合格（或没有标定件）⇒ 正常路径关闭；**人工试运行是唯一例外**
+    return trial !== null
+  }
+  return CONFIG.rollbackEnabled === true || trial !== null
 }
 /** 通知层的有效开关：同样受评测保护与自动降档约束（降档后连通知也停，只留审计）。 */
 function effectiveNotify() {
@@ -335,8 +379,12 @@ function effectiveNotify() {
 function capabilityGateReason() {
   if (CONFIG.measurementSafe === true) return 'measurement-safe'
   if (autoDemote) return `auto-demoted:${autoDemote.reason}`
-  if (policyArtifact && policyArtifact.verdict !== 'PASS' && policyArtifact.verdict !== 'PARTIAL-PASS') return `policy-${policyArtifact.verdict}`
-  if (CONFIG.rollbackEnabled !== true) return 'switch-off'
+  const trial = trialReleaseActive()
+  // 试运行只在**它真的在为开门负责**时才被报出来（标定件已通过、或开关已开时，
+  // 说"是试运行开的门"就是误导）——但一旦它负责，就必须一眼看出来"这不是标定授权"。
+  const normalClosedByPolicy = Boolean(policyArtifact && policyArtifact.verdict !== 'PASS' && policyArtifact.verdict !== 'PARTIAL-PASS')
+  if (normalClosedByPolicy) return trial ? `trial-release:${trial.channels.join('+')}` : `policy-${policyArtifact.verdict}`
+  if (CONFIG.rollbackEnabled !== true) return trial ? `trial-release:${trial.channels.join('+')}` : 'switch-off'
   return null
 }
 
@@ -1017,7 +1065,7 @@ function applyRollback(rec, via, p) {
       restored: null,
     }
   }
-  logAudit(rec, 'surface', { phase: 'narrowed', denied: CONFIG.leanDenyPatterns.slice(), via, p: round2(p), ratio: round2(rec.weightedRatio) })
+  logAudit(rec, 'surface', { phase: 'narrowed', denied: CONFIG.leanDenyPatterns.slice(), via, p: round2(p), ratio: round2(rec.weightedRatio), trialRelease: (trialReleaseActive() || {}).channels || null })
 }
 
 function enterDrift(rec, via, p) {
@@ -1139,6 +1187,8 @@ function stateMachine(rec, agent) {
     prior: c.prior ? { rate: c.prior.rate, strength: c.prior.strength, matched: c.prior.matched } : null,
     // L3 第三层：实际生效的行动级门限（回灌后；null = 资格被撤销或不可用）
     actAlphaEffective: Number.isFinite(c.actAlphaEffective) ? c.actAlphaEffective : null,
+    // 该通道的资格是不是**人工试运行**给的（不是标定件给的）——两者必须能分辨
+    trialRelease: c.trialRelease === true,
   }))
   rec.lastPolicy = decision.level
   rec.lastPolicyAction = decision.action
@@ -1549,6 +1599,29 @@ function channelTests(rec) {
   }
   const series = channelSeries(rec)
   for (const name of ['inaction', 'repetition', 'failure']) out.push(channelTest(name, series[name] || [], priorForFamily(rec, name)))
+  // 人工试运行放行（**唯一**入口，且默认不存在）：把名单里的通道的资格与工作点显式抬起来。
+  // 两条纪律：
+  //   · 试运行**只**绕"标定件给不给资格"，不绕数据质量（lexicon-degenerate 依然挡住该通道）；
+  //   · 动手**不是静默的**——这里留一次 trial-release-armed 审计，status 里也能看到 α 与到期时间。
+  const trial = trialReleaseActive()
+  if (trial) {
+    const granted = []
+    for (const c of out) {
+      if (!trial.channels.includes(c.name)) continue
+      if (c.blockedBy === 'lexicon-degenerate') continue
+      c.capabilityEligible = true
+      c.actAlpha = trial.alpha          // 试运行的工作点（显式给的，不沿用任何默认）
+      c.trialRelease = true
+      granted.push(c.name)
+    }
+    if (granted.length > 0 && rec.trialReleaseArmed !== granted.join('+')) {
+      rec.trialReleaseArmed = granted.join('+')
+      logAudit(rec, 'trial-release-armed', {
+        channels: granted, alpha: trial.alpha, until: trial.until, note: trial.note,
+        why: '标定件未授权，按人工放行进入试运行（会写 didNarrow，供 L3.3 结局回灌积累样本）',
+      })
+    }
+  }
   return out
 }
 
@@ -2832,6 +2905,8 @@ function summaryOf(rec) {
     narrowedSteps: rec.narrowedSteps,
     didNarrow: rec.didNarrow === true,
     capabilityBudgetExhausted: rec.capabilityBudgetExhausted,
+    // 本会话的资格是否由**人工试运行**授予（null = 本会话没走到那条路径）
+    trialReleaseArmed: rec.trialReleaseArmed || null,
     policy: rec.lastPolicy,
     policyAction: rec.lastPolicyAction,
     policyChannel: rec.lastPolicyChannel,
@@ -2988,6 +3063,14 @@ function buildSummary(filter) {
     policyArtifact,
     autoDemote,
     capabilityGate: capabilityGateReason(),
+    // 人工试运行放行：通道 / 显式工作点 α / 到期时间 / 剩余时长 / 放行理由。
+    // 它必须**一眼可见**，否则"为什么能力层在动手"会变成只有翻源码才知道的事。
+    trialRelease: (() => {
+      const t = trialReleaseActive()
+      const raw = CONFIG.trialRelease
+      if (!t) return raw ? { active: false, configured: true, reason: 'expired-or-invalid', until: (raw && raw.until) || null, channels: (raw && raw.channels) || [] } : null
+      return { active: true, configured: true, channels: t.channels, alpha: t.alpha, until: t.until, remainingMs: Math.max(0, t.untilMs - Date.now()), note: t.note }   // time-ok: 纯展示剩余时长
+    })(),
     reanchorGate: reanchorGateReason(),
     reanchorEvidence,
     familyPriors: familyPriors ? { source: familyPriors.source, families: Object.keys(familyPriors.byKey || {}).length } : null,
@@ -3019,6 +3102,29 @@ function mergeConfig(config) {
       // 未知配置键：按"响亮 warn 但继续"处理（不阻断挂载）——写错的键在运行期会
       // 静默失效，所以必须响亮且可在 anchor_status / 收尾 record 里查到。
       noteConfigWarning(`unknown config key "${key}" — ignored (allowed: ${[...CONFIG_KEYS].sort().join(', ')})`)
+      continue
+    }
+    if (key === 'trialRelease') {
+      // 人工试运行放行：形状必须精确，否则**整条路径作废**（fail-safe 回到只观察）。
+      // 为什么这么严：它是唯一能绕过"标定件不合格"的动作路径，写法含糊就等于放行了一个
+      // 说不清边界的执行器 —— 那正是本插件最重那次事故的形态。
+      const t = config[key]
+      if (!t || typeof t !== 'object' || Array.isArray(t)) {
+        noteConfigWarning('invalid trialRelease (needs an object {channels, alpha, until, note}); keeping observe-only')
+        continue
+      }
+      const channels = Array.isArray(t.channels) ? t.channels.filter((c) => typeof c === 'string' && c.length > 0) : []
+      const alpha = Number(t.alpha)
+      const untilMs = typeof t.until === 'string' ? Date.parse(t.until) : NaN
+      if (channels.length === 0) { noteConfigWarning('trialRelease.channels is empty; keeping observe-only'); continue }
+      if (!Number.isFinite(alpha) || alpha <= 0 || alpha >= 1) { noteConfigWarning('trialRelease.alpha must be in (0,1); keeping observe-only'); continue }
+      if (!Number.isFinite(untilMs)) { noteConfigWarning('trialRelease.until must be an ISO timestamp (a trial without an expiry is unbounded); keeping observe-only'); continue }
+      const known = channels.filter((c) => Object.prototype.hasOwnProperty.call(CONFIG.responseChannels, c))
+      if (known.length !== channels.length) {
+        noteConfigWarning(`trialRelease.channels has unknown channel(s): ${channels.filter((c) => !known.includes(c)).join(',')}; keeping observe-only`)
+        continue
+      }
+      CONFIG[key] = { channels: known, alpha, until: t.until, note: typeof t.note === 'string' ? t.note : null }
       continue
     }
     if (key === 'lexicon') {

@@ -695,7 +695,7 @@ if (existsSync(readmePath)) {
   // 测试隔离：持久化让状态跨挂载存活 ⇒ 各套件必须显式隔离（实测六个套件同时崩）
   const suitesNeedingIsolation = ['test-anchor-contract.mjs', 'test-response-policy.mjs', 'test-policy-gate.mjs',
     'test-reanchor.mjs', 'test-family-prior.mjs', 'test-outcome-feedback.mjs',
-    'test-pullback-arms.mjs', 'test-audit-durability.mjs']
+    'test-pullback-arms.mjs', 'test-audit-durability.mjs', 'test-trial-release.mjs']
   for (const s of suitesNeedingIsolation) {
     const p = resolve(toolsDir, s)
     if (!existsSync(p)) { problems.push(`找不到 ${s}`); continue }
@@ -806,6 +806,63 @@ if (existsSync(readmePath)) {
   }
   if (problems.length) for (const p of problems) fails.push(`C22 ${p}`)
   else oks.push('C22 观测单元与审计持久性：两臂共用触发记录、窗口按触发点、对照臂一样被计数、采样规则两臂同一、v2 行才进证据（会话级留一 + 随机化分层闸）、审计块序号从磁盘续起且先于第一次落盘')
+}
+
+// ── C23 硬：人工试运行放行的纪律（唯一能绕过"标定不合格"的动作路径）────────────
+// 由来：L3.3（结局回灌）只归因于 `didNarrow === true` 的会话（这是修掉"用没干预的会话
+// 评价干预"那条方向不安全缺陷时定的口径），而 `didNarrow` 只有能力层真的收窄过才置位，
+// 能力层又被标定件的 FAIL 关着 ⇒ **L3.3 结构性死锁**。`trialRelease` 是唯一出口，
+// 也正因为如此，它必须被钉死：显式点名、显式工作点、**必须有期限**、且绕不过更硬的闸门。
+{
+  const problems = []
+  const toolsDir = resolve(dirname(indexPath), 'tools')
+  if (!/trialRelease: null/.test(src)) problems.push('缺少 trialRelease 出厂默认 null（放行必须是显式配置，不能有默认路径）')
+  if (!/function trialReleaseActive\(\)/.test(src)) problems.push('缺少 trialReleaseActive（生效判定必须单一实现）')
+  const act = (src.match(/function trialReleaseActive\(\)[\s\S]*?\n\}/) || [''])[0]
+  if (!act) problems.push('取不到 trialReleaseActive 函数体（检查模式串失配）')
+  else {
+    if (!/channels\.length === 0/.test(act)) problems.push('试运行没有要求"必须点名通道"（等于放行全部）')
+    if (!/Number\.isFinite\(alpha\) \|\| alpha <= 0 \|\| alpha >= 1/.test(act)) problems.push('试运行没有校验 α 的工作点')
+    if (!/if \(!until\) return null/.test(act) || !/Number\.isFinite\(untilMs\)/.test(act)) {
+      problems.push('试运行没有强制到期时间（**没有期限的执行器**正是本插件最重那次事故的形态）')
+    }
+    if (!/time-ok:/.test(act)) problems.push('试运行的墙钟到期时间没有按 C10 约定显式声明例外（time-ok）')
+  }
+  // 三道更硬的闸门必须在试运行**之前**判：评测保护、自动降档
+  const eff = (src.match(/function effectiveRollback\(\)[\s\S]*?\n\}/) || [''])[0]
+  if (!eff) problems.push('取不到 effectiveRollback 函数体')
+  else {
+    const iSafe = eff.indexOf('measurementSafe')
+    const iDemote = eff.indexOf('autoDemote')
+    const iTrial = eff.indexOf('trialReleaseActive')
+    if (iSafe === -1 || iDemote === -1 || iTrial === -1) problems.push('effectiveRollback 缺少某道闸门')
+    else if (!(iSafe < iTrial && iDemote < iTrial)) {
+      problems.push('试运行排在 measurementSafe/autoDemote 之前（会绕过硬闸门）')
+    }
+  }
+  // 放行只在一个入口生效，且不许绕过数据质量（词典退化）
+  if (!/trialReleaseActive\(\)[\s\S]{0,400}?c\.capabilityEligible = true/.test(src)) {
+    problems.push('试运行的资格抬升不在 channelTests 这个唯一入口里（会出现第二条放行路径）')
+  }
+  if (!/if \(c\.blockedBy === 'lexicon-degenerate'\) continue/.test(src)) {
+    problems.push('试运行会绕过"词典退化"这道数据质量闸（退化通道即使放行也不该动手）')
+  }
+  if (!/logAudit\(rec, 'trial-release-armed'/.test(src)) problems.push('试运行进入时没有审计留痕')
+  if (!/trialRelease: \(\(\) => \{/.test(src)) problems.push('状态里没有 trialRelease 块（放行必须一眼可见）')
+  if (!/trialReleaseArmed/.test(src)) problems.push('本会话是否由试运行授予资格不可见')
+  if (!/trialRelease: c\.trialRelease === true/.test(src)) problems.push('通道行没有标出"这次资格来自试运行"')
+  if (!/safeguard/.test(src) && !/trialRelease\.channels has unknown/.test(src)) {
+    problems.push('配置守卫缺少"未知通道"检查')
+  }
+  for (const s of ['test-trial-release.mjs']) {
+    if (!existsSync(resolve(toolsDir, s))) problems.push(`缺少 ${s}（试运行的闸门没有套件守）`)
+  }
+  const loop2 = resolve(toolsDir, 'auto-loop.mjs')
+  if (existsSync(loop2) && !/test-trial-release\.mjs/.test(readFileSync(loop2, 'utf8'))) {
+    problems.push('闭环的自门禁没有覆盖试运行套件')
+  }
+  if (problems.length) for (const p of problems) fails.push(`C23 ${p}`)
+  else oks.push('C23 人工试运行放行：默认不存在、显式点名通道与 α、**必须有期限**（按 C10 声明例外）、绕不过 measurementSafe/autoDemote、不绕过词典退化、资格只在一个入口抬升、全程留痕可见')
 }
 
 // ── 输出 ────────────────────────────────────────────────────────────────
