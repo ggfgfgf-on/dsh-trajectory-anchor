@@ -64,7 +64,8 @@ if (!runTests) {
 } else {
   const suites = [
     'check-invariants.mjs', 'test-runtime-lexicon.mjs', 'test-anchor-contract.mjs', 'test-response-policy.mjs',
-    'test-policy-gate.mjs', 'test-pullback.mjs', 'test-pullback-arms.mjs', 'test-reanchor.mjs', 'test-family-prior.mjs',
+    'test-policy-gate.mjs', 'test-pullback.mjs', 'test-pullback-arms.mjs', 'test-pullback-evidence.mjs',
+    'test-reanchor.mjs', 'test-family-prior.mjs',
     'test-outcome-feedback.mjs', 'test-drift-label.mjs', 'test-task-anchor.mjs',
     'test-ledger-semantics.mjs', 'test-ledger-parity.mjs', 'test-audit-durability.mjs', 'replay-interventions.mjs',
   ]

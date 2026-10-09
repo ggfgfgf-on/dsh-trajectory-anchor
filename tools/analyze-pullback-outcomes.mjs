@@ -136,7 +136,35 @@ const firstPerSession = []
 }
 const cmpFirst = compareRows(firstPerSession)
 
-// 判定：方向 + 显著性 + 会话级样本量 + 留一稳健性 + 绝对水平，全部要过
+// ③ 随机化分层：控制率中途变了怎么办？
+// 臂是在**触发点**上随机分配的 ⇒ 改分配比例**不产生偏差**（意向性比较依然有效），
+// "改了就当数据作废"是不准确的说法；真正要防的是**时段效应**（后期会话的任务/模型分布漂移）。
+// 口径：**合并检验为主**（它本就是随机化比较），**分层复核为闸**——任何"足够大"的分层
+// （两臂各 ≥2 单元）只要方向相反，就不许判定 PASS。
+const rateOfRow = (r) => (Number.isFinite(r.controlRate) ? String(r.controlRate) : 'unspecified')
+const strataKeys = [...new Set(rows.map(rateOfRow))]
+const strata = []
+let stratumContradiction = null
+for (const k of strataKeys) {
+  const sub = rows.filter((r) => rateOfRow(r) === k)
+  const byArm = { intervened: 0, control: 0 }
+  for (const r of sub) byArm[armOf(r)] += 1
+  const c = compareRows(sub)
+  const big = Boolean(c) && byArm.intervened >= 2 && byArm.control >= 2
+  const entry = {
+    rate: k, n: sub.length, intervened: byArm.intervened, control: byArm.control,
+    goodRateIntervened: c ? c.intervened.goodRate : null,
+    goodRateControl: c ? c.control.goodRate : null,
+    effectPP: c ? c.effectPP : null,
+    oneSidedP: c ? c.oneSidedP : null,
+    gating: big,
+    contradicts: big && c.effectPP <= 0,
+  }
+  strata.push(entry)
+  if (entry.contradicts && !stratumContradiction) stratumContradiction = entry
+}
+
+// 判定：方向 + 显著性 + 会话级样本量 + 留一稳健性 + 分层不矛盾 + 绝对水平，全部要过
 let verdict = 'FAIL'
 let verdictReason = ''
 if (rows.length < minSamples) { verdict = 'INSUFFICIENT'; verdictReason = `观测单元 ${rows.length} < ${minSamples}` }
@@ -147,8 +175,11 @@ else if (cmp.oneSidedP > 0.05) { verdict = 'INSUFFICIENT'; verdictReason = `方�
 else if (looMaxP !== null && looMaxP > 0.05) {
   verdict = 'INSUFFICIENT'
   verdictReason = `去掉会话 ${looWorstSession} 后不再显著（留一最大 p=${looMaxP.toFixed(3)}）⇒ 单个会话撑着，不算证据`
+} else if (stratumContradiction) {
+  verdict = 'INSUFFICIENT'
+  verdictReason = `分层方向矛盾：控制率 ${stratumContradiction.rate} 上干预并不更好（${stratumContradiction.effectPP.toFixed(1)}pp）⇒ 时段效应未排清，不许开门`
 } else if (rate < minImprove) { verdict = 'FAIL'; verdictReason = `显著但绝对产出率不足（${(rate * 100).toFixed(1)}% < ${(minImprove * 100).toFixed(0)}%）` }
-else { verdict = 'PASS-online'; verdictReason = `干预臂显著更好（+${cmp.effectPP.toFixed(1)}pp，单侧 p=${cmp.oneSidedP.toFixed(3)}，留一最大 p=${looMaxP === null ? 'n/a' : looMaxP.toFixed(3)}）` }
+else { verdict = 'PASS-online'; verdictReason = `干预臂显著更好（+${cmp.effectPP.toFixed(1)}pp，单侧 p=${cmp.oneSidedP.toFixed(3)}，留一最大 p=${looMaxP === null ? 'n/a' : looMaxP.toFixed(3)}，分层 ${strata.length} 组无矛盾）` }
 
 const artifact = {
   generatedAtUtc: new Date().toISOString(),
@@ -171,6 +202,13 @@ const artifact = {
     firstPerSessionP: cmpFirst ? cmpFirst.oneSidedP : null,
     firstPerSessionEffectPP: cmpFirst ? cmpFirst.effectPP : null,
   },
+  // 随机化分层（控制率）：合并检验为主、分层复核为闸（任何大分层方向相反即不许开门）
+  rateStrata: {
+    rates: strataKeys,
+    mixed: strataKeys.length > 1,
+    perRate: strata,
+    contradiction: stratumContradiction ? { rate: stratumContradiction.rate, effectPP: stratumContradiction.effectPP } : null,
+  },
   effectiveness: {
     improvedRate: Number(rate.toFixed(4)),
     verifyAfterRate: rows.length ? Number((rows.filter((r) => r.verifiesAfterPullback > 0).length / rows.length).toFixed(4)) : null,
@@ -192,6 +230,13 @@ if (cmp) {
     + `  效应 ${cmp.effectPP >= 0 ? '+' : ''}${cmp.effectPP.toFixed(1)}pp  单侧 p=${cmp.oneSidedP.toFixed(4)}`)
   console.log(`敏感性：逐会话留一最大 p=${looMaxP === null ? 'n/a' : looMaxP.toFixed(4)}（最差会话 ${looWorstSession ?? 'n/a'}）`
     + `；每会话首个触发点 p=${cmpFirst ? cmpFirst.oneSidedP.toFixed(4) : 'n/a'}`)
+  if (strata.length > 1) {
+    for (const s of strata) {
+      console.log(`分层 控制率=${s.rate}  n=${s.n}（干预 ${s.intervened} / 对照 ${s.control}）`
+        + `  效应 ${s.effectPP === null ? 'n/a' : (s.effectPP >= 0 ? '+' : '') + s.effectPP.toFixed(1) + 'pp'}`
+        + `${s.gating ? '（参与闸门）' : '（样本太小，仅报出）'}${s.contradicts ? ' **方向相反**' : ''}`)
+    }
+  }
 } else {
   console.log('对照：**只有单臂** ⇒ 无法估计效果（需要 pullbackControlRate > 0 攒对照数据）')
 }

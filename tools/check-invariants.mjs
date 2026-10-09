@@ -768,6 +768,22 @@ if (existsSync(readmePath)) {
     if (!/legacyIgnored/.test(a)) problems.push('分析器没有报出被忽略的旧行（静默丢弃不可接受）')
     if (!/leaveOneSessionOut|looMaxP|maxP/.test(a)) problems.push('分析器缺少"逐会话留一"敏感性（单个会话就能定成败）')
     if (!/minSessions|min-sessions/.test(a)) problems.push('分析器没有会话级最小样本量（独立性在会话层）')
+    // ③b 随机化分层（控制率）：合并检验为主、分层复核为闸。
+    // 为什么要分层：改控制率**不产生偏差**（臂在触发点上随机分配，意向性比较依然有效），
+    // 但要防"时段效应"——所以任何足够大的分层方向相反时不许开门；小分层只报出不闸门。
+    if (!/controlRate/.test(src) || !/controlRate: Number\.isFinite\(t\.rate\)/.test(src)) {
+      problems.push('落盘行没有记录 controlRate（单元的随机化分层标识丢了，跨比例汇总无法审计）')
+    }
+    if (!/rateStrata/.test(a)) problems.push('分析器没有报出随机化分层（跨控制率的证据无法审计）')
+    // **负向**：分层矛盾必须真的**参与判定**，不能只写进产物了事
+    // （这条抓的是一个真实的自伤：我算出了 stratumContradiction 却忘了把它接进判定链，
+    //  产物里写着"矛盾"、判定却说"无矛盾"——新套件第一次跑就抓到了。）
+    if (!/else if \(stratumContradiction\)/.test(a)) {
+      problems.push('分析器算出了分层矛盾却没有接进判定链（产物与判定会自相矛盾）')
+    }
+  }
+  for (const s of ['test-pullback-evidence.mjs']) {
+    if (!existsSync(resolve(toolsDir, s))) problems.push(`缺少 ${s}（L2 门的判定逻辑没有套件守）`)
   }
   // ④ 审计接手：块序号必须先从磁盘续起，且必须发生在第一次落盘之前
   if (!/function ensureAuditFiles\(rec\)/.test(src)) problems.push('缺少 ensureAuditFiles（续号与接手必须只有一个入口）')
@@ -778,18 +794,18 @@ if (existsSync(readmePath)) {
   if (/rec\.chunkIdx = \(rec\.chunkIdx \|\| 0\) \+ 1/.test(src) && !/adoptAuditFiles/.test(src)) {
     problems.push('块序号仍从 1 重新数（每次重启覆写上一轮的块）')
   }
-  for (const s of ['test-pullback-arms.mjs', 'test-audit-durability.mjs']) {
-    if (!existsSync(resolve(toolsDir, s))) problems.push(`缺少 ${s}（这两条纪律没有套件守）`)
+  for (const s of ['test-pullback-arms.mjs', 'test-audit-durability.mjs', 'test-pullback-evidence.mjs']) {
+    if (!existsSync(resolve(toolsDir, s))) problems.push(`缺少 ${s}（这些纪律没有套件守）`)
   }
   const loop = resolve(toolsDir, 'auto-loop.mjs')
   if (existsSync(loop)) {
     const l = readFileSync(loop, 'utf8')
-    if (!/test-pullback-arms\.mjs/.test(l) || !/test-audit-durability\.mjs/.test(l)) {
-      problems.push('闭环的自门禁没有覆盖两臂观测/审计持久性套件')
+    if (!/test-pullback-arms\.mjs/.test(l) || !/test-audit-durability\.mjs/.test(l) || !/test-pullback-evidence\.mjs/.test(l)) {
+      problems.push('闭环的自门禁没有覆盖两臂观测/审计持久性/证据判定套件')
     }
   }
   if (problems.length) for (const p of problems) fails.push(`C22 ${p}`)
-  else oks.push('C22 观测单元与审计持久性：两臂共用触发记录、窗口按触发点、对照臂一样被计数、v2 行才进证据（含会话级留一敏感性）、审计块序号从磁盘续起且先于第一次落盘')
+  else oks.push('C22 观测单元与审计持久性：两臂共用触发记录、窗口按触发点、对照臂一样被计数、采样规则两臂同一、v2 行才进证据（会话级留一 + 随机化分层闸）、审计块序号从磁盘续起且先于第一次落盘')
 }
 
 // ── 输出 ────────────────────────────────────────────────────────────────

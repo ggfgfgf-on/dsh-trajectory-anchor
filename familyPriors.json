@@ -1,5 +1,5 @@
 {
-  "generatedAtUtc": "2026-10-08T06:56:50.800Z",
+  "generatedAtUtc": "2026-10-09T04:32:30.549Z",
   "corpus": {
     "sessionsScanned": 129,
     "sessionsUsed": 78
@@ -46,12 +46,12 @@
       "preset": null,
       "scope": "none",
       "sessions": 33,
-      "steps": 21121,
-      "meanSteps": 640,
+      "steps": 21166,
+      "meanSteps": 641,
       "baseRates": {
         "inaction": 0.0019,
-        "repetition": 0.0535,
-        "failure": 0.0392
+        "repetition": 0.0534,
+        "failure": 0.0393
       }
     },
     {

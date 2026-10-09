@@ -2088,10 +2088,16 @@ function markObs(rec, kind, turn, step) {
   return n
 }
 
-/** 记一次触发（两条臂走同一条记录路径——口径对称是靠"共用代码"保证的，不是靠自觉）。 */
+/** 记一次触发（两条臂走同一条记录路径——口径对称是靠"共用代码"保证的，不是靠自觉）。
+ *  `rate` 记下**这次触发时生效的控制率**：它是这条单元的**随机化分层标识**。
+ *  为什么要记：控制率中途调整**不产生偏差**（臂是在触发点上随机分配的，意向性比较依然有效），
+ *  但会产生"时段效应"——所以分析器要能按比例分层复核，而不是把不同比例的单元混在一起说不清。 */
 function markTrigger(rec, arm, reason, turn, step) {
   const n = (rec.pullback.obsN = (rec.pullback.obsN || 0) + 1)
-  const t = { arm, n, turn: turn ?? null, step: step ?? null, at: Date.now(), reason: reason ?? null }
+  const t = {
+    arm, n, turn: turn ?? null, step: step ?? null, at: Date.now(), reason: reason ?? null,
+    rate: Number.isFinite(CONFIG.pullbackControlRate) ? CONFIG.pullbackControlRate : null,
+  }
   rec.pullback.triggers.push(t)
   if (rec.pullback.triggers.length > 50) rec.pullback.triggers.shift()
   return t
@@ -2133,6 +2139,8 @@ function recordPullbackOutcome(rec) {
         triggersInSession: triggers.length,
         triggerTurn: t.turn,
         triggerStep: t.step,
+        // 随机化分层标识：这条单元是在多大的控制率下分配的（分析器按它做分层复核）
+        controlRate: Number.isFinite(t.rate) ? t.rate : null,
         reason: t.reason,
         pullbacks: rec.pullback.count,               // 会话累计，仅作背景
         controls: rec.pullback.controls,             // 会话累计，仅作背景
