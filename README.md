@@ -728,24 +728,41 @@ node tools\export-layer4.mjs `
   and the per-channel snapshot (`channels`, `channelWindows`) with the effective
   `actAlpha` / `notifyAlpha` / `consecutive` and the two live run counters
 - Assertion suites (all must stay green; each is run against `index.js` by path):
-  `tools/check-invariants.mjs` — 18 static invariants (C1–C18), 0 debt;
+  **19 suites / 573 assertions**, plus `tools/replay-interventions.mjs`.
+  `tools/check-invariants.mjs` — 28 static invariants (C1–C29), 1 registered debt
+  (`maxDriftSteps` is an inherited value; see its configuration row above);
   `tools/test-runtime-lexicon.mjs` — 64 pure-function cases;
-  `tools/test-anchor-contract.mjs` — 24 install-and-use / contract cases (incl. the
+  `tools/test-anchor-contract.mjs` — 25 install-and-use / contract cases (incl. the
   "apply() with no config at all" mount and a lossless-JSON walk over live rows);
-  `tools/test-response-policy.mjs` — 30 end-to-end policy cases (A…J);
-  `tools/test-policy-gate.mjs` — 47 B3 gate cases (artifact / expiry / evaluation
+  `tools/test-response-policy.mjs` — 45 end-to-end policy cases (A…J plus K1–K5: the
+  four-way control for the closed style channel, and the assembled-tool-surface check
+  on the shipped default);
+  `tools/test-policy-gate.mjs` — 51 B3 gate cases (artifact / expiry / evaluation
   protection / auto-demote / two-tier counters / the shipped artifact end-to-end,
   each with its opposite direction);
   `tools/test-drift-label.mjs` — 35 labelling cases (metrics, anchors, and the
   circular-labelling guard proven load-bearing);
-  `tools/test-task-anchor.mjs` — 55 task-anchor cases (clause parsing in English and
+  `tools/test-task-anchor.mjs` — 58 task-anchor cases (clause parsing in English and
   Chinese, "never guess" on prompts without a scope clause, scope scanning, and the
   four audited false-positive classes pinned as regressions);
-  `tools/test-pullback.mjs` — 37 L1 cases (fires/stays-silent both ways, turn throttle,
+  `tools/test-pullback.mjs` — 49 L1 cases (fires/stays-silent both ways, turn throttle,
   session cap, re-verification clears the reminder, wording has no imperative verb);
+  `tools/test-pullback-arms.mjs` — 24 arm/retraction cases (a failed tool call cannot
+  be counted as a success, and control arms are consumed exactly once);
+  `tools/test-pullback-evidence.mjs` — 17 L2 gate cases (synthetic / expired /
+  insufficient evidence all rejected, both directions);
   `tools/test-reanchor.mjs` — 26 L2 cases (all five gates both ways, light-before-heavy,
   once per session, persona carried verbatim, synthetic evidence rejected, outcome JSONL
   written only when a pull-back actually happened);
+  `tools/test-reanchor-confirm.mjs` — 28 L2′ cases (the three confirmation signals, the
+  "already declared done" precondition for `verify-failed`, and `confirm-declined`
+  leaving a trace when a signal is refused);
+  `tools/test-trial-release.mjs` — 22 hand-run trial-release cases (grants only the named
+  channel, never bypasses data quality, and reports a release that cannot take effect);
+  `tools/test-outcome-feedback.mjs` — 25 L3.3 cases (asymmetric and bounded multipliers,
+  baseline-α matching, and the "no evidence ⇒ no change" direction);
+  `tools/test-adaptive-state.mjs` — 25 memory cases (append-only per session, ignore
+  unrelated sessions, reload bounded, and derived state recomputed every mount);
   `tools/test-family-prior.mjs` — 20 L3 cases (higher-base-rate family ⇒ strictly larger p,
   the decision flips when α sits between the two p's, and unknown-family / broken-file /
   empty-table all fall back to *bit-identical* pre-prior behaviour);
@@ -753,7 +770,24 @@ node tools\export-layer4.mjs `
   for the four ledger paths, including the two the real corpus never exercises);
   `tools/test-ledger-parity.mjs` — 14 live-vs-batch parity runs (4 synthetic streams +
   3 real sessions, every decision point compared);
+  `tools/test-audit-durability.mjs` — 11 restart cases (chunk indices continue from disk,
+  a previous run's tail is never overwritten);
+  `tools/test-context-suppression.mjs` — 23 suppression cases (fail-open when the service
+  is missing, and a failed restore must not claim success);
   `tools/replay-interventions.mjs` — bounded episodes, compliant end reasons, replayable
+- **Negative-copy discipline**: 52 deliberately-broken copies of the tree (one mutation
+  each) must be caught by an invariant, a suite, or both; the generators live in
+  `D:\DSHwork\Scratch\gen-c*-negatives.mjs` and print which face caught each copy. Two
+  asymmetries are recorded rather than hidden (a dead-code wiring can only be caught
+  structurally; a wrong observation surface was fixed by adding `auditKinds` instead of
+  loosening the assertion).
+- **Closure self-gate**: `tools/auto-loop.mjs` regenerates the family priors and the
+  calibration artifact, then runs the invariants plus every suite, and refuses to publish
+  if any step fails (exit 0 is the release condition).
+- **Three-tree mirror**: `tools/mirror-trees.mjs` copies the source tree to the git repo
+  and to the live `node_modules/@dsh-ext/trajectory-anchor` tree and then verifies every
+  file by sha256 (89 files, 0 mismatches); `--write` performs the copy, a bare run is a
+  dry run.
 - Shipped calibration artifact: `responsePolicy.json` — verdict **`FAIL`**, zero
   capability-eligible channels, the false-alarm sweep per channel, the **measured
   recall side** with its conclusion, the G3 negative control, and a corpus
@@ -765,6 +799,63 @@ node tools\export-layer4.mjs `
 - Event-sequence assertion: `adopted → anchored → context-suppressed → maxTokens-rewrite →
   gate-armed → lift(anchor-gate:minimal-like | max-steps) → context-restored →
   maxTokens-strip → score… → closed + record(incl. reward)`
+
+## Evidence status: implemented vs. measured vs. unmeasured
+
+The purpose of this plugin is *"lock in the good first-round behaviour, watch every step, and
+pull the agent back when it degrades"*. That sentence contains three separable claims, and they
+do **not** have the same strength of evidence. They are separated here so that nothing in this
+README is read as more proven than it is.
+
+**1. Implemented and mechanically verified — strong.**
+First-round anchoring (bootstrap tool surface + Minimal persona + agent-scope context
+suppression) with an observable promotion gate; per-step trajectory scoring with an append-only
+audit log; the assembly-time derived tool surface; the session-local drift test with bounded
+episodes; L1 informational pull-back; L2′ confirm-triggered re-anchoring; L3/L3.3 family priors
+and outcome feedback with online auto-demote; the Layer-4 export. Evidence: 28 invariants, 19
+suites / 573 assertions, 52 deliberately-broken copies all caught, a closure self-gate that
+refuses to publish on any failure, and a live audit trail showing every decision
+(`adopted → anchored → gate-armed → lift → score… → closed`). This part is not in doubt: a
+mismatch between the code and its documented behaviour fails the build.
+
+**2. Measured: which drift signals actually fire, and whether they beat chance — mixed.**
+On a 60-session corpus, recall was compared against **same-budget chance** (the only comparison
+that means anything here):
+
+| Channel | Throttled (as deployed) | Lead | Verdict |
+|---|---|---|---|
+| `inaction` (A′) | 2.45× lift, 2.5% recall vs 0.7% chance | **+3 steps** | the only signal with a positive lead; used as the trial-release candidate |
+| `repetition` (C) | 3.13× lift | **−1 step** | fires *after* the anchor — diagnostic, not predictive |
+| `failure` (B) | 0.50× | — | **worse than chance** |
+| `lexicon` / style | 1.06× ≈ chance (unbounded: 0.64×) | — | removed from the judgement surface in v0.5.1 |
+
+Consequently the capability layer ships **closed**: the shipped calibration artifact's verdict is
+`FAIL`, with zero capability-eligible channels and the measured recall conclusion written into the
+artifact itself; opening it requires an explicit artifact or a hand-run trial release. That is a
+measurement result, not an unfinished feature.
+
+**3. Not measured: whether anchoring improves the *outcome* ("防降智") — no evidence either way.**
+Two attempts to measure it from the existing corpus failed for structural reasons:
+
+- *Clean outcome* (did the session's last verification pass?) over 78 sessions: **pass 20 / fail 0**
+  — there is no contrast, so nothing can be predicted from it.
+- *Delayed anchors* (does an anchor appear later in the session?) turn out to be a **session-size
+  proxy**: anchor appearance rises 4% → 20% → 100% across <100 / 100–300 / ≥300-step buckets, with
+  ρ(anchors, steps) = 0.53–0.68.
+
+So the observational corpus cannot answer the question, and the honest status is: **the mechanism
+demonstrably acts; its benefit is unproven.** "Not measured" is *not* "ineffective" — the null
+result that would license removal has not been obtained either. What exists instead is the
+instrument for answering it: `D:\DSHwork\anchor-bench\` (fixed multi-module tasks with a
+machine-readable score, a paired analyzer, and an outcome extractor that re-runs the *pristine*
+tests so an agent cannot score by editing them). Running it needs the anchoring switch flipped in
+the host composition, i.e. two phases with a restart, plus enough runs per arm that the outcome
+has variance.
+
+**4. Cost side: also unmeasured.** No measurement yet of what a reminder costs — steps added
+after a pull-back, repeated edits on the same file, tokens spent on the re-anchor payload. Until
+that exists, even a positive effect result would not by itself settle whether the plugin is worth
+leaving on.
 
 ## License
 
