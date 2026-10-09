@@ -865,6 +865,57 @@ if (existsSync(readmePath)) {
   else oks.push('C23 人工试运行放行：默认不存在、显式点名通道与 α、**必须有期限**（按 C10 声明例外）、绕不过 measurementSafe/autoDemote、不绕过词典退化、资格只在一个入口抬升、全程留痕可见')
 }
 
+// ── C24 硬：判别力评估的纪律（召回必须与"同预算随机召回"比）────────────────────
+// 由来：我第一次跑候选信号评估时只看**召回绝对值**，差点得出"unverified-edit 召回 24.2%、
+// 远高于统计通道 2.8% ⇒ 判别力最强"这个**错误结论**。补上同预算随机召回基线后真相反转：
+// 它每会话触发 52.9 次，随机撒同样多的点本就能蒙到 36.8% —— 比随机**更差**（0.64×）；
+// 按运行期节流后（1/turn、≤3/会话）≈ 随机（1.06×）。这条不变量防止后人再犯同一个错。
+{
+  const problems = []
+  const toolsDir = resolve(dirname(indexPath), 'tools')
+  const ev = resolve(toolsDir, 'evaluate-signals.mjs')
+  if (!existsSync(ev)) problems.push('缺少 tools/evaluate-signals.mjs（判别力评估没有单一实现）')
+  else {
+    const s = readFileSync(ev, 'utf8')
+    // 剥注释后再查：**"写在注释里"不算数**（这一条我自己就踩过两次——
+    // 第一次是只报召回不报基线，第二次是"随机召回"只出现在注释/note 里就满足了检查）
+    const code = s.split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n')
+    if (!/function chanceRecall\(/.test(code)) {
+      problems.push('评估器没有"同预算随机召回"基线（高频信号会假装有判别力——这正是第一次犯过的错）')
+    }
+    if (!/chanceRecall\(rows, LEAD\)/.test(code)) problems.push('基线算出来了却没有进表格/产物')
+    if (!/console\.log\('[^']*随机召回/.test(code)) {
+      problems.push('汇总表没有把"随机召回"作为一列打出来（只写在注释或 note 里不算）')
+    }
+    if (!/function throttleFires\(/.test(code) || !/const throttled = throttleFires\(/.test(code)) {
+      problems.push('没有真正计算"按运行期节流后"的形态')
+    }
+    if (!/ORDERED\.push\([^\n]*节流/.test(code)) {
+      problems.push('节流形态没有被排进汇总表（算了但不报 = 没测）')
+    }
+    if (!/UNKNOWN_TOOL, ANCHOR_KINDS\.USER_CORRECTION, ANCHOR_KINDS\.ABANDONED_TURN/.test(s)) {
+      problems.push('评估锚点没有收敛到强语义子集（tool-error/failure-marker 是工作常态，会把基线膨胀到 ~19%）')
+    }
+    if (!/OWN_SIGNAL/.test(s)) problems.push('没有声明各信号的自有信号（会循环标注）')
+  }
+  const rep = resolve(dirname(indexPath), 'signalEvalReport.json')
+  if (!existsSync(rep)) problems.push('缺少 signalEvalReport.json（"为什么能力层关着"必须随包发布可查的证据）')
+  else {
+    try {
+      const j = JSON.parse(readFileSync(rep, 'utf8'))
+      if (j.kind !== 'drift-signal-discriminative-power') problems.push('signalEvalReport.json 的种类标记不对')
+      for (const name of ['unverified-edit·节流', 'edit-thrash·节流', 'inaction', 'repetition', 'failure']) {
+        const e = (j.signals && j.signals[name]) || (j.reference && j.reference[name])
+        if (!e) { problems.push(`signalEvalReport.json 缺少 ${name} 的结果`); continue }
+        if (!Number.isFinite(e.chanceRecall)) problems.push(`signalEvalReport.json 的 ${name} 没有随机召回基线`)
+        if (!Number.isFinite(e.precisionLift)) problems.push(`signalEvalReport.json 的 ${name} 没有精度倍数`)
+      }
+    } catch (e) { problems.push(`signalEvalReport.json 解析失败：${e.message}`) }
+  }
+  if (problems.length) for (const p of problems) fails.push(`C24 ${p}`)
+  else oks.push('C24 判别力评估：召回必须与**同预算随机召回**比较、必须测"按运行期节流后"的部署形态、锚点收敛到强语义子集且排除自有信号，结论随包发布')
+}
+
 // ── 输出 ────────────────────────────────────────────────────────────────
 for (const s of oks) console.log(`  OK    ${s}`)
 for (const s of debts) console.log(`  DEBT  ${s}`)

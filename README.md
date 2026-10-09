@@ -276,6 +276,49 @@ honest state of the world, and it has a direct consequence for the intervention
 work: the pull-back's *mechanism* can be verified (injected drift must fire it), but
 its *efficacy* cannot be measured from this corpus — there is nothing to pull back.
 
+**Do any signals predict drift? Measured against strong anchors (2026-10-09).**
+The earlier recall run used *all* anchors, and its 19.2% chance baseline was inflated by
+`tool-error`/`failure-marker` — which are normal work (running a test *is* supposed to
+print failures). So the discriminating evaluation (`tools/evaluate-signals.mjs`, shipped
+result in `signalEvalReport.json`) restricts labels to the anchors that really mean "went
+wrong": `unknown-tool`, `user-correction`, `abandoned-turn` (285 of them across 60
+sessions). It also reports two things the first run lacked: **chance recall at the same
+fire budget** (a signal that fires 53×/session "recovers" a lot of anchors simply by
+firing constantly) and the signal **as deployed** (throttled to 1/turn, ≤3/session).
+
+| Signal | fires/session | recall@3 | chance recall | lead | precision | 1× baseline | lift |
+|---|---|---|---|---|---|---|---|
+| `unverified-edit` (L1's, unbounded) | 52.9 | 24.2% | **36.8%** | +1 | 2.2% | 3.4% | **0.64×** |
+| `unverified-edit` **as deployed** | 0.9 | 0.7% | 0.6% | −1 | 3.6% | 3.4% | **1.06×** |
+| `unverified-claim` (unbounded) | 5.3 | 9.1% | 7.0% | 0 | 8.1% | 3.4% | 2.41× |
+| `edit-thrash` (A→B→A reverts, throttle) | 0.6 | 1.4% | 0.5% | **−1** | 10.5% | 3.4% | **3.12×** |
+| `write-before-read` (throttle) | 1.0 | 0.4% | 0.7% | +3 | 1.6% | 3.4% | 0.49× |
+| `inaction` (incumbent) | 1.4 | 2.5% | 0.7% | **+3** | 8.2% | 3.4% | 2.44× |
+| `repetition` (incumbent) | 11.3 | 2.8% | 4.5% | +2 | 1.2% | 3.4% | **0.35×** |
+| `failure` (incumbent) | 8.0 | 2.8% | 5.2% | +1 | 1.7% | 3.4% | **0.50×** |
+
+Three conclusions, and the first one corrects an earlier claim in this file:
+
+1. **No candidate has both a lift above 1 and a positive lead.** The capability layer's
+   problem is not the threshold, the budget or the calibration: `repetition` and
+   `failure` are placed *worse than random* against strong anchors (0.35× / 0.50×), so
+   no α could have rescued them.
+2. **L1's signal is not a drift predictor — and it was never meant to be one.** Unbounded
+   it fires on 7.5% of all steps and scores *below* chance (0.64×); throttled to its
+   deployed budget it is exactly chance (1.06×). Its value is that it states a **fact the
+   agent can verify** ("code was edited after the last verification") at a moment when
+   acting on it is cheap — this session's own field data is the clearest evidence: five
+   reminders, five times the work was re-verified. It belongs in the same category as a
+   linter, not in the same category as an anomaly detector, and the README should not
+   have implied otherwise.
+3. **The only signal with a real positive lead is `inaction` (+3 steps, 2.44×)** — the
+   same channel that the human-gated trial release puts on probation. That is a better
+   justification for the trial than "least bad of four": it is the only measured signal
+   that fires *before* the damage rather than during or after it. `edit-thrash` has the
+   highest lift of anything measured (3.12%) but a **negative** lead (−1), which makes it
+   a good *diagnostic* and a useless *predictor*.
+
+
 ### The pull-back itself (L1): near-term, advisory, throttled, off by default
 
 `pullbackEnabled` (default **`false`**) adds the first action that speaks to the model
