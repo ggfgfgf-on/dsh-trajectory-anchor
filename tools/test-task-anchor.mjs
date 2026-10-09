@@ -82,6 +82,34 @@ const ZH = '你正在接手一个本地护理/睡眠联调工程（Project2）�
     inScope('D:\\DSHwork\\bugfix-a5\\calc.py', a) === false, JSON.stringify(a.scopeNames))
 }
 
+// ── ①d 范围判据的其余真实形态（每种都带反向对照）────────────────────────────
+// 由来：反引号那条（①b）修完后继续问"还有哪些常见写法会让 inScope 失效"，
+// 挑出两种高危形态：**路径里有空格**（英文式 token 用 [^\s,.]+ ⇒ 会在空格处截断）
+// 与**结尾斜杠**（前缀匹配是 startsWith(d + '/') ⇒ d 以 / 结尾时会变成 '//'）。
+{
+  const SPACE = 'Work ONLY inside `D:\\My Projects\\cf-b1`. Fix the modules; do not edit tests/.'
+  const a = parseTaskAnchors(SPACE)
+  check('①d 路径含空格：目录被完整解析（不截断在空格处）',
+    a.scopeDirs.some((d) => d.includes('cf-b1')) && !a.scopeDirs.some((d) => d.endsWith('my')),
+    JSON.stringify(a.scopeDirs))
+  check('①d 路径含空格：范围内的文件在范围内（误报反例）',
+    inScope('D:\\My Projects\\cf-b1\\mod_report.py', a) === true, JSON.stringify(a.scopeDirs))
+  check('①d 路径含空格：范围外仍判越界（反向对照）',
+    inScope('D:\\Other\\cf-b1\\mod_report.py', a) === false, JSON.stringify(a.scopeDirs))
+}
+{
+  const SLASH = 'Work ONLY inside `D:\\DSHwork\\runs\\cf-b1\\`. Fix the modules.'
+  const a = parseTaskAnchors(SLASH)
+  check('①d 结尾斜杠：目录被解析且不留尾斜杠',
+    a.scopeDirs.length > 0 && a.scopeDirs.every((d) => !d.endsWith('/')), JSON.stringify(a.scopeDirs))
+  check('①d 结尾斜杠：范围内的文件在范围内（误报反例）',
+    inScope('D:\\DSHwork\\runs\\cf-b1\\mod_report.py', a) === true, JSON.stringify(a.scopeDirs))
+  check('①d 结尾斜杠：子目录里的文件也在范围内',
+    inScope('D:\\DSHwork\\runs\\cf-b1\\sub\\deep\\x.py', a) === true, JSON.stringify(a.scopeDirs))
+  check('①d 结尾斜杠：兄弟目录仍判越界（反向对照）',
+    inScope('D:\\DSHwork\\runs\\cf-b2\\mod_report.py', a) === false, JSON.stringify(a.scopeDirs))
+}
+
 // ── ② 不猜 ─────────────────────────────────────────────────────────────────
 {
   const a = parseTaskAnchors('帮我看看这个仓库有没有问题，随便改改就行')

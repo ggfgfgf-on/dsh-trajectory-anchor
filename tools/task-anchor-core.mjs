@@ -75,7 +75,13 @@ export function parseTaskAnchors(prompt) {
   //      `[^\s,.]+` 会把反引号一起抓走 ⇒ 名字成 "cf-b1`"，与路径段名**永不相等**；
   //   ② 英文式里也可能是**绝对路径** ⇒ 必须进 scopeDirs（前缀匹配），
   //      否则范围名匹配注定失效，范围内文件会被判越界。
-  const enScope = text.match(/work only inside\s+([^\s,.]+)/i) || text.match(/only (?:modify|touch|edit|change)[^.]*?\b([A-Za-z][\w.-]*-\w[\w.-]*)\b/i)
+  //   ③ 实测第三处：`[^\s,.]+` 还会**在空格处截断**
+  //      （`D:\My Projects\cf-b1` ⇒ `d:/my`，既丢掉真范围、又把范围放得过宽）
+  //      ⇒ 所以**优先捕获引号/反引号包起来的整段**，裸 token 才退回"不许含空格"的匹配。
+  const enScope = text.match(/work only inside\s+`([^`]+)`/i)
+    || text.match(/work only inside\s+"([^"]+)"/i)
+    || text.match(/work only inside\s+([^\s,.`"']+)/i)
+    || text.match(/only (?:modify|touch|edit|change)[^.]*?\b([A-Za-z][\w.-]*-\w[\w.-]*)\b/i)
   if (enScope) {
     evidence.scopeClause = enScope[0].trim()
     const tok = stripWrappers(enScope[1])
@@ -86,10 +92,12 @@ export function parseTaskAnchors(prompt) {
     }
   }
   // ② 中文式范围子句："工作区仅限 D:\...\workspace 目录" / "仅在 X 内" / "只依赖 workspace 内内容"
-  const cnScope = text.match(/(?:工作区)?(?:仅限|只限|仅|只)(?:在)?\s*([A-Za-z]:[\\/][^\s，。；、）)]+)/)
+  //    同样优先捕获引号/反引号包裹的整段 —— 与英文式①是**同一个缺陷类**（空格截断）。
+  const cnScope = text.match(/(?:工作区)?(?:仅限|只限|仅|只)(?:在)?\s*`([^`]+)`/)
+    || text.match(/(?:工作区)?(?:仅限|只限|仅|只)(?:在)?\s*([A-Za-z]:[\\/][^\s，。；、）)]+)/)
   if (cnScope) {
     evidence.scopeClause = evidence.scopeClause || cnScope[0].trim()
-    scopeDirs.push(normalizePath(cnScope[1]))
+    scopeDirs.push(normalizePath(stripWrappers(cnScope[1])))
   }
   const cnScope2 = text.match(/只依赖\s*([^\s，。；、]+)\s*内/)
   if (cnScope2) {
