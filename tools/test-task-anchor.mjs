@@ -50,6 +50,38 @@ const ZH = '你正在接手一个本地护理/睡眠联调工程（Project2）�
   check('① 中文式：解析出"禁止范围外"子句', a.outsideForbidden === true, JSON.stringify(a.evidence.forbidClause))
 }
 
+// ── ①b 反引号包裹的绝对路径（A/B 实验里实测到的误报形态）────────────────────
+// 由来：实验里给子代理的提示是 `Work ONLY inside \`D:\...\runs\cf-b1\`.` —— 英文式子句用
+// `[^\s,.]+` 抓 token，于是连**反引号**一起抓走；baseName 取出 `cf-b1\``（带尾反引号），
+// 而真正的目录从未进入 scopeDirs（英文式没有"目录绝对路径"分支）。
+// 结果：inScope 用"路径段名相等"匹配，`cf-b1` ≠ `cf-b1\`` ⇒ 写**范围内**的 mod_report.py
+// 被判成越界（B 臂至少 3 个代理独立报告过这条误报）。
+{
+  const EN_TICK = 'Work ONLY inside `D:\\DSHwork\\anchor-bench\\runs\\cf-b1`.\n'
+    + 'Fix mod_core.py, mod_stats.py and mod_report.py so the suite passes; do not edit tests/.'
+  const a = parseTaskAnchors(EN_TICK)
+  check('①b 反引号路径：目录被解析进 scopeDirs',
+    a.scopeDirs.some((d) => d.includes('d:/dshwork/anchor-bench/runs/cf-b1')), JSON.stringify(a.scopeDirs))
+  check('①b 反引号路径：范围名里不得残留反引号',
+    !a.scopeNames.some((n) => n.includes('`')), JSON.stringify(a.scopeNames))
+  check('①b 反引号路径：**范围内的文件不算越界**（误报的直接反例）',
+    inScope('D:\\DSHwork\\anchor-bench\\runs\\cf-b1\\mod_report.py', a) === true,
+    JSON.stringify({ dirs: a.scopeDirs, names: a.scopeNames }))
+  check('①b 反引号路径：**范围外的文件仍判越界**（反向对照，修完不许漏放）',
+    inScope('D:\\DSHwork\\anchor-bench\\runs\\cf-b2\\mod_report.py', a) === false,
+    JSON.stringify({ dirs: a.scopeDirs }))
+}
+
+// ── ①c 裸名形态不许被修坏（回归）──────────────────────────────────────────
+{
+  const a = parseTaskAnchors('Work only inside bugfix-a4. Fix calc.py and rerun until tests pass.')
+  check('①c 裸名形态仍解析为范围名', a.scopeNames.includes('bugfix-a4'), JSON.stringify(a.scopeNames))
+  check('①c 裸名：同名目录内的文件在范围内',
+    inScope('D:\\DSHwork\\bugfix-a4\\calc.py', a) === true, JSON.stringify(a.scopeNames))
+  check('①c 裸名：**别的目录仍判越界**（反向对照）',
+    inScope('D:\\DSHwork\\bugfix-a5\\calc.py', a) === false, JSON.stringify(a.scopeNames))
+}
+
 // ── ② 不猜 ─────────────────────────────────────────────────────────────────
 {
   const a = parseTaskAnchors('帮我看看这个仓库有没有问题，随便改改就行')

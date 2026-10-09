@@ -49,6 +49,19 @@ const ABS_DIR_RE = /([A-Za-z]:[\\/][^\s"'`，。；、）)]+)/g
  *   evidence: {scopeClause?: string, forbidClause?: string, verifyClause?: string, reportClause?: string}
  * }}
  */
+/** 去掉包裹 token 的反引号/引号与结尾标点 —— **实测**提示里常写成 `` `D:\path\`` ``。 */
+function stripWrappers(s) {
+  return String(s == null ? '' : s)
+    .replace(/^[`'"“”‘’<(\[]+/, '')
+    .replace(/[`'"“”‘’>)\]]+$/, '')
+    .replace(/[.,;:]+$/, '')
+}
+
+/** 绝对路径（Windows 盘符或 POSIX 根）。 */
+function isAbsPath(s) {
+  return /^[A-Za-z]:[\\/]/.test(s) || /^\//.test(s)
+}
+
 export function parseTaskAnchors(prompt) {
   const text = typeof prompt === 'string' ? prompt : ''
   const evidence = {}
@@ -57,10 +70,20 @@ export function parseTaskAnchors(prompt) {
   let outsideForbidden = false
 
   // ① 英文式范围子句："Work only inside bugfix-a4" / "only inside the X directory"
+  // ⚠ 两处实测缺陷（A/B 实验里至少 3 个代理独立报告为误报，见 ablation-log 第二十一条）：
+  //   ① token 常被**反引号/引号**包着（`Work ONLY inside `D:\...\runs\cf-b1`.`）；
+  //      `[^\s,.]+` 会把反引号一起抓走 ⇒ 名字成 "cf-b1`"，与路径段名**永不相等**；
+  //   ② 英文式里也可能是**绝对路径** ⇒ 必须进 scopeDirs（前缀匹配），
+  //      否则范围名匹配注定失效，范围内文件会被判越界。
   const enScope = text.match(/work only inside\s+([^\s,.]+)/i) || text.match(/only (?:modify|touch|edit|change)[^.]*?\b([A-Za-z][\w.-]*-\w[\w.-]*)\b/i)
   if (enScope) {
     evidence.scopeClause = enScope[0].trim()
-    scopeNames.push(baseName(enScope[1]))
+    const tok = stripWrappers(enScope[1])
+    if (isAbsPath(tok)) scopeDirs.push(normalizePath(tok))
+    else {
+      const n = baseName(tok)
+      if (n) scopeNames.push(n)
+    }
   }
   // ② 中文式范围子句："工作区仅限 D:\...\workspace 目录" / "仅在 X 内" / "只依赖 workspace 内内容"
   const cnScope = text.match(/(?:工作区)?(?:仅限|只限|仅|只)(?:在)?\s*([A-Za-z]:[\\/][^\s，。；、）)]+)/)
