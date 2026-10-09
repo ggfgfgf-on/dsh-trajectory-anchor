@@ -1,4 +1,4 @@
-/**
+﻿/**
  * check-invariants.mjs —— 静态不变量断言（零依赖，只读）
  *
  * 由来：v0.4.1–v0.4.3 的归还分支引用了一个 DEFAULTS 里不存在的键
@@ -695,7 +695,7 @@ if (existsSync(readmePath)) {
   // 测试隔离：持久化让状态跨挂载存活 ⇒ 各套件必须显式隔离（实测六个套件同时崩）
   const suitesNeedingIsolation = ['test-anchor-contract.mjs', 'test-response-policy.mjs', 'test-policy-gate.mjs',
     'test-reanchor.mjs', 'test-family-prior.mjs', 'test-outcome-feedback.mjs',
-    'test-pullback-arms.mjs', 'test-audit-durability.mjs', 'test-trial-release.mjs']
+    'test-pullback-arms.mjs', 'test-audit-durability.mjs', 'test-trial-release.mjs', 'test-context-suppression.mjs']
   for (const s of suitesNeedingIsolation) {
     const p = resolve(toolsDir, s)
     if (!existsSync(p)) { problems.push(`找不到 ${s}`); continue }
@@ -919,6 +919,91 @@ if (existsSync(readmePath)) {
   }
   if (problems.length) for (const p of problems) fails.push(`C24 ${p}`)
   else oks.push('C24 判别力评估：召回必须与**同预算随机召回**比较、必须测"按运行期节流后"的部署形态、锚点收敛到强语义子集且排除自有信号，结论随包发布')
+}
+
+// ── C25 硬：bootstrap 上下文抑制的 fail-open 契约 ───────────────────────────────
+// 由来：上下文抑制（替换 persona 段 + 摘掉 runtime context）是**已经在跑**的功能，
+// 却一直没有专门的安全审计。做审计时当场发现一个真缺陷：还原函数**无论成败**都把
+// `contextSuppressed` 置 false ⇒ disposer 抛错时状态会**说谎**（显示"未抑制"、实际
+// persona 仍被替换），而开头那句早退又让重试永久失效 —— 永久卡在看不见的降级里，
+// 正是本项目最重那次事故（工具面被摘、归还路径不可达）的翻版。
+{
+  const problems = []
+  const toolsDir = resolve(dirname(indexPath), 'tools')
+  const r = (src.match(/function restoreBootstrapContext\(rec\)[\s\S]*?\n\}/) || [''])[0]
+  if (!r) problems.push('取不到 restoreBootstrapContext 函数体（模式串失配）')
+  else {
+    // 必须"只有成功才敢写未抑制"
+    if (!/if \(ok\) \{[\s\S]{0,140}?rec\.contextSuppressed = false/.test(r)) {
+      problems.push('还原无条件把 contextSuppressed 置 false（失败时状态会说谎——这就是修掉的那个缺陷）')
+    }
+    const beforeOk = r.split('if (ok)')[0]
+    if (/rec\.contextSuppressed = false/.test(beforeOk)) {
+      problems.push('在 `if (ok)` 之前就写了 contextSuppressed = false（乐观置位）')
+    }
+    if (!/contextRestoreError/.test(r)) problems.push('还原失败没有留错误字段（失败不可见）')
+    else if (!/'restore-failed'/.test(r)) {
+      // 只要求"出现了这个字段名"太松：`rec.contextRestoreError = null`（成功分支）也能满足它。
+      // 必须要求**失败分支真的记了东西**——这是我第二次被"检查被别处的字样满足"咬到。
+      problems.push('失败分支没有真的记录错误（只出现字段名不算）')
+    }
+    if (!/stillSuppressed: rec\.contextSuppressed === true/.test(r)) {
+      problems.push('审计没有写明"是否仍然被抑制"（还原结果的语义必须可查）')
+    }
+  }
+  if (!/contextRestoreError: rec\.contextRestoreError \|\| null/.test(src)) {
+    problems.push('状态里没有暴露 contextRestoreError')
+  }
+  if (!/suppressedSources: CONFIG\.suppressedSources\.slice\(\)/.test(src)) {
+    problems.push('状态里没有暴露 suppressedSources（"到底摘了什么"必须可见）')
+  }
+  // 抑制清单不许含插件自己的消息种类（否则 L1 的提醒会被自己的抑制吃掉）
+  if (!/suppressedSources must not contain the plugin's own message kinds/.test(src)) {
+    problems.push('缺少"抑制清单不得含自有消息种类"的配置守卫')
+  }
+  for (const s of ['test-context-suppression.mjs']) {
+    if (!existsSync(resolve(toolsDir, s))) problems.push(`缺少 ${s}（这条契约没有套件守）`)
+  }
+  const loop3 = resolve(toolsDir, 'auto-loop.mjs')
+  if (existsSync(loop3) && !/test-context-suppression\.mjs/.test(readFileSync(loop3, 'utf8'))) {
+    problems.push('闭环的自门禁没有覆盖上下文抑制审计')
+  }
+  if (problems.length) for (const p of problems) fails.push(`C25 ${p}`)
+  else oks.push('C25 上下文抑制 fail-open：锚定即抑制且可见、有晋升与窗口两条还原路径、服务不可用则不抑制、**还原失败时状态不说谎**（保持 true + 暴露错误 + 留重试）、抑制清单不得含自有消息种类')
+}
+
+// ── C26（DEBT 登记）：两个"知道但先不做"的静态项 ──────────────────────────────
+// 这里登记而不是修掉，是因为**两者都需要证据才能修**，而证据现在不存在：
+//   ① `maxDriftSteps`（默认 12）约束"一个收窄片段最多持续多少步"，本应由"自然恢复片段长度的
+//      p95"反解。实测（`tools/measure-drift-episodes.mjs` + 产物 `driftEpisodes.json`）：
+//      当前审计目录里**收窄片段 = 0**——历史那次事故早于 `surface` 审计事件、修好之后
+//      能力层一直关着，所以**没有可反解的样本**。在零样本上编一个数字比留着常数更糟。
+//      将来试运行开始产生收窄片段后，这个工具就能给出反解值。
+//   ② `mineCounterfactualCandidates`（默认 true）在收窄时抓取"注入前的工具面"作反事实候选，
+//      但**没有任何消费者**（离线也不读）⇒ 在回滚/收窄关闭时它是纯休眠的记账。要么将来接上
+//      离线反事实分析，要么默认关掉；现在不动是因为它零成本且不改变行为（只是多写一条审计）。
+{
+  const debtsLocal = []
+  const ep = resolve(dirname(indexPath), 'driftEpisodes.json')
+  if (!existsSync(ep)) {
+    debtsLocal.push('C26 缺少 driftEpisodes.json（maxDriftSteps 的反解证据没有随包发布）')
+  } else {
+    try {
+      const j = JSON.parse(readFileSync(ep, 'utf8'))
+      const n = (j.closedEpisodes && j.closedEpisodes.n) || 0
+      if (j.recommendedMaxDriftSteps === null) {
+        debtsLocal.push(`C26 maxDriftSteps 仍是静态 ${/maxDriftSteps: (\d+)/.exec(src)?.[1] ?? '?'}：审计目录里自然恢复的收窄片段 ${n} 个 ⇒ **零样本无法反解**（工具已就位，等试运行产出片段后重跑即可）`)
+      }
+    } catch (e) { debtsLocal.push(`C26 driftEpisodes.json 解析失败：${e.message}`) }
+  }
+  if (/mineCounterfactualCandidates: true/.test(src)) {
+    debtsLocal.push('C26 mineCounterfactualCandidates 默认 true 但**无消费者**（收窄时记账、无人读）⇒ 或接上离线反事实分析、或默认关掉')
+  }
+  if (!existsSync(resolve(dirname(indexPath), 'tools', 'measure-drift-episodes.mjs'))) {
+    debtsLocal.push('C26 缺少 tools/measure-drift-episodes.mjs（反解工具本身没有落地）')
+  }
+  for (const d of debtsLocal) debts.push(d)
+  if (debtsLocal.length === 0) oks.push('C26 两个静态项都已解决（maxDriftSteps 已反解、反事实候选有消费者）')
 }
 
 // ── 输出 ────────────────────────────────────────────────────────────────

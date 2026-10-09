@@ -1691,8 +1691,18 @@ function restoreBootstrapContext(rec) {
       logAudit(rec, 'context-restore-error', { error: msg(e) })
     }
   }
-  rec.contextSuppressed = false
-  logAudit(rec, 'context-restored', { ok })
+  // ⚠ 只有**真的都还原成功**才把状态写成"未抑制"。旧写法无论成败都置 false ⇒
+  // disposer 抛错时状态会**说谎**（对外显示"未抑制"，实际 persona 仍被替换、runtime
+  // context 仍被摘掉），而下一行的早退 `if (!rec.contextSuppressed) return` 又让重试
+  // 直接失效 ⇒ 永久卡在"看不到的降级"里（正是本项目最重那次事故的形态）。
+  // 现在：失败则保持 true（状态说实话）、错误暴露到状态里、并保留重试机会。
+  if (ok) {
+    rec.contextSuppressed = false
+    rec.contextRestoreError = null
+  } else {
+    rec.contextRestoreError = rec.contextRestoreError || 'restore-failed'
+  }
+  logAudit(rec, 'context-restored', { ok, stillSuppressed: rec.contextSuppressed === true })
 }
 
 function anchorAgent(agent, rec, channel) {
@@ -2892,6 +2902,9 @@ function summaryOf(rec) {
     pendingPromote: rec.pendingPromote,
     contextSuppressed: rec.contextSuppressed,
     contextSuppressError: rec.contextSuppressError,
+    // 还原阶段自己的错误（与抑制阶段的 contextSuppressError 分开）：
+    // 失败时 contextSuppressed 会**保持 true**（状态说实话），重试机会也留着。
+    contextRestoreError: rec.contextRestoreError || null,
     band: rec.band,
     ratio: round2(rec.weightedRatio),
     personaRatio: round2(rec.personaRatio),
@@ -3025,6 +3038,8 @@ function buildSummary(filter) {
       gateEnabled: CONFIG.gateEnabled,
       maxBootstrapSteps: CONFIG.maxBootstrapSteps,
       suppressContextOnBootstrap: CONFIG.suppressContextOnBootstrap,
+      // 抑制清单必须可见：否则"到底摘掉了什么"只能翻源码
+      suppressedSources: CONFIG.suppressedSources.slice(),
       bootstrapPersona: CONFIG.bootstrapPersona,
       bootstrapMaxTokens: CONFIG.bootstrapMaxTokens,
       specMax: CONFIG.specMax,
@@ -3102,6 +3117,24 @@ function mergeConfig(config) {
       // 未知配置键：按"响亮 warn 但继续"处理（不阻断挂载）——写错的键在运行期会
       // 静默失效，所以必须响亮且可在 anchor_status / 收尾 record 里查到。
       noteConfigWarning(`unknown config key "${key}" — ignored (allowed: ${[...CONFIG_KEYS].sort().join(', ')})`)
+      continue
+    }
+    if (key === 'suppressedSources') {
+      // 抑制清单**不许含插件自己的消息种类**：否则 L1 的拉回提醒会被自己的抑制吃掉
+      // （"用安全机制干掉安全机制"是这类配置里最容易踩的坑，而且完全静默）。
+      const own = ['trajectory-anchor-pullback', 'trajectory-anchor-reanchor']
+      const v = config[key]
+      if (!Array.isArray(v) || v.some((x) => typeof x !== 'string')) {
+        noteConfigWarning('invalid suppressedSources (needs an array of source kinds); keeping current list')
+        continue
+      }
+      const clash = v.filter((x) => own.includes(x))
+      if (clash.length > 0) {
+        noteConfigWarning(`suppressedSources must not contain the plugin's own message kinds (${clash.join(', ')}); those entries were dropped`)
+        CONFIG[key] = v.filter((x) => !own.includes(x))
+        continue
+      }
+      CONFIG[key] = v
       continue
     }
     if (key === 'trialRelease') {

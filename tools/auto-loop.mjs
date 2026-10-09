@@ -1,4 +1,4 @@
-/**
+﻿/**
  * auto-loop.mjs —— L4 全自动闭环：一条命令，从语料走到"可发布的产物 + 门禁结论"
  *
  * 依次做四件事，任一步失败就**拒绝发布**（这才是"自门禁"的含义）：
@@ -67,7 +67,7 @@ if (!runTests) {
     'test-policy-gate.mjs', 'test-pullback.mjs', 'test-pullback-arms.mjs', 'test-pullback-evidence.mjs',
     'test-trial-release.mjs', 'test-reanchor.mjs', 'test-family-prior.mjs',
     'test-outcome-feedback.mjs', 'test-drift-label.mjs', 'test-task-anchor.mjs',
-    'test-ledger-semantics.mjs', 'test-ledger-parity.mjs', 'test-audit-durability.mjs', 'replay-interventions.mjs',
+    'test-ledger-semantics.mjs', 'test-ledger-parity.mjs', 'test-audit-durability.mjs', 'test-context-suppression.mjs', 'replay-interventions.mjs',
   ]
   for (const s of suites) {
     const r = spawnSync(process.execPath, [join(here, s)], { cwd: bundle, encoding: 'utf8' })

@@ -1,0 +1,23 @@
+{
+  "generatedAtUtc": "2026-10-09T08:55:47.064Z",
+  "command": "node tools/measure-drift-episodes.mjs [日志目录] --out <前缀>",
+  "dir": "D:\\deepseek-harness-dsh-v0.1.1-rc.2\\.dsh-trajectory-logs",
+  "files": 126,
+  "sessions": 96,
+  "sessionsWithNarrowing": 0,
+  "sessionsStuckOpen": 0,
+  "closedEpisodes": {
+    "n": 0,
+    "p50": null,
+    "p90": null,
+    "p95": null,
+    "max": null
+  },
+  "openEpisodes": {
+    "n": 0,
+    "p50": null,
+    "max": null
+  },
+  "recommendedMaxDriftSteps": null,
+  "note": "上界来自\"自然恢复片段\"的 p95：太小会截断正常片段，缺了它会出现\"收窄后永不恢复\"（本项目最重那次事故）。"
+}
