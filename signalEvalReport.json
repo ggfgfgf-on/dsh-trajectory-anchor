@@ -1,13 +1,23 @@
 {
-  "generatedAtUtc": "2026-10-09T08:23:49.434Z",
+  "generatedAtUtc": "2026-10-09T08:35:48.553Z",
   "kind": "drift-signal-discriminative-power",
   "command": "node tools/evaluate-signals.mjs [会话目录] --out <前缀>",
-  "note": "候选漂移信号的判别力评估（与 measure-recall 同口径）。**召回必须与\"同预算随机召回\"比较**：按运行期节流(1/turn、≤3/会话)后的信号才是实际部署形态，未节流的召回只是\"触发得多、蒙上的也多\"。结论（60 会话 / 285 强锚点）：没有任何候选同时具备\"精度倍数 > 1\"与\"正提前量\"；inaction 是唯一有正提前量(+3)的；repetition/failure 在漂移预测意义上低于随机(0.35×/0.50×)；L1 的 unverified-edit 按部署节流后≈随机(1.06×)——它是**事实提醒**，不是漂移预测器。",
+  "note": "候选漂移信号的判别力评估（与 measure-recall 同口径）。**召回必须与\"同预算随机召回\"比较**：按运行期节流(1/turn、≤3/会话)后的信号才是实际部署形态，未节流的召回只是\"触发得多、蒙上的也多\"。**前提覆盖率必须一起报**：触发 0 次可能是\"没有漂移\"，也可能是\"这个语料里根本没有该信号赖以存在的前提\"，两者结论完全不同（plan-order 就是前者）。结论（60 会话 / 285 强锚点）：没有任何候选同时具备\"精度倍数 > 1\"与\"正提前量\"。inaction 是唯一有正提前量(+3)的；repetition/failure 在漂移预测意义上低于随机(0.35×/0.50×)；L1 的 unverified-edit 按部署节流后≈随机(1.06×)——它是**事实提醒**，不是漂移预测器。「计划 vs 行动」这一路实测失败：plan-order 在 57% 覆盖（34/60 会话有 ≥2 阶段计划）下**触发 0 次**（这些会话里代理**没有**违背自己声明的顺序），plan-unmet-claim 0.27×（比随机差）。",
+  "coverage": {
+    "scope-write": 0.2,
+    "unverified-edit": 1,
+    "unverified-claim": 1,
+    "edit-thrash": 1,
+    "repeat-failure": 1,
+    "write-before-read": 1,
+    "plan-order": 0.5666666666666667,
+    "plan-unmet-claim": 0.5666666666666667
+  },
   "sessionsUsed": 60,
   "sessionsWithAnchors": 60,
   "anchorStats": {
-    "failure-marker": 1562,
-    "tool-error": 1369,
+    "failure-marker": 1566,
+    "tool-error": 1370,
     "unknown-tool": 85,
     "user-correction": 147,
     "abandoned-turn": 53
@@ -31,12 +41,13 @@
         "fires": 0,
         "unexplainedFires": 0,
         "precision": null,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": null,
         "delays": []
       },
       "chanceRecall": 0,
       "precisionLift": null,
+      "preconditionCoverage": 20,
       "macroRecall": 0
     },
     "scope-write·节流": {
@@ -51,27 +62,28 @@
         "fires": 0,
         "unexplainedFires": 0,
         "precision": null,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": null,
         "delays": []
       },
       "chanceRecall": 0,
       "precisionLift": null,
+      "preconditionCoverage": null,
       "macroRecall": 0
     },
     "unverified-edit": {
-      "fires": 3174,
-      "firesPerSession": 52.9,
-      "fireRate": 0.07509049184981902,
+      "fires": 3192,
+      "firesPerSession": 53.2,
+      "fireRate": 0.07543424317617867,
       "firedSessionRate": 0.5666666666666667,
       "pooled": {
         "anchors": 285,
         "hits": 69,
         "recall": 0.24210526315789474,
-        "fires": 3174,
-        "unexplainedFires": 3105,
-        "precision": 0.021739130434782608,
-        "chancePrecision": 0.0337126499325747,
+        "fires": 3192,
+        "unexplainedFires": 3123,
+        "precision": 0.021616541353383457,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": 1,
         "delays": [
           -1,
@@ -145,14 +157,15 @@
           3
         ]
       },
-      "chanceRecall": 0.3684456409697096,
-      "precisionLift": 0.644836003051106,
+      "chanceRecall": 0.36940163196507425,
+      "precisionLift": 0.6418975069252076,
+      "preconditionCoverage": 100,
       "macroRecall": 0.23800625724041213
     },
     "unverified-edit·节流": {
       "fires": 56,
       "firesPerSession": 0.9333333333333333,
-      "fireRate": 0.001324847997350304,
+      "fireRate": 0.0013234077750206782,
       "firedSessionRate": 0.5666666666666667,
       "pooled": {
         "anchors": 285,
@@ -161,30 +174,31 @@
         "fires": 56,
         "unexplainedFires": 54,
         "precision": 0.03571428571428571,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": -1,
         "delays": [
           -1,
           1
         ]
       },
-      "chanceRecall": 0.005758065583730242,
-      "precisionLift": 1.0593734335839597,
+      "chanceRecall": 0.005749906393096494,
+      "precisionLift": 1.0605263157894735,
+      "preconditionCoverage": null,
       "macroRecall": 0.025757575757575757
     },
     "unverified-claim": {
-      "fires": 320,
-      "firesPerSession": 5.333333333333333,
-      "fireRate": 0.00757055998485888,
+      "fires": 322,
+      "firesPerSession": 5.366666666666666,
+      "fireRate": 0.0076095947063689,
       "firedSessionRate": 0.25,
       "pooled": {
         "anchors": 285,
         "hits": 26,
         "recall": 0.0912280701754386,
-        "fires": 320,
-        "unexplainedFires": 294,
-        "precision": 0.08125,
-        "chancePrecision": 0.0337126499325747,
+        "fires": 322,
+        "unexplainedFires": 296,
+        "precision": 0.08074534161490683,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": 0,
         "delays": [
           -1,
@@ -215,14 +229,15 @@
           3
         ]
       },
-      "chanceRecall": 0.06962315751111732,
-      "precisionLift": 2.410074561403509,
+      "chanceRecall": 0.06989890170513503,
+      "precisionLift": 2.397711670480549,
+      "preconditionCoverage": 100,
       "macroRecall": 0.04167943265654533
     },
     "unverified-claim·节流": {
       "fires": 31,
       "firesPerSession": 0.5166666666666667,
-      "fireRate": 0.000733397998533204,
+      "fireRate": 0.0007326007326007326,
       "firedSessionRate": 0.25,
       "pooled": {
         "anchors": 285,
@@ -231,20 +246,21 @@
         "fires": 31,
         "unexplainedFires": 30,
         "precision": 0.03225806451612903,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": -1,
         "delays": [
           -1
         ]
       },
-      "chanceRecall": 0.005153955339371391,
-      "precisionLift": 0.9568534238822862,
+      "chanceRecall": 0.005145796148737645,
+      "precisionLift": 0.9578947368421051,
+      "preconditionCoverage": null,
       "macroRecall": 0.0030303030303030303
     },
     "edit-thrash": {
       "fires": 122,
       "firesPerSession": 2.033333333333333,
-      "fireRate": 0.002886275994227448,
+      "fireRate": 0.0028831383670093347,
       "firedSessionRate": 0.31666666666666665,
       "pooled": {
         "anchors": 285,
@@ -253,7 +269,7 @@
         "fires": 122,
         "unexplainedFires": 114,
         "precision": 0.06557377049180328,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -266,14 +282,15 @@
           2
         ]
       },
-      "chanceRecall": 0.011253830964793246,
-      "precisionLift": 1.9450790911705493,
+      "chanceRecall": 0.011240261957309153,
+      "precisionLift": 1.9471958584987057,
+      "preconditionCoverage": 100,
       "macroRecall": 0.02329507347112981
     },
     "edit-thrash·节流": {
       "fires": 38,
       "firesPerSession": 0.6333333333333333,
-      "fireRate": 0.000899003998201992,
+      "fireRate": 0.0008980267044783174,
       "firedSessionRate": 0.31666666666666665,
       "pooled": {
         "anchors": 285,
@@ -282,7 +299,7 @@
         "fires": 38,
         "unexplainedFires": 34,
         "precision": 0.10526315789473684,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -291,14 +308,15 @@
           2
         ]
       },
-      "chanceRecall": 0.005326325026051243,
-      "precisionLift": 3.12236380424746,
+      "chanceRecall": 0.005318165835417495,
+      "precisionLift": 3.1257617728531852,
+      "preconditionCoverage": null,
       "macroRecall": 0.011020669471373696
     },
     "repeat-failure": {
       "fires": 8,
       "firesPerSession": 0.13333333333333333,
-      "fireRate": 0.000189263999621472,
+      "fireRate": 0.0001890582535743826,
       "firedSessionRate": 0.016666666666666666,
       "pooled": {
         "anchors": 285,
@@ -307,18 +325,19 @@
         "fires": 8,
         "unexplainedFires": 8,
         "precision": 0,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": null,
         "delays": []
       },
       "chanceRecall": 0.000902863019896372,
       "precisionLift": 0,
+      "preconditionCoverage": 100,
       "macroRecall": 0
     },
     "repeat-failure·节流": {
       "fires": 3,
       "firesPerSession": 0.05,
-      "fireRate": 0.000070973999858052,
+      "fireRate": 0.00007089684509039348,
       "firedSessionRate": 0.016666666666666666,
       "pooled": {
         "anchors": 285,
@@ -327,27 +346,28 @@
         "fires": 3,
         "unexplainedFires": 3,
         "precision": 0,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": null,
         "delays": []
       },
       "chanceRecall": 0.0003420373455003014,
       "precisionLift": 0,
+      "preconditionCoverage": null,
       "macroRecall": 0
     },
     "write-before-read": {
-      "fires": 575,
-      "firesPerSession": 9.583333333333334,
-      "fireRate": 0.0136033499727933,
+      "fires": 577,
+      "firesPerSession": 9.616666666666667,
+      "fireRate": 0.013635826539052346,
       "firedSessionRate": 0.5166666666666667,
       "pooled": {
         "anchors": 285,
         "hits": 9,
         "recall": 0.031578947368421054,
-        "fires": 575,
-        "unexplainedFires": 566,
-        "precision": 0.01565217391304348,
-        "chancePrecision": 0.0337126499325747,
+        "fires": 577,
+        "unexplainedFires": 568,
+        "precision": 0.01559792027729636,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": 2,
         "delays": [
           -1,
@@ -361,14 +381,15 @@
           3
         ]
       },
-      "chanceRecall": 0.06706566738207978,
-      "precisionLift": 0.46428192219679637,
+      "chanceRecall": 0.06727632981342052,
+      "precisionLift": 0.46317613791845297,
+      "preconditionCoverage": 100,
       "macroRecall": 0.03248506188647034
     },
     "write-before-read·节流": {
       "fires": 61,
       "firesPerSession": 1.0166666666666666,
-      "fireRate": 0.001443137997113724,
+      "fireRate": 0.0014415691835046674,
       "firedSessionRate": 0.5166666666666667,
       "pooled": {
         "anchors": 285,
@@ -377,15 +398,109 @@
         "fires": 61,
         "unexplainedFires": 60,
         "precision": 0.01639344262295082,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": 3,
         "delays": [
           3
         ]
       },
-      "chanceRecall": 0.007065118977065001,
-      "precisionLift": 0.48626977279263733,
+      "chanceRecall": 0.007056959786431254,
+      "precisionLift": 0.4867989646246764,
+      "preconditionCoverage": null,
       "macroRecall": 0.005681818181818182
+    },
+    "plan-order": {
+      "fires": 0,
+      "firesPerSession": 0,
+      "fireRate": 0,
+      "firedSessionRate": 0,
+      "pooled": {
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 0,
+        "unexplainedFires": 0,
+        "precision": null,
+        "chancePrecision": 0.033676001417936904,
+        "medianDelay": null,
+        "delays": []
+      },
+      "chanceRecall": 0,
+      "precisionLift": null,
+      "preconditionCoverage": 56.666666666666664,
+      "macroRecall": 0
+    },
+    "plan-order·节流": {
+      "fires": 0,
+      "firesPerSession": 0,
+      "fireRate": 0,
+      "firedSessionRate": 0,
+      "pooled": {
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 0,
+        "unexplainedFires": 0,
+        "precision": null,
+        "chancePrecision": 0.033676001417936904,
+        "medianDelay": null,
+        "delays": []
+      },
+      "chanceRecall": 0,
+      "precisionLift": null,
+      "preconditionCoverage": null,
+      "macroRecall": 0
+    },
+    "plan-unmet-claim": {
+      "fires": 893,
+      "firesPerSession": 14.883333333333333,
+      "fireRate": 0.021103627555240458,
+      "firedSessionRate": 0.15,
+      "pooled": {
+        "anchors": 285,
+        "hits": 8,
+        "recall": 0.028070175438596492,
+        "fires": 893,
+        "unexplainedFires": 885,
+        "precision": 0.008958566629339306,
+        "chancePrecision": 0.033676001417936904,
+        "medianDelay": 3,
+        "delays": [
+          0,
+          3,
+          3,
+          3,
+          3,
+          3,
+          3,
+          3
+        ]
+      },
+      "chanceRecall": 0.07210315766196364,
+      "precisionLift": 0.26602227854069666,
+      "preconditionCoverage": 56.666666666666664,
+      "macroRecall": 0.056818181818181816
+    },
+    "plan-unmet-claim·节流": {
+      "fires": 23,
+      "firesPerSession": 0.38333333333333336,
+      "fireRate": 0.00054354247902635,
+      "firedSessionRate": 0.15,
+      "pooled": {
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 23,
+        "unexplainedFires": 23,
+        "precision": 0,
+        "chancePrecision": 0.033676001417936904,
+        "medianDelay": null,
+        "delays": []
+      },
+      "chanceRecall": 0.002271769414066969,
+      "precisionLift": 0,
+      "preconditionCoverage": null,
+      "macroRecall": 0
     }
   },
   "leadCurve": {
@@ -398,7 +513,7 @@
         "fires": 0,
         "unexplainedFires": 0,
         "precision": null,
-        "chancePrecision": 0.01348505997302988,
+        "chancePrecision": 0.01347040056717476,
         "medianDelay": null,
         "delays": []
       },
@@ -410,7 +525,7 @@
         "fires": 0,
         "unexplainedFires": 0,
         "precision": null,
-        "chancePrecision": 0.02022758995954482,
+        "chancePrecision": 0.020205600850762142,
         "medianDelay": null,
         "delays": []
       },
@@ -422,7 +537,7 @@
         "fires": 0,
         "unexplainedFires": 0,
         "precision": null,
-        "chancePrecision": 0.02697011994605976,
+        "chancePrecision": 0.02694080113434952,
         "medianDelay": null,
         "delays": []
       },
@@ -434,7 +549,7 @@
         "fires": 0,
         "unexplainedFires": 0,
         "precision": null,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": null,
         "delays": []
       },
@@ -446,7 +561,7 @@
         "fires": 0,
         "unexplainedFires": 0,
         "precision": null,
-        "chancePrecision": 0.04045517991908964,
+        "chancePrecision": 0.040411201701524284,
         "medianDelay": null,
         "delays": []
       },
@@ -458,7 +573,7 @@
         "fires": 0,
         "unexplainedFires": 0,
         "precision": null,
-        "chancePrecision": 0.04719770990560458,
+        "chancePrecision": 0.04714640198511166,
         "medianDelay": null,
         "delays": []
       },
@@ -470,7 +585,7 @@
         "fires": 0,
         "unexplainedFires": 0,
         "precision": null,
-        "chancePrecision": 0.05394023989211952,
+        "chancePrecision": 0.05388160226869904,
         "medianDelay": null,
         "delays": []
       }
@@ -484,7 +599,7 @@
         "fires": 0,
         "unexplainedFires": 0,
         "precision": null,
-        "chancePrecision": 0.01348505997302988,
+        "chancePrecision": 0.01347040056717476,
         "medianDelay": null,
         "delays": []
       },
@@ -496,7 +611,7 @@
         "fires": 0,
         "unexplainedFires": 0,
         "precision": null,
-        "chancePrecision": 0.02022758995954482,
+        "chancePrecision": 0.020205600850762142,
         "medianDelay": null,
         "delays": []
       },
@@ -508,7 +623,7 @@
         "fires": 0,
         "unexplainedFires": 0,
         "precision": null,
-        "chancePrecision": 0.02697011994605976,
+        "chancePrecision": 0.02694080113434952,
         "medianDelay": null,
         "delays": []
       },
@@ -520,7 +635,7 @@
         "fires": 0,
         "unexplainedFires": 0,
         "precision": null,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": null,
         "delays": []
       },
@@ -532,7 +647,7 @@
         "fires": 0,
         "unexplainedFires": 0,
         "precision": null,
-        "chancePrecision": 0.04045517991908964,
+        "chancePrecision": 0.040411201701524284,
         "medianDelay": null,
         "delays": []
       },
@@ -544,7 +659,7 @@
         "fires": 0,
         "unexplainedFires": 0,
         "precision": null,
-        "chancePrecision": 0.04719770990560458,
+        "chancePrecision": 0.04714640198511166,
         "medianDelay": null,
         "delays": []
       },
@@ -556,7 +671,7 @@
         "fires": 0,
         "unexplainedFires": 0,
         "precision": null,
-        "chancePrecision": 0.05394023989211952,
+        "chancePrecision": 0.05388160226869904,
         "medianDelay": null,
         "delays": []
       }
@@ -567,10 +682,10 @@
         "anchors": 285,
         "hits": 43,
         "recall": 0.15087719298245614,
-        "fires": 3174,
-        "unexplainedFires": 3131,
-        "precision": 0.013547574039067423,
-        "chancePrecision": 0.01348505997302988,
+        "fires": 3192,
+        "unexplainedFires": 3149,
+        "precision": 0.013471177944862155,
+        "chancePrecision": 0.01347040056717476,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -623,10 +738,10 @@
         "anchors": 285,
         "hits": 51,
         "recall": 0.17894736842105263,
-        "fires": 3174,
-        "unexplainedFires": 3123,
-        "precision": 0.01606805293005671,
-        "chancePrecision": 0.02022758995954482,
+        "fires": 3192,
+        "unexplainedFires": 3141,
+        "precision": 0.015977443609022556,
+        "chancePrecision": 0.020205600850762142,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -687,10 +802,10 @@
         "anchors": 285,
         "hits": 59,
         "recall": 0.20701754385964913,
-        "fires": 3174,
-        "unexplainedFires": 3115,
-        "precision": 0.018588531821046,
-        "chancePrecision": 0.02697011994605976,
+        "fires": 3192,
+        "unexplainedFires": 3133,
+        "precision": 0.018483709273182956,
+        "chancePrecision": 0.02694080113434952,
         "medianDelay": 1,
         "delays": [
           -1,
@@ -759,10 +874,10 @@
         "anchors": 285,
         "hits": 69,
         "recall": 0.24210526315789474,
-        "fires": 3174,
-        "unexplainedFires": 3105,
-        "precision": 0.021739130434782608,
-        "chancePrecision": 0.0337126499325747,
+        "fires": 3192,
+        "unexplainedFires": 3123,
+        "precision": 0.021616541353383457,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": 1,
         "delays": [
           -1,
@@ -841,10 +956,10 @@
         "anchors": 285,
         "hits": 77,
         "recall": 0.27017543859649124,
-        "fires": 3174,
-        "unexplainedFires": 3097,
-        "precision": 0.024259609325771897,
-        "chancePrecision": 0.04045517991908964,
+        "fires": 3192,
+        "unexplainedFires": 3115,
+        "precision": 0.02412280701754386,
+        "chancePrecision": 0.040411201701524284,
         "medianDelay": 3,
         "delays": [
           -1,
@@ -931,10 +1046,10 @@
         "anchors": 285,
         "hits": 85,
         "recall": 0.2982456140350877,
-        "fires": 3174,
-        "unexplainedFires": 3089,
-        "precision": 0.026780088216761186,
-        "chancePrecision": 0.04719770990560458,
+        "fires": 3192,
+        "unexplainedFires": 3107,
+        "precision": 0.02662907268170426,
+        "chancePrecision": 0.04714640198511166,
         "medianDelay": 3,
         "delays": [
           -1,
@@ -1029,10 +1144,10 @@
         "anchors": 285,
         "hits": 89,
         "recall": 0.312280701754386,
-        "fires": 3174,
-        "unexplainedFires": 3085,
-        "precision": 0.028040327662255827,
-        "chancePrecision": 0.05394023989211952,
+        "fires": 3192,
+        "unexplainedFires": 3103,
+        "precision": 0.02788220551378446,
+        "chancePrecision": 0.05388160226869904,
         "medianDelay": 4,
         "delays": [
           -1,
@@ -1136,7 +1251,7 @@
         "fires": 56,
         "unexplainedFires": 54,
         "precision": 0.03571428571428571,
-        "chancePrecision": 0.01348505997302988,
+        "chancePrecision": 0.01347040056717476,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1151,7 +1266,7 @@
         "fires": 56,
         "unexplainedFires": 54,
         "precision": 0.03571428571428571,
-        "chancePrecision": 0.02022758995954482,
+        "chancePrecision": 0.020205600850762142,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1166,7 +1281,7 @@
         "fires": 56,
         "unexplainedFires": 54,
         "precision": 0.03571428571428571,
-        "chancePrecision": 0.02697011994605976,
+        "chancePrecision": 0.02694080113434952,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1181,7 +1296,7 @@
         "fires": 56,
         "unexplainedFires": 54,
         "precision": 0.03571428571428571,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1196,7 +1311,7 @@
         "fires": 56,
         "unexplainedFires": 54,
         "precision": 0.03571428571428571,
-        "chancePrecision": 0.04045517991908964,
+        "chancePrecision": 0.040411201701524284,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1211,7 +1326,7 @@
         "fires": 56,
         "unexplainedFires": 54,
         "precision": 0.03571428571428571,
-        "chancePrecision": 0.04719770990560458,
+        "chancePrecision": 0.04714640198511166,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1226,7 +1341,7 @@
         "fires": 56,
         "unexplainedFires": 54,
         "precision": 0.03571428571428571,
-        "chancePrecision": 0.05394023989211952,
+        "chancePrecision": 0.05388160226869904,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1240,10 +1355,10 @@
         "anchors": 285,
         "hits": 16,
         "recall": 0.056140350877192984,
-        "fires": 320,
-        "unexplainedFires": 304,
-        "precision": 0.05,
-        "chancePrecision": 0.01348505997302988,
+        "fires": 322,
+        "unexplainedFires": 306,
+        "precision": 0.049689440993788817,
+        "chancePrecision": 0.01347040056717476,
         "medianDelay": 0,
         "delays": [
           -1,
@@ -1269,10 +1384,10 @@
         "anchors": 285,
         "hits": 23,
         "recall": 0.08070175438596491,
-        "fires": 320,
-        "unexplainedFires": 297,
-        "precision": 0.071875,
-        "chancePrecision": 0.02022758995954482,
+        "fires": 322,
+        "unexplainedFires": 299,
+        "precision": 0.07142857142857142,
+        "chancePrecision": 0.020205600850762142,
         "medianDelay": 0,
         "delays": [
           -1,
@@ -1305,10 +1420,10 @@
         "anchors": 285,
         "hits": 25,
         "recall": 0.08771929824561403,
-        "fires": 320,
-        "unexplainedFires": 295,
-        "precision": 0.078125,
-        "chancePrecision": 0.02697011994605976,
+        "fires": 322,
+        "unexplainedFires": 297,
+        "precision": 0.07763975155279502,
+        "chancePrecision": 0.02694080113434952,
         "medianDelay": 0,
         "delays": [
           -1,
@@ -1343,10 +1458,10 @@
         "anchors": 285,
         "hits": 26,
         "recall": 0.0912280701754386,
-        "fires": 320,
-        "unexplainedFires": 294,
-        "precision": 0.08125,
-        "chancePrecision": 0.0337126499325747,
+        "fires": 322,
+        "unexplainedFires": 296,
+        "precision": 0.08074534161490683,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": 0,
         "delays": [
           -1,
@@ -1382,10 +1497,10 @@
         "anchors": 285,
         "hits": 29,
         "recall": 0.10175438596491228,
-        "fires": 320,
-        "unexplainedFires": 291,
-        "precision": 0.090625,
-        "chancePrecision": 0.04045517991908964,
+        "fires": 322,
+        "unexplainedFires": 293,
+        "precision": 0.09006211180124224,
+        "chancePrecision": 0.040411201701524284,
         "medianDelay": 1,
         "delays": [
           -1,
@@ -1424,10 +1539,10 @@
         "anchors": 285,
         "hits": 30,
         "recall": 0.10526315789473684,
-        "fires": 320,
-        "unexplainedFires": 290,
-        "precision": 0.09375,
-        "chancePrecision": 0.04719770990560458,
+        "fires": 322,
+        "unexplainedFires": 292,
+        "precision": 0.09316770186335403,
+        "chancePrecision": 0.04714640198511166,
         "medianDelay": 1,
         "delays": [
           -1,
@@ -1467,10 +1582,10 @@
         "anchors": 285,
         "hits": 36,
         "recall": 0.12631578947368421,
-        "fires": 320,
-        "unexplainedFires": 284,
-        "precision": 0.1125,
-        "chancePrecision": 0.05394023989211952,
+        "fires": 322,
+        "unexplainedFires": 286,
+        "precision": 0.11180124223602485,
+        "chancePrecision": 0.05388160226869904,
         "medianDelay": 1,
         "delays": [
           -1,
@@ -1521,7 +1636,7 @@
         "fires": 31,
         "unexplainedFires": 30,
         "precision": 0.03225806451612903,
-        "chancePrecision": 0.01348505997302988,
+        "chancePrecision": 0.01347040056717476,
         "medianDelay": -1,
         "delays": [
           -1
@@ -1535,7 +1650,7 @@
         "fires": 31,
         "unexplainedFires": 30,
         "precision": 0.03225806451612903,
-        "chancePrecision": 0.02022758995954482,
+        "chancePrecision": 0.020205600850762142,
         "medianDelay": -1,
         "delays": [
           -1
@@ -1549,7 +1664,7 @@
         "fires": 31,
         "unexplainedFires": 30,
         "precision": 0.03225806451612903,
-        "chancePrecision": 0.02697011994605976,
+        "chancePrecision": 0.02694080113434952,
         "medianDelay": -1,
         "delays": [
           -1
@@ -1563,7 +1678,7 @@
         "fires": 31,
         "unexplainedFires": 30,
         "precision": 0.03225806451612903,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": -1,
         "delays": [
           -1
@@ -1577,7 +1692,7 @@
         "fires": 31,
         "unexplainedFires": 30,
         "precision": 0.03225806451612903,
-        "chancePrecision": 0.04045517991908964,
+        "chancePrecision": 0.040411201701524284,
         "medianDelay": -1,
         "delays": [
           -1
@@ -1591,7 +1706,7 @@
         "fires": 31,
         "unexplainedFires": 30,
         "precision": 0.03225806451612903,
-        "chancePrecision": 0.04719770990560458,
+        "chancePrecision": 0.04714640198511166,
         "medianDelay": -1,
         "delays": [
           -1
@@ -1605,7 +1720,7 @@
         "fires": 31,
         "unexplainedFires": 30,
         "precision": 0.03225806451612903,
-        "chancePrecision": 0.05394023989211952,
+        "chancePrecision": 0.05388160226869904,
         "medianDelay": -1,
         "delays": [
           -1
@@ -1621,7 +1736,7 @@
         "fires": 122,
         "unexplainedFires": 117,
         "precision": 0.040983606557377046,
-        "chancePrecision": 0.01348505997302988,
+        "chancePrecision": 0.01347040056717476,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1639,7 +1754,7 @@
         "fires": 122,
         "unexplainedFires": 116,
         "precision": 0.04918032786885246,
-        "chancePrecision": 0.02022758995954482,
+        "chancePrecision": 0.020205600850762142,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1658,7 +1773,7 @@
         "fires": 122,
         "unexplainedFires": 114,
         "precision": 0.06557377049180328,
-        "chancePrecision": 0.02697011994605976,
+        "chancePrecision": 0.02694080113434952,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1679,7 +1794,7 @@
         "fires": 122,
         "unexplainedFires": 114,
         "precision": 0.06557377049180328,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1700,7 +1815,7 @@
         "fires": 122,
         "unexplainedFires": 113,
         "precision": 0.07377049180327869,
-        "chancePrecision": 0.04045517991908964,
+        "chancePrecision": 0.040411201701524284,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1722,7 +1837,7 @@
         "fires": 122,
         "unexplainedFires": 113,
         "precision": 0.07377049180327869,
-        "chancePrecision": 0.04719770990560458,
+        "chancePrecision": 0.04714640198511166,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1744,7 +1859,7 @@
         "fires": 122,
         "unexplainedFires": 112,
         "precision": 0.08196721311475409,
-        "chancePrecision": 0.05394023989211952,
+        "chancePrecision": 0.05388160226869904,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1769,7 +1884,7 @@
         "fires": 38,
         "unexplainedFires": 35,
         "precision": 0.07894736842105263,
-        "chancePrecision": 0.01348505997302988,
+        "chancePrecision": 0.01347040056717476,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1785,7 +1900,7 @@
         "fires": 38,
         "unexplainedFires": 35,
         "precision": 0.07894736842105263,
-        "chancePrecision": 0.02022758995954482,
+        "chancePrecision": 0.020205600850762142,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1801,7 +1916,7 @@
         "fires": 38,
         "unexplainedFires": 34,
         "precision": 0.10526315789473684,
-        "chancePrecision": 0.02697011994605976,
+        "chancePrecision": 0.02694080113434952,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1818,7 +1933,7 @@
         "fires": 38,
         "unexplainedFires": 34,
         "precision": 0.10526315789473684,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1835,7 +1950,7 @@
         "fires": 38,
         "unexplainedFires": 33,
         "precision": 0.13157894736842105,
-        "chancePrecision": 0.04045517991908964,
+        "chancePrecision": 0.040411201701524284,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1853,7 +1968,7 @@
         "fires": 38,
         "unexplainedFires": 33,
         "precision": 0.13157894736842105,
-        "chancePrecision": 0.04719770990560458,
+        "chancePrecision": 0.04714640198511166,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1871,7 +1986,7 @@
         "fires": 38,
         "unexplainedFires": 32,
         "precision": 0.15789473684210525,
-        "chancePrecision": 0.05394023989211952,
+        "chancePrecision": 0.05388160226869904,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -1892,7 +2007,7 @@
         "fires": 8,
         "unexplainedFires": 8,
         "precision": 0,
-        "chancePrecision": 0.01348505997302988,
+        "chancePrecision": 0.01347040056717476,
         "medianDelay": null,
         "delays": []
       },
@@ -1904,7 +2019,7 @@
         "fires": 8,
         "unexplainedFires": 8,
         "precision": 0,
-        "chancePrecision": 0.02022758995954482,
+        "chancePrecision": 0.020205600850762142,
         "medianDelay": null,
         "delays": []
       },
@@ -1916,7 +2031,7 @@
         "fires": 8,
         "unexplainedFires": 8,
         "precision": 0,
-        "chancePrecision": 0.02697011994605976,
+        "chancePrecision": 0.02694080113434952,
         "medianDelay": null,
         "delays": []
       },
@@ -1928,7 +2043,7 @@
         "fires": 8,
         "unexplainedFires": 8,
         "precision": 0,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": null,
         "delays": []
       },
@@ -1940,7 +2055,7 @@
         "fires": 8,
         "unexplainedFires": 7,
         "precision": 0.125,
-        "chancePrecision": 0.04045517991908964,
+        "chancePrecision": 0.040411201701524284,
         "medianDelay": 4,
         "delays": [
           4
@@ -1954,7 +2069,7 @@
         "fires": 8,
         "unexplainedFires": 7,
         "precision": 0.125,
-        "chancePrecision": 0.04719770990560458,
+        "chancePrecision": 0.04714640198511166,
         "medianDelay": 4,
         "delays": [
           4
@@ -1968,7 +2083,7 @@
         "fires": 8,
         "unexplainedFires": 7,
         "precision": 0.125,
-        "chancePrecision": 0.05394023989211952,
+        "chancePrecision": 0.05388160226869904,
         "medianDelay": 4,
         "delays": [
           4
@@ -1984,7 +2099,7 @@
         "fires": 3,
         "unexplainedFires": 3,
         "precision": 0,
-        "chancePrecision": 0.01348505997302988,
+        "chancePrecision": 0.01347040056717476,
         "medianDelay": null,
         "delays": []
       },
@@ -1996,7 +2111,7 @@
         "fires": 3,
         "unexplainedFires": 3,
         "precision": 0,
-        "chancePrecision": 0.02022758995954482,
+        "chancePrecision": 0.020205600850762142,
         "medianDelay": null,
         "delays": []
       },
@@ -2008,7 +2123,7 @@
         "fires": 3,
         "unexplainedFires": 3,
         "precision": 0,
-        "chancePrecision": 0.02697011994605976,
+        "chancePrecision": 0.02694080113434952,
         "medianDelay": null,
         "delays": []
       },
@@ -2020,7 +2135,7 @@
         "fires": 3,
         "unexplainedFires": 3,
         "precision": 0,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": null,
         "delays": []
       },
@@ -2032,7 +2147,7 @@
         "fires": 3,
         "unexplainedFires": 3,
         "precision": 0,
-        "chancePrecision": 0.04045517991908964,
+        "chancePrecision": 0.040411201701524284,
         "medianDelay": null,
         "delays": []
       },
@@ -2044,7 +2159,7 @@
         "fires": 3,
         "unexplainedFires": 3,
         "precision": 0,
-        "chancePrecision": 0.04719770990560458,
+        "chancePrecision": 0.04714640198511166,
         "medianDelay": null,
         "delays": []
       },
@@ -2056,7 +2171,7 @@
         "fires": 3,
         "unexplainedFires": 3,
         "precision": 0,
-        "chancePrecision": 0.05394023989211952,
+        "chancePrecision": 0.05388160226869904,
         "medianDelay": null,
         "delays": []
       }
@@ -2067,10 +2182,10 @@
         "anchors": 285,
         "hits": 3,
         "recall": 0.010526315789473684,
-        "fires": 575,
-        "unexplainedFires": 572,
-        "precision": 0.0052173913043478265,
-        "chancePrecision": 0.01348505997302988,
+        "fires": 577,
+        "unexplainedFires": 574,
+        "precision": 0.005199306759098787,
+        "chancePrecision": 0.01347040056717476,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -2083,10 +2198,10 @@
         "anchors": 285,
         "hits": 4,
         "recall": 0.014035087719298246,
-        "fires": 575,
-        "unexplainedFires": 571,
-        "precision": 0.006956521739130435,
-        "chancePrecision": 0.02022758995954482,
+        "fires": 577,
+        "unexplainedFires": 573,
+        "precision": 0.006932409012131715,
+        "chancePrecision": 0.020205600850762142,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -2100,10 +2215,10 @@
         "anchors": 285,
         "hits": 6,
         "recall": 0.021052631578947368,
-        "fires": 575,
-        "unexplainedFires": 569,
-        "precision": 0.010434782608695653,
-        "chancePrecision": 0.02697011994605976,
+        "fires": 577,
+        "unexplainedFires": 571,
+        "precision": 0.010398613518197574,
+        "chancePrecision": 0.02694080113434952,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -2119,10 +2234,10 @@
         "anchors": 285,
         "hits": 9,
         "recall": 0.031578947368421054,
-        "fires": 575,
-        "unexplainedFires": 566,
-        "precision": 0.01565217391304348,
-        "chancePrecision": 0.0337126499325747,
+        "fires": 577,
+        "unexplainedFires": 568,
+        "precision": 0.01559792027729636,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": 2,
         "delays": [
           -1,
@@ -2141,10 +2256,10 @@
         "anchors": 285,
         "hits": 10,
         "recall": 0.03508771929824561,
-        "fires": 575,
-        "unexplainedFires": 565,
-        "precision": 0.017391304347826087,
-        "chancePrecision": 0.04045517991908964,
+        "fires": 577,
+        "unexplainedFires": 567,
+        "precision": 0.01733102253032929,
+        "chancePrecision": 0.040411201701524284,
         "medianDelay": 2,
         "delays": [
           -1,
@@ -2164,10 +2279,10 @@
         "anchors": 285,
         "hits": 11,
         "recall": 0.03859649122807018,
-        "fires": 575,
-        "unexplainedFires": 564,
-        "precision": 0.019130434782608695,
-        "chancePrecision": 0.04719770990560458,
+        "fires": 577,
+        "unexplainedFires": 566,
+        "precision": 0.019064124783362217,
+        "chancePrecision": 0.04714640198511166,
         "medianDelay": 3,
         "delays": [
           -1,
@@ -2188,10 +2303,10 @@
         "anchors": 285,
         "hits": 13,
         "recall": 0.0456140350877193,
-        "fires": 575,
-        "unexplainedFires": 562,
-        "precision": 0.022608695652173914,
-        "chancePrecision": 0.05394023989211952,
+        "fires": 577,
+        "unexplainedFires": 564,
+        "precision": 0.022530329289428077,
+        "chancePrecision": 0.05388160226869904,
         "medianDelay": 3,
         "delays": [
           -1,
@@ -2219,7 +2334,7 @@
         "fires": 61,
         "unexplainedFires": 61,
         "precision": 0,
-        "chancePrecision": 0.01348505997302988,
+        "chancePrecision": 0.01347040056717476,
         "medianDelay": null,
         "delays": []
       },
@@ -2231,7 +2346,7 @@
         "fires": 61,
         "unexplainedFires": 61,
         "precision": 0,
-        "chancePrecision": 0.02022758995954482,
+        "chancePrecision": 0.020205600850762142,
         "medianDelay": null,
         "delays": []
       },
@@ -2243,7 +2358,7 @@
         "fires": 61,
         "unexplainedFires": 61,
         "precision": 0,
-        "chancePrecision": 0.02697011994605976,
+        "chancePrecision": 0.02694080113434952,
         "medianDelay": null,
         "delays": []
       },
@@ -2255,7 +2370,7 @@
         "fires": 61,
         "unexplainedFires": 60,
         "precision": 0.01639344262295082,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": 3,
         "delays": [
           3
@@ -2269,7 +2384,7 @@
         "fires": 61,
         "unexplainedFires": 60,
         "precision": 0.01639344262295082,
-        "chancePrecision": 0.04045517991908964,
+        "chancePrecision": 0.040411201701524284,
         "medianDelay": 3,
         "delays": [
           3
@@ -2283,7 +2398,7 @@
         "fires": 61,
         "unexplainedFires": 59,
         "precision": 0.03278688524590164,
-        "chancePrecision": 0.04719770990560458,
+        "chancePrecision": 0.04714640198511166,
         "medianDelay": 3,
         "delays": [
           3,
@@ -2298,12 +2413,433 @@
         "fires": 61,
         "unexplainedFires": 59,
         "precision": 0.03278688524590164,
-        "chancePrecision": 0.05394023989211952,
+        "chancePrecision": 0.05388160226869904,
         "medianDelay": 3,
         "delays": [
           3,
           5
         ]
+      }
+    ],
+    "plan-order": [
+      {
+        "lead": 0,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 0,
+        "unexplainedFires": 0,
+        "precision": null,
+        "chancePrecision": 0.01347040056717476,
+        "medianDelay": null,
+        "delays": []
+      },
+      {
+        "lead": 1,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 0,
+        "unexplainedFires": 0,
+        "precision": null,
+        "chancePrecision": 0.020205600850762142,
+        "medianDelay": null,
+        "delays": []
+      },
+      {
+        "lead": 2,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 0,
+        "unexplainedFires": 0,
+        "precision": null,
+        "chancePrecision": 0.02694080113434952,
+        "medianDelay": null,
+        "delays": []
+      },
+      {
+        "lead": 3,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 0,
+        "unexplainedFires": 0,
+        "precision": null,
+        "chancePrecision": 0.033676001417936904,
+        "medianDelay": null,
+        "delays": []
+      },
+      {
+        "lead": 4,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 0,
+        "unexplainedFires": 0,
+        "precision": null,
+        "chancePrecision": 0.040411201701524284,
+        "medianDelay": null,
+        "delays": []
+      },
+      {
+        "lead": 5,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 0,
+        "unexplainedFires": 0,
+        "precision": null,
+        "chancePrecision": 0.04714640198511166,
+        "medianDelay": null,
+        "delays": []
+      },
+      {
+        "lead": 6,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 0,
+        "unexplainedFires": 0,
+        "precision": null,
+        "chancePrecision": 0.05388160226869904,
+        "medianDelay": null,
+        "delays": []
+      }
+    ],
+    "plan-order·节流": [
+      {
+        "lead": 0,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 0,
+        "unexplainedFires": 0,
+        "precision": null,
+        "chancePrecision": 0.01347040056717476,
+        "medianDelay": null,
+        "delays": []
+      },
+      {
+        "lead": 1,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 0,
+        "unexplainedFires": 0,
+        "precision": null,
+        "chancePrecision": 0.020205600850762142,
+        "medianDelay": null,
+        "delays": []
+      },
+      {
+        "lead": 2,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 0,
+        "unexplainedFires": 0,
+        "precision": null,
+        "chancePrecision": 0.02694080113434952,
+        "medianDelay": null,
+        "delays": []
+      },
+      {
+        "lead": 3,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 0,
+        "unexplainedFires": 0,
+        "precision": null,
+        "chancePrecision": 0.033676001417936904,
+        "medianDelay": null,
+        "delays": []
+      },
+      {
+        "lead": 4,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 0,
+        "unexplainedFires": 0,
+        "precision": null,
+        "chancePrecision": 0.040411201701524284,
+        "medianDelay": null,
+        "delays": []
+      },
+      {
+        "lead": 5,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 0,
+        "unexplainedFires": 0,
+        "precision": null,
+        "chancePrecision": 0.04714640198511166,
+        "medianDelay": null,
+        "delays": []
+      },
+      {
+        "lead": 6,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 0,
+        "unexplainedFires": 0,
+        "precision": null,
+        "chancePrecision": 0.05388160226869904,
+        "medianDelay": null,
+        "delays": []
+      }
+    ],
+    "plan-unmet-claim": [
+      {
+        "lead": 0,
+        "anchors": 285,
+        "hits": 1,
+        "recall": 0.0035087719298245615,
+        "fires": 893,
+        "unexplainedFires": 892,
+        "precision": 0.0011198208286674132,
+        "chancePrecision": 0.01347040056717476,
+        "medianDelay": 0,
+        "delays": [
+          0
+        ]
+      },
+      {
+        "lead": 1,
+        "anchors": 285,
+        "hits": 1,
+        "recall": 0.0035087719298245615,
+        "fires": 893,
+        "unexplainedFires": 892,
+        "precision": 0.0011198208286674132,
+        "chancePrecision": 0.020205600850762142,
+        "medianDelay": 0,
+        "delays": [
+          0
+        ]
+      },
+      {
+        "lead": 2,
+        "anchors": 285,
+        "hits": 1,
+        "recall": 0.0035087719298245615,
+        "fires": 893,
+        "unexplainedFires": 892,
+        "precision": 0.0011198208286674132,
+        "chancePrecision": 0.02694080113434952,
+        "medianDelay": 0,
+        "delays": [
+          0
+        ]
+      },
+      {
+        "lead": 3,
+        "anchors": 285,
+        "hits": 8,
+        "recall": 0.028070175438596492,
+        "fires": 893,
+        "unexplainedFires": 885,
+        "precision": 0.008958566629339306,
+        "chancePrecision": 0.033676001417936904,
+        "medianDelay": 3,
+        "delays": [
+          0,
+          3,
+          3,
+          3,
+          3,
+          3,
+          3,
+          3
+        ]
+      },
+      {
+        "lead": 4,
+        "anchors": 285,
+        "hits": 15,
+        "recall": 0.05263157894736842,
+        "fires": 893,
+        "unexplainedFires": 878,
+        "precision": 0.0167973124300112,
+        "chancePrecision": 0.040411201701524284,
+        "medianDelay": 3,
+        "delays": [
+          0,
+          3,
+          3,
+          3,
+          3,
+          3,
+          3,
+          3,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4
+        ]
+      },
+      {
+        "lead": 5,
+        "anchors": 285,
+        "hits": 22,
+        "recall": 0.07719298245614035,
+        "fires": 893,
+        "unexplainedFires": 871,
+        "precision": 0.02463605823068309,
+        "chancePrecision": 0.04714640198511166,
+        "medianDelay": 4,
+        "delays": [
+          0,
+          3,
+          3,
+          3,
+          3,
+          3,
+          3,
+          3,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          5,
+          5,
+          5,
+          5,
+          5,
+          5,
+          5
+        ]
+      },
+      {
+        "lead": 6,
+        "anchors": 285,
+        "hits": 22,
+        "recall": 0.07719298245614035,
+        "fires": 893,
+        "unexplainedFires": 871,
+        "precision": 0.02463605823068309,
+        "chancePrecision": 0.05388160226869904,
+        "medianDelay": 4,
+        "delays": [
+          0,
+          3,
+          3,
+          3,
+          3,
+          3,
+          3,
+          3,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          5,
+          5,
+          5,
+          5,
+          5,
+          5,
+          5
+        ]
+      }
+    ],
+    "plan-unmet-claim·节流": [
+      {
+        "lead": 0,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 23,
+        "unexplainedFires": 23,
+        "precision": 0,
+        "chancePrecision": 0.01347040056717476,
+        "medianDelay": null,
+        "delays": []
+      },
+      {
+        "lead": 1,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 23,
+        "unexplainedFires": 23,
+        "precision": 0,
+        "chancePrecision": 0.020205600850762142,
+        "medianDelay": null,
+        "delays": []
+      },
+      {
+        "lead": 2,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 23,
+        "unexplainedFires": 23,
+        "precision": 0,
+        "chancePrecision": 0.02694080113434952,
+        "medianDelay": null,
+        "delays": []
+      },
+      {
+        "lead": 3,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 23,
+        "unexplainedFires": 23,
+        "precision": 0,
+        "chancePrecision": 0.033676001417936904,
+        "medianDelay": null,
+        "delays": []
+      },
+      {
+        "lead": 4,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 23,
+        "unexplainedFires": 23,
+        "precision": 0,
+        "chancePrecision": 0.040411201701524284,
+        "medianDelay": null,
+        "delays": []
+      },
+      {
+        "lead": 5,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 23,
+        "unexplainedFires": 23,
+        "precision": 0,
+        "chancePrecision": 0.04714640198511166,
+        "medianDelay": null,
+        "delays": []
+      },
+      {
+        "lead": 6,
+        "anchors": 285,
+        "hits": 0,
+        "recall": 0,
+        "fires": 23,
+        "unexplainedFires": 23,
+        "precision": 0,
+        "chancePrecision": 0.05388160226869904,
+        "medianDelay": null,
+        "delays": []
       }
     ],
     "inaction": [
@@ -2315,7 +2851,7 @@
         "fires": 85,
         "unexplainedFires": 85,
         "precision": 0,
-        "chancePrecision": 0.01348505997302988,
+        "chancePrecision": 0.01347040056717476,
         "medianDelay": null,
         "delays": []
       },
@@ -2327,7 +2863,7 @@
         "fires": 85,
         "unexplainedFires": 78,
         "precision": 0.08235294117647059,
-        "chancePrecision": 0.02022758995954482,
+        "chancePrecision": 0.020205600850762142,
         "medianDelay": 1,
         "delays": [
           1,
@@ -2347,7 +2883,7 @@
         "fires": 85,
         "unexplainedFires": 78,
         "precision": 0.08235294117647059,
-        "chancePrecision": 0.02697011994605976,
+        "chancePrecision": 0.02694080113434952,
         "medianDelay": 2,
         "delays": [
           2,
@@ -2367,7 +2903,7 @@
         "fires": 85,
         "unexplainedFires": 78,
         "precision": 0.08235294117647059,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": 3,
         "delays": [
           3,
@@ -2387,7 +2923,7 @@
         "fires": 85,
         "unexplainedFires": 78,
         "precision": 0.08235294117647059,
-        "chancePrecision": 0.04045517991908964,
+        "chancePrecision": 0.040411201701524284,
         "medianDelay": 3,
         "delays": [
           3,
@@ -2407,7 +2943,7 @@
         "fires": 85,
         "unexplainedFires": 78,
         "precision": 0.08235294117647059,
-        "chancePrecision": 0.04719770990560458,
+        "chancePrecision": 0.04714640198511166,
         "medianDelay": 3,
         "delays": [
           3,
@@ -2427,7 +2963,7 @@
         "fires": 85,
         "unexplainedFires": 78,
         "precision": 0.08235294117647059,
-        "chancePrecision": 0.05394023989211952,
+        "chancePrecision": 0.05388160226869904,
         "medianDelay": 3,
         "delays": [
           3,
@@ -2449,7 +2985,7 @@
         "fires": 678,
         "unexplainedFires": 674,
         "precision": 0.0058997050147492625,
-        "chancePrecision": 0.01348505997302988,
+        "chancePrecision": 0.01347040056717476,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -2466,7 +3002,7 @@
         "fires": 678,
         "unexplainedFires": 674,
         "precision": 0.0058997050147492625,
-        "chancePrecision": 0.02022758995954482,
+        "chancePrecision": 0.020205600850762142,
         "medianDelay": -1,
         "delays": [
           -1,
@@ -2483,7 +3019,7 @@
         "fires": 678,
         "unexplainedFires": 672,
         "precision": 0.008849557522123894,
-        "chancePrecision": 0.02697011994605976,
+        "chancePrecision": 0.02694080113434952,
         "medianDelay": 1,
         "delays": [
           -1,
@@ -2502,7 +3038,7 @@
         "fires": 678,
         "unexplainedFires": 670,
         "precision": 0.011799410029498525,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": 2,
         "delays": [
           -1,
@@ -2523,7 +3059,7 @@
         "fires": 678,
         "unexplainedFires": 668,
         "precision": 0.014749262536873156,
-        "chancePrecision": 0.04045517991908964,
+        "chancePrecision": 0.040411201701524284,
         "medianDelay": 3,
         "delays": [
           -1,
@@ -2546,7 +3082,7 @@
         "fires": 678,
         "unexplainedFires": 668,
         "precision": 0.014749262536873156,
-        "chancePrecision": 0.04719770990560458,
+        "chancePrecision": 0.04714640198511166,
         "medianDelay": 3,
         "delays": [
           -1,
@@ -2569,7 +3105,7 @@
         "fires": 678,
         "unexplainedFires": 667,
         "precision": 0.016224188790560472,
-        "chancePrecision": 0.05394023989211952,
+        "chancePrecision": 0.05388160226869904,
         "medianDelay": 3,
         "delays": [
           -1,
@@ -2595,7 +3131,7 @@
         "fires": 479,
         "unexplainedFires": 476,
         "precision": 0.006263048016701462,
-        "chancePrecision": 0.01348505997302988,
+        "chancePrecision": 0.01347040056717476,
         "medianDelay": 0,
         "delays": [
           0,
@@ -2611,7 +3147,7 @@
         "fires": 479,
         "unexplainedFires": 475,
         "precision": 0.008350730688935281,
-        "chancePrecision": 0.02022758995954482,
+        "chancePrecision": 0.020205600850762142,
         "medianDelay": 1,
         "delays": [
           0,
@@ -2628,7 +3164,7 @@
         "fires": 479,
         "unexplainedFires": 474,
         "precision": 0.010438413361169102,
-        "chancePrecision": 0.02697011994605976,
+        "chancePrecision": 0.02694080113434952,
         "medianDelay": 1,
         "delays": [
           0,
@@ -2646,7 +3182,7 @@
         "fires": 479,
         "unexplainedFires": 471,
         "precision": 0.016701461377870562,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": 1,
         "delays": [
           0,
@@ -2667,7 +3203,7 @@
         "fires": 479,
         "unexplainedFires": 471,
         "precision": 0.016701461377870562,
-        "chancePrecision": 0.04045517991908964,
+        "chancePrecision": 0.040411201701524284,
         "medianDelay": 1,
         "delays": [
           0,
@@ -2688,7 +3224,7 @@
         "fires": 479,
         "unexplainedFires": 470,
         "precision": 0.018789144050104383,
-        "chancePrecision": 0.04719770990560458,
+        "chancePrecision": 0.04714640198511166,
         "medianDelay": 2,
         "delays": [
           0,
@@ -2710,7 +3246,7 @@
         "fires": 479,
         "unexplainedFires": 469,
         "precision": 0.020876826722338204,
-        "chancePrecision": 0.05394023989211952,
+        "chancePrecision": 0.05388160226869904,
         "medianDelay": 2,
         "delays": [
           0,
@@ -2731,7 +3267,7 @@
     "inaction": {
       "fires": 85,
       "firesPerSession": 1.4166666666666667,
-      "fireRate": 0.00201092999597814,
+      "fireRate": 0.002008743944227815,
       "firedSessionRate": 0.18333333333333332,
       "pooled": {
         "anchors": 285,
@@ -2740,7 +3276,7 @@
         "fires": 85,
         "unexplainedFires": 78,
         "precision": 0.08235294117647059,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": 3,
         "delays": [
           3,
@@ -2752,14 +3288,15 @@
           3
         ]
       },
-      "chanceRecall": 0.007387792875098058,
-      "precisionLift": 2.4427905056759545,
+      "chanceRecall": 0.007368837675152914,
+      "precisionLift": 2.4454489164086683,
+      "preconditionCoverage": null,
       "macroRecall": 0.05113636363636364
     },
     "repetition": {
       "fires": 678,
       "firesPerSession": 11.3,
-      "fireRate": 0.01604012396791975,
+      "fireRate": 0.016022686990428928,
       "firedSessionRate": 0.4,
       "pooled": {
         "anchors": 285,
@@ -2768,7 +3305,7 @@
         "fires": 678,
         "unexplainedFires": 670,
         "precision": 0.011799410029498525,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": 2,
         "delays": [
           -1,
@@ -2781,14 +3318,15 @@
           3
         ]
       },
-      "chanceRecall": 0.04509528088726074,
-      "precisionLift": 0.34999948248201623,
+      "chanceRecall": 0.04499580362203975,
+      "precisionLift": 0.3503803757180562,
+      "preconditionCoverage": null,
       "macroRecall": 0.019223484848484847
     },
     "failure": {
       "fires": 479,
       "firesPerSession": 7.983333333333333,
-      "fireRate": 0.011332181977335636,
+      "fireRate": 0.01131986293276616,
       "firedSessionRate": 0.5333333333333333,
       "pooled": {
         "anchors": 285,
@@ -2797,7 +3335,7 @@
         "fires": 479,
         "unexplainedFires": 471,
         "precision": 0.016701461377870562,
-        "chancePrecision": 0.0337126499325747,
+        "chancePrecision": 0.033676001417936904,
         "medianDelay": 1,
         "delays": [
           0,
@@ -2810,8 +3348,9 @@
           3
         ]
       },
-      "chanceRecall": 0.05174075434618133,
-      "precisionLift": 0.49540636560084966,
+      "chanceRecall": 0.051549880408617015,
+      "precisionLift": 0.4959455004944511,
+      "preconditionCoverage": null,
       "macroRecall": 0.010373319462227913
     }
   }

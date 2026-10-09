@@ -53,6 +53,8 @@ const OWN_SIGNAL = {
   'edit-thrash': [],
   'repeat-failure': [ANCHOR_KINDS.TOOL_ERROR, 'failure-marker'],
   'write-before-read': [],
+  'plan-order': [],          // 计划序违背：声明与行动都来自结构，不含任何锚点信号
+  'plan-unmet-claim': [],
 }
 
 // ---------- 事件读取小工具 ----------
@@ -205,6 +207,127 @@ function firesWriteBeforeRead(events) {
   return out
 }
 
+// ---------- 「计划 vs 行动」：从**首轮计划**抽声明阶段，再测后续行动对它的偏离 ----------
+/**
+ * 为什么这么抽（来自真实语料的探查，不是拍脑袋）：
+ *   · 计划**多数写在 reasoning 块里**，不在 text 块里——很多会话的首条 text 块只是最终答案
+ *     （`PASS=7/7` / `done`），只看 text 会得到"覆盖率≈0"的假结论；
+ *   · 真实计划长的样子是**第一人称意图句**："I'll start by reading the prior research… then…"、
+ *     "I'll verify each project using the GitHub API"、"我会先…然后…"；
+ *   · 所以判据 = 意图句 → 阶段类（读/搜/测/改/报），按**出现顺序**记声明次序。
+ * 覆盖守卫：抽不到 ≥2 个声明阶段的会话**不产出触发**（宁可漏，不猜）。
+ */
+const PHASE_PATTERNS = [
+  ['search', /\b(search|web search|look up|google|fetch)\b|搜索|检索|查一下/i],
+  ['read', /\b(read|explore|inspect|look at|examine|review|survey|map|understand)\b|读一下|看看|检查|梳理|了解/i],
+  ['test', /\b(run|re-?run|execute)?\s*(the\s+)?(tests?|tests\b|test suite|benchmark)\b|\b(verify|validate|reproduce|confirm)\b|测试|验证|复现|跑一遍/i],
+  ['edit', /\b(edit|fix|change|modify|implement|write|patch|refactor|apply|update)\b|修改|修复|实现|改写|改一下/i],
+  ['report', /\b(report|summari[sz]e|conclude|answer|tell you)\b|汇报|报告|总结/i],
+]
+const PLAN_CUE = /\bI'?ll\b|\bI will\b|\bI'?m going to\b|\bLet me\b|\b(First|Then|Next|Finally)\b|\bMy plan\b|\bStep \d+\b|我会|我先|先.{0,12}再|然后|接着|最后|计划是/i
+
+const planTextOf = (ev) => {
+  const blocks = ev && ev.data && ev.data.message && ev.data.message.content
+  if (!Array.isArray(blocks)) return ''
+  // text **与** reasoning 都算（计划多在 reasoning 里）
+  return blocks.filter((b) => b && (b.type === 'text' || b.type === 'reasoning')).map((b) => b.text || '').join('\n')
+}
+
+/** 抽出声明阶段（按声明顺序去重）与"计划原文"，供触发点判断使用。 */
+function extractPlan(events) {
+  const sents = []
+  let examined = 0
+  for (const ev of events) {
+    if (!ev || ev.type !== 'assistant/message') continue
+    const turn = ev.data && ev.data.turn
+    if (turn !== 1) continue
+    const txt = planTextOf(ev)
+    if (!txt.trim()) continue
+    examined++
+    for (const raw of txt.split(/\n|(?<=[.。!?！？])\s+/)) {
+      const s = raw.trim()
+      if (!s || s.length > 400) continue
+      if (!PLAN_CUE.test(s)) continue
+      sents.push(s)
+    }
+    if (examined >= 3) break      // 只认**开头**的计划（后面的"我打算…"是实现过程的一部分）
+  }
+  const declared = []
+  for (const s of sents) {
+    for (const [cls, re] of PHASE_PATTERNS) {
+      if (re.test(s)) { if (!declared.includes(cls)) declared.push(cls); break }
+    }
+  }
+  return { declared, sents: sents.length, examined }
+}
+
+/** 各阶段在会话中的**首次实际发生**步（与声明类同名）。 */
+function actualPhaseSteps(events) {
+  const first = {}
+  const failByCall = new Map()
+  for (const ev of events) {
+    if (ev && ev.type === 'tool/result') {
+      const cid = ev.data && ev.data.message && ev.data.message.source && ev.data.message.source.callId
+      if (cid) failByCall.set(cid, errOfResult(ev))
+    }
+  }
+  for (const ev of events) {
+    if (!ev || ev.type !== 'tool/call') continue
+    const d = ev.data || {}
+    const name = typeof d.name === 'string' ? d.name : ''
+    const a = argOf(d)
+    const key = { turn: d.turn, step: d.step }
+    if (isReadTool(name) && !first.read) first.read = key
+    if (name === 'grep' || name === 'glob' || name.startsWith('browser_') || name === 'web_search') {
+      if (!first.search) first.search = key
+    }
+    const cmd = a && typeof a.command === 'string' ? a.command : ''
+    if (cmd && verifyCommandKind(cmd) && !first.test) first.test = key
+    if (isWriteTool(name) && failByCall.get(d.callId) !== true && !first.edit) first.edit = key
+  }
+  return first
+}
+
+/** 计划序违背：做了**后**声明的阶段，而**先**声明的阶段一次都没做。 */
+function firesPlanOrder(events) {
+  const plan = extractPlan(events)
+  if (plan.declared.length < 2) return []
+  const actual = actualPhaseSteps(events)
+  const idxOfPhase = (cls) => actual[cls] || null
+  const out = []
+  const ordered = plan.declared.filter((c) => c !== 'report')
+  for (let i = 0; i < ordered.length; i++) {
+    const cur = ordered[i]
+    const curAt = idxOfPhase(cur)
+    if (!curAt) continue
+    for (let j = 0; j < i; j++) {
+      const earlier = ordered[j]
+      if (idxOfPhase(earlier)) continue            // 先声明的做过 ⇒ 没违背
+      if (earlier === 'report') continue
+      out.push(curAt)                              // 在 curAt 这一步，先声明的 earlier 还没做
+      break
+    }
+  }
+  return out.map((k) => ({ turn: k.turn, step: k.step }))
+}
+
+/** 宣告完成时，声明过的阶段仍有没做的（"说做完了，但计划里的事没做"）。 */
+function firesPlanUnmetClaim(events) {
+  const plan = extractPlan(events)
+  if (plan.declared.length < 2) return []
+  const actual = actualPhaseSteps(events)
+  const out = []
+  for (const ev of events) {
+    if (!ev || ev.type !== 'assistant/message') continue
+    const claim = claimsFromFinalMessage(planTextOf(ev))
+    const declares = claim && (claim.claimedDone === true || claim.claimedPass !== null)
+    if (!declares) continue
+    const unmet = plan.declared.filter((c) => c !== 'report' && !actual[c])
+    if (unmet.length > 0) out.push({ turn: ev.data && ev.data.turn, step: ev.data && ev.data.step })
+  }
+  return out
+}
+
 const SIGNALS = {
   'scope-write': firesScopeWrite,
   'unverified-edit': firesUnverifiedEdit,
@@ -212,6 +335,8 @@ const SIGNALS = {
   'edit-thrash': firesEditThrash,
   'repeat-failure': firesRepeatFailure,
   'write-before-read': firesWriteBeforeRead,
+  'plan-order': firesPlanOrder,
+  'plan-unmet-claim': firesPlanUnmetClaim,
 }
 
 /**
@@ -238,6 +363,8 @@ function throttleFires(raw, budget) {
 }
 
 // ---------- 语料走查 ----------
+for (const line of []) { /* 占位 */ }
+const coverage = {}
 const files = walk(sessionsDir, []).filter((f) => f.endsWith('session.jsonl.zstd'))
 const perSignal = Object.fromEntries(Object.keys(SIGNALS).map((k) => [k, []]))
 const refChannels = { inaction: [], repetition: [], failure: [] }
@@ -296,6 +423,15 @@ for (const f of files) {
   for (const [name, fn] of Object.entries(SIGNALS)) {
     const raw = fn(events, taskAnchors)
     const idxed = (rs) => [...new Set(rs.map((r) => idxOf.get(`${r.turn}#${r.step}`)).filter((i) => i !== undefined))].sort((a, b) => a - b)
+    // 覆盖守卫：某些信号的**前提**不是每个会话都成立（如"提示里能解析出范围""开头真有 ≥2 阶段计划"）。
+    // 必须把覆盖率单独报出来，否则"触发 0 次"会被误读成"没有漂移"——
+    // 它可能只是"这个语料里根本没有这条信号赖以存在的前提"。
+    let pre = true
+    if (name === 'scope-write') pre = Boolean(taskAnchors && taskAnchors.parsed === true)
+    else if (name === 'plan-order' || name === 'plan-unmet-claim') pre = extractPlan(events).declared.length >= 2
+    coverage[name] = coverage[name] || { sessions: 0, withPrecondition: 0 }
+    coverage[name].sessions++
+    if (pre) coverage[name].withPrecondition++
     // 自有信号排除（避免循环标注）
     const own = OWN_SIGNAL[name] || []
     const usableAnchors = anchors.filter((a) => {
@@ -360,16 +496,21 @@ for (const name of Object.keys(SIGNALS)) {
 for (const ch of Object.keys(refChannels)) ORDERED.push(ch)
 
 console.log(`\n强语义锚点（评估用）：${STRONG.join(' / ')}    lead=${LEAD}`)
-console.log('信号                 触发/会话 每步率  锚点数  召回     随机召回  提前量  精度     基线    精度倍数')
+console.log('信号                 触发/会话 每步率  锚点数  召回     随机召回  提前量  精度     基线    精度倍数  前提覆盖')
 const report = {
   generatedAtUtc: new Date().toISOString(),
   kind: 'drift-signal-discriminative-power',
   command: 'node tools/evaluate-signals.mjs [会话目录] --out <前缀>',
   note: '候选漂移信号的判别力评估（与 measure-recall 同口径）。**召回必须与"同预算随机召回"比较**：'
     + '按运行期节流(1/turn、≤3/会话)后的信号才是实际部署形态，未节流的召回只是"触发得多、蒙上的也多"。'
-    + '结论（60 会话 / 285 强锚点）：没有任何候选同时具备"精度倍数 > 1"与"正提前量"；'
+    + '**前提覆盖率必须一起报**：触发 0 次可能是"没有漂移"，也可能是"这个语料里根本没有该信号赖以存在的前提"，'
+    + '两者结论完全不同（plan-order 就是前者）。'
+    + '结论（60 会话 / 285 强锚点）：没有任何候选同时具备"精度倍数 > 1"与"正提前量"。'
     + 'inaction 是唯一有正提前量(+3)的；repetition/failure 在漂移预测意义上低于随机(0.35×/0.50×)；'
-    + 'L1 的 unverified-edit 按部署节流后≈随机(1.06×)——它是**事实提醒**，不是漂移预测器。',
+    + 'L1 的 unverified-edit 按部署节流后≈随机(1.06×)——它是**事实提醒**，不是漂移预测器。'
+    + '「计划 vs 行动」这一路实测失败：plan-order 在 57% 覆盖（34/60 会话有 ≥2 阶段计划）下**触发 0 次**'
+    + '（这些会话里代理**没有**违背自己声明的顺序），plan-unmet-claim 0.27×（比随机差）。',
+  coverage: Object.fromEntries(Object.entries(coverage).map(([k, v]) => [k, v.sessions ? v.withPrecondition / v.sessions : null])),
   sessionsUsed, sessionsWithAnchors, anchorStats, strong: STRONG, lead: LEAD, signals: {}, leadCurve: {}, reference: {},
 }
 for (const name of ORDERED) {
@@ -381,10 +522,13 @@ for (const name of ORDERED) {
   const cr = chanceRecall(rows, LEAD)
   const fr = fireRate(rows)
   const lift = p.precision !== null && p.chancePrecision ? p.precision / p.chancePrecision : null
+  const c = coverage[name]
+  const cov = c && c.sessions ? (c.withPrecondition / c.sessions) * 100 : null
   const line = `${name.padEnd(18)} ${(totalFires / Math.max(1, rows.length)).toFixed(1).padStart(7)} ${fmt(fr).padStart(6)}  ${String(p.anchors).padStart(6)}  `
     + `${fmt(p.recall).padStart(7)}  ${fmt(cr).padStart(8)}  ${String(p.medianDelay ?? '—').padStart(6)}  ${fmt(p.precision).padStart(7)}  ${fmt(p.chancePrecision).padStart(6)}  ${(lift === null ? '—' : lift.toFixed(2) + '×').padStart(8)}`
+    + `  ${(cov === null ? '—' : cov.toFixed(0) + '%').padStart(6)}`
   console.log(line)
-  const entry = { fires: totalFires, firesPerSession: totalFires / Math.max(1, rows.length), fireRate: fr, firedSessionRate: firedSessions / Math.max(1, rows.length), pooled: p, chanceRecall: cr, precisionLift: lift, macroRecall: agg.macroRecall }
+  const entry = { fires: totalFires, firesPerSession: totalFires / Math.max(1, rows.length), fireRate: fr, firedSessionRate: firedSessions / Math.max(1, rows.length), pooled: p, chanceRecall: cr, precisionLift: lift, preconditionCoverage: cov, macroRecall: agg.macroRecall }
   if (perSignal[name]) report.signals[name] = entry
   else report.reference[name] = entry
 }

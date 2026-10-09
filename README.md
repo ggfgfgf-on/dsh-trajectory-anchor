@@ -318,6 +318,43 @@ Three conclusions, and the first one corrects an earlier claim in this file:
    highest lift of anything measured (3.12%) but a **negative** lead (−1), which makes it
    a good *diagnostic* and a useless *predictor*.
 
+**The "plan vs action" candidate was tried and failed — with a reason (2026-10-09).**
+The next hypothesis was structural rather than statistical: the agent *writes down a plan*
+early ("I'll start by reading the prior research and the common script, then run the
+tests"), so deviation from its own declared plan should be visible sooner than any
+statistical drift. Two signals were pre-registered and measured:
+`plan-order` (doing a later-declared phase while an earlier-declared one never happened)
+and `plan-unmet-claim` (claiming completion while a declared phase never ran).
+
+| Signal | precondition coverage | fires/session | recall@3 | chance recall | lift |
+|---|---|---|---|---|---|
+| `plan-order` | **57%** (34/60 sessions have a ≥2-phase plan) | **0.0** | — | — | — |
+| `plan-unmet-claim` | 57% | 14.9 | 2.8% | 7.2% | **0.27×** |
+
+Two different negative results, and the coverage column is what separates them:
+
+- `plan-order` has **real coverage and zero occurrences**: on 34 sessions with an ordered
+  plan, the agent *never once* performed a later-declared phase before an earlier one. This
+  corpus therefore contains no "premature action" drift of that kind — the signal cannot be
+  evaluated because there is nothing to detect (the same shape as the earlier finding that
+  the corpus contains no labelable task-level drift).
+- `plan-unmet-claim` fires plenty and is **worse than random** (0.27×): "declared a phase
+  and didn't do it before claiming" mostly happens in benign reading/reporting sessions
+  whose plan mentioned testing that the task never called for. As a drift marker it is a
+  false-signal class, not a weak one.
+
+**Where this leaves the goal.** Eleven signals have now been measured against strong,
+delayed labels: `lexicon`, `repetition`, `failure`, `inaction` (incumbent channels),
+`unverified-edit`, `unverified-claim`, `edit-thrash`, `repeat-failure`, `write-before-read`,
+`scope-write`, `plan-order`, `plan-unmet-claim`. **Not one of them is both precise and
+early** — the only positive lead belongs to `inaction`, at 2.5% recall (chance 0.7%). So the
+honest endpoint of this line of work is *not* "add another signal": it is that on this
+corpus the plugin can reliably **state facts** (L1, a linter-class nudge the agent can act
+on — 5 reminders, 5 actions taken, in the session that produced this file) but cannot
+reliably **predict** degradation. Predicting it would need either a corpus that contains
+the phenomenon, or features nobody has measured yet. Anything less than that would be
+tuning a threshold on a signal that does not separate.
+
 
 ### The pull-back itself (L1): near-term, advisory, throttled, off by default
 

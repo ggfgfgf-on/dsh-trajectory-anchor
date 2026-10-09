@@ -893,6 +893,11 @@ if (existsSync(readmePath)) {
     if (!/ORDERED\.push\([^\n]*节流/.test(code)) {
       problems.push('节流形态没有被排进汇总表（算了但不报 = 没测）')
     }
+    // 前提覆盖率：触发 0 次可能是"没有漂移"，也可能是"语料里没有该信号的前提"——
+    // 两者结论完全不同（plan-order 就是前者：57% 覆盖但 0 触发）。不报覆盖率就无法区分。
+    if (!/preconditionCoverage/.test(code)) problems.push('没有报"前提覆盖率"（0 触发无法解释）')
+    if (!/console\.log\('[^']*前提覆盖/.test(code)) problems.push('汇总表没有"前提覆盖"这一列（只写进产物不算）')
+    if (!/const coverage = \{\}/.test(code)) problems.push('没有统计覆盖率的数据结构')
     if (!/UNKNOWN_TOOL, ANCHOR_KINDS\.USER_CORRECTION, ANCHOR_KINDS\.ABANDONED_TURN/.test(s)) {
       problems.push('评估锚点没有收敛到强语义子集（tool-error/failure-marker 是工作常态，会把基线膨胀到 ~19%）')
     }
