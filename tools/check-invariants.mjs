@@ -1178,6 +1178,12 @@ if (existsSync(readmePath)) {
 //   ② 更隐蔽的是 `calibrate-channels.mjs` 读版本失败后**保底写 "unknown"**，
 //      于是出厂标定件里的 `pluginVersion` 与 package.json 不符，而**没有任何地方会报错**。
 // 所以这条不变量钉两件事：源文件不许带 BOM；出厂产物里的版本号必须与 package.json 一致。
+// ⚠ 这**不是新坑**：DSH 操作要点（dsh_notes）§31 早已实锤，且记着它的最坏后果是
+//    「重启后整站打不开」（DSH 启动时 parse 每个包的 package.json，BOM ⇒ SyntaxError ⇒
+//    插件加载崩溃 ⇒ web 壳注入不了 __ModuleLoader__ facade）。本轮是运气好，先炸在
+//    不变量与产物版本号上。C29 的作用就是把"手册里的规矩"变成**机器可查**的一条：
+//    文本一律用 write/edit 工具；必须用 pwsh 写文本时用
+//    `[System.IO.File]::WriteAllText(..., New-Object System.Text.UTF8Encoding($False))`。
 {
   const problems = []
   const rel = ['package.json', 'index.js', ...readdirSync(resolve(dirname(indexPath), 'tools')).filter((f) => f.endsWith('.mjs')).map((f) => `tools/${f}`),
