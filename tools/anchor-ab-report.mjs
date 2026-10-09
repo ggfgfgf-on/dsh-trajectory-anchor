@@ -62,10 +62,36 @@ const tailGain = (r) => r.tail - (Number.isFinite(r.tailStart) ? r.tailStart : 0
 const totalGain = (r) => r.final - r.start
 const primaryGain = tailComplete ? tailGain : totalGain
 
+/**
+ * Two more guards, both taken from what the community measures on agent benchmarks:
+ *
+ * (1) **pass^k** (tau-bench introduced it for this reason): a mean score saturates long before
+ *     reliability does, so we also report, per task family, the fraction of families where *every*
+ *     repeated run in that condition was perfect on the primary outcome. A saturated mean with a
+ *     low pass^k is the discriminating signal; a saturated mean *and* pass^k=1 means the task is
+ *     below the model's horizon, and the fix is to move the task, not the metric.
+ * (2) **equal-progress pairing**: two runs may only be compared when they started from the same
+ *     state (`start`, `total`, `tailTotal` all equal). A historical A/B in this project failed
+ *     exactly here — its rows were labelled per run number, so the two arms could not be paired at
+ *     all. Refused pairs are reported, never silently dropped.
+ */
+const fam = (r) => String(r.task).split('#')[0]
+const perfectPrimary = (r) => (tailComplete ? r.tail === r.tailTotal : r.final === r.total)
+const passK = (set) => {
+  const byFam = {}
+  for (const r of set) (byFam[fam(r)] || (byFam[fam(r)] = [])).push(r)
+  return Object.entries(byFam)
+    .filter(([, rs]) => rs.length >= 2)
+    .map(([f, rs]) => ({ family: f, k: rs.length, perfect: rs.filter(perfectPrimary).length, allPerfect: rs.every(perfectPrimary) }))
+}
+const pairOk = (a, b) => a.start === b.start && a.total === b.total && (a.tailTotal ?? null) === (b.tailTotal ?? null)
+
 const byTask = (set) => Object.fromEntries(set.map((r) => [r.task, r]))
 const mA = byTask(A)
 const mB = byTask(B)
-const paired = Object.keys(mA).filter((t) => mB[t]).map((t) => ({
+const comparable = Object.keys(mA).filter((t) => mB[t])
+const refused = comparable.filter((t) => !pairOk(mA[t], mB[t])).map((t) => ({ task: t, a: { start: mA[t].start, total: mA[t].total }, b: { start: mB[t].start, total: mB[t].total } }))
+const paired = comparable.filter((t) => pairOk(mA[t], mB[t])).map((t) => ({
   task: t,
   a: primaryGain(mA[t]), b: primaryGain(mB[t]), delta: primaryGain(mA[t]) - primaryGain(mB[t]),
   finalA: totalGain(mA[t]), finalB: totalGain(mB[t]), finalDelta: totalGain(mA[t]) - totalGain(mB[t]),
@@ -112,6 +138,8 @@ const artifact = {
     'anchor-off': { tasks: B.length, meanGain: mean(B.map(primaryGain)), meanFinal: mean(B.map(totalGain)), perfect: B.filter((r) => r.final === r.total).length, tailPerfect: tailComplete ? B.filter((r) => r.tail === r.tailTotal).length : null },
   },
   paired: paired.map((p) => ({ task: p.task, a: p.a, b: p.b, delta: p.delta, finalDelta: p.finalDelta })),
+  passK: { on: passK(A), off: passK(B) },
+  refusedPairs: refused,
 }
 
 let verdict = 'INSUFFICIENT'
