@@ -139,13 +139,29 @@ await boot({ reanchorOnConfirm: true, bootstrapPersona: 'PERSONA-XYZ' })
   check('② 记的是 unknown-tool 这个原因', row.reanchor.confirm.reason === 'unknown-tool', JSON.stringify(row.reanchor.confirm))
 }
 {
-  const { agent, session } = base('rc-verifyfail')
-  sessionEvent(session, callOf('pwsh', { command: 'node tools/test-x.mjs' }, 2, 1, 'v1'))
-  sessionEvent(session, resultOf(2, 1, 'v1', { text: '2 failed\n[exit code: 1]' }))
+  // verify-failed 的**反向对照**：验证失败但**还没宣告完成** ⇒ 不算确认。
+  // 为什么（2026-10-09 线上真实误触发）：红色测试是**正常工作状态**（跑红的 → 改 → 再跑），
+  // 第一版把"验证失败"直接当确认 ⇒ 我跑一次**故意红**的基准夹具就把重锚定触发了。
+  const { agent, session } = base('rc-verifyred')
+  sessionEvent(session, callOf('pwsh', { command: 'node tools/test-x.mjs' }, 2, 1, 'v0'))
+  sessionEvent(session, resultOf(2, 1, 'v0', { text: '2 failed\n[exit code: 1]' }))
   const d = await preStep(agent, 3, 1)
-  check('② verify-failed ⇒ 重锚定', reAnchors(d).length === 1, `n=${reAnchors(d).length}`)
+  check('② 反向对照：验证失败但**未宣告完成** ⇒ 不算确认（红色测试是正常工作状态）', reAnchors(d).length === 0, `n=${reAnchors(d).length}`)
+  const row0 = await rowOf('rc-verifyred')
+  check('② 拒绝有痕（confirm-declined）', row0.auditTail.includes('confirm-declined'), JSON.stringify(row0.auditTail.slice(-3)))
+}
+{
+  // verify-failed 的**正向**：先宣告完成，**之后**验证仍失败 ⇒ 才算确认出问题
+  const { agent, session } = base('rc-verifyfail')
+  sessionEvent(session, { type: 'assistant/message', data: { turn: 2, step: 2, message: { content: [{ type: 'text', text: 'Done — all bugs fixed and all tests pass.' }] } } })
+  sessionEvent(session, callOf('pwsh', { command: 'node tools/test-x.mjs' }, 3, 1, 'v1'))
+  sessionEvent(session, resultOf(3, 1, 'v1', { text: '2 failed\n[exit code: 1]' }))
+  const d = await preStep(agent, 4, 1)
+  check('② 宣告完成之后验证仍失败 ⇒ 重锚定（这才叫"确认出问题"）', reAnchors(d).length === 1, `n=${reAnchors(d).length}`)
   const row = await rowOf('rc-verifyfail')
-  check('② 记的是 verify-failed', row.reanchor.confirm.reason === 'verify-failed', JSON.stringify(row.reanchor.confirm))
+  check('② 记的是 verify-failed，并带上"在哪一步宣告的"',
+    row.reanchor.confirm && row.reanchor.confirm.reason === 'verify-failed' && /claimed@/.test(String(row.reanchor.confirm.detail || '')),
+    JSON.stringify(row.reanchor.confirm))
 }
 
 // ── ③ 反向对照：没有确认信号 ⇒ 不重锚定 ───────────────────────────────────

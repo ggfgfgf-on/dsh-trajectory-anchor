@@ -1,4 +1,4 @@
-﻿/**
+/**
  * check-invariants.mjs —— 静态不变量断言（零依赖，只读）
  *
  * 由来：v0.4.1–v0.4.3 的归还分支引用了一个 DEFAULTS 里不存在的键
@@ -1057,6 +1057,12 @@ if (existsSync(readmePath)) {
     problems.push('确认路径没有随机化对照（只有单臂 ⇒ 效果永远估不出来）')
   }
   if (!/logAudit\(rec, 'reanchor-control'/.test(src)) problems.push('对照臂没有审计留痕')
+  // ⑤b `verify-failed` 必须是"**宣告完成之后**仍失败"才算确认 —— 红色测试是正常工作状态。
+  //    （2026-10-09 线上真实误触发：我跑一次**故意红**的基准夹具就把重锚定触发了。）
+  if (!/if \(rec\.claimedDoneAt\) \{/.test(src)) {
+    problems.push('verify-failed 没有要求"先宣告完成"（红色测试=正常工作状态，会误触发重锚定）')
+  }
+  if (!/logAudit\(rec, 'confirm-declined'/.test(src)) problems.push('被拒绝的确认信号没有留痕（看不见的抑制）')
   // ⑤ 落盘行必须区分动作（两种动作混在一起算会把两条效果糊成一条）
   if (!/action: t\.action \|\| 'pullback'/.test(src)) problems.push('落盘行没有 action 字段（pullback 与 reanchor 会混在一起）')
   if (!/function markTrigger\(rec, arm, reason, turn, step, action = 'pullback'\)/.test(src)) {

@@ -43,7 +43,7 @@ import { isAbsolute, resolve as resolvePath, dirname as dirname2 } from 'node:pa
 // （台账定稿 51 倍偏差、两级连续计数混层），所以本轮一律共用一份实现。
 import {
   parseTaskAnchors, inScope, isIgnorablePath, changeInvalidatesVerification, pathsFromCallStrict, isWriteTool,
-  verifyCommandKind,
+  verifyCommandKind, claimsFromFinalMessage,
 } from './tools/task-anchor-core.mjs'
 // 纠偏线索**共用离线标注那一份**（`drift-label-core` 零依赖、只读）：避免"标注用的判据"
 // 与"运行时触发的判据"各写一份、然后悄悄漂移（本项目在台账与形态识别上各栽过一次）。
@@ -2148,6 +2148,15 @@ export function reanchorText(persona, info, count) {
     + '若你已经在按这个方式工作，忽略本条即可。'
 }
 
+/** 助手消息的**文本**（用于"是否宣告完成"判定；reasoning 块不算——计划里说"接下来做完"不是宣告）。 */
+function planTextFor(event) {
+  const blocks = event && event.data && event.data.message && event.data.message.content
+  if (!Array.isArray(blocks)) return ''
+  return blocks.filter((b) => b && b.type === 'text').map((b) => b.text || '').join('\n')
+}
+
+/** 助手消息的**文本**（"宣告完成"只看 text 块：reasoning 里说"做完了"不算对外的宣告）。 */
+
 /**
  * 记一个**确认信号**（不是预测，是"当场能确证出问题了"）。三类：
  *   · `user-correction` —— 人类消息里出现纠偏线索（共用 `CORRECTION_CUES` 那一份判据）
@@ -2579,14 +2588,23 @@ function feedSessionEvent(session, event) {
       logAudit(rec, 'unknown-tool', { turn: event.data && event.data.turn, step: event.data && event.data.step })
       noteConfirmation(rec, 'unknown-tool', event.data && event.data.turn, event.data && event.data.step)
     }
-    // **验证未通过**也是确认信号：刚跑过的那条验证命令，它的输出里仍有失败标记。
-    // 与 unknown-tool 不同，这里必须确认"这次结果属于那次验证调用"（按 turn#step 对齐）。
+    // **验证未通过**也是确认信号 —— 但**必须"已经宣告完成"才算**。
+    // 为什么收紧（2026-10-09 线上真实误触发）：红色测试是**正常工作状态**
+    // （跑红的 → 改 → 再跑），计划书自己就写过"重复调用是正常迭代调试的签名"。
+    // 第一版把"验证失败"直接当确认 ⇒ 我跑一次**故意红**的基准夹具就把重锚定触发了。
+    // 收紧后：只有"代理**说过做完了**、而验证仍然失败"才算确认出问题。
     {
       const k = `${event.data && event.data.turn}#${event.data && event.data.step}`
       if (rec.lastVerifyCallKey && rec.lastVerifyCallKey === k) {
         const txt = toolResultText(event)
         if (txt && FAILURE_MARKERS.some((re) => re.test(txt))) {
-          noteConfirmation(rec, 'verify-failed', event.data && event.data.turn, event.data && event.data.step, txt.slice(-120))
+          if (rec.claimedDoneAt) {
+            noteConfirmation(rec, 'verify-failed', event.data && event.data.turn, event.data && event.data.step,
+              `claimed@${rec.claimedDoneAt.turn}#${rec.claimedDoneAt.step} | ${txt.slice(-120)}`)
+          } else {
+            rec.confirmDeclined = (rec.confirmDeclined || 0) + 1
+            logAudit(rec, 'confirm-declined', { reason: 'verify-failed', note: '还未宣告完成 ⇒ 红色测试是正常工作状态，不算确认' })
+          }
         }
         rec.lastVerifyCallKey = null
       }
@@ -2607,6 +2625,17 @@ function feedSessionEvent(session, event) {
     if (typeof step === 'number') rec.lastStep = step
     const texts = reasoningBlocks(event)
     logAudit(rec, 'assistant-message', { blocks: texts.length, turn, step })
+    // "宣告完成"的时刻：确认信号 `verify-failed` 必须**晚于**它才算确认
+    // （否则红色测试=正常工作状态，会误触发重锚定——2026-10-09 线上真实误触发后收紧）。
+    try {
+      const claimText = planTextFor(event)
+      if (claimText) {
+        const c = claimsFromFinalMessage(claimText)
+        if (c && (c.claimedDone === true || c.claimedPass !== null)) {
+          rec.claimedDoneAt = { turn: turn ?? null, step: step ?? null }
+        }
+      }
+    } catch (e) { /* 观测侧永不抛 */ }
     const agent = agentsSvc ? safeGet(agentsSvc, rec.sessionId) : null
     updateWindow(rec, texts, agent || undefined)
     if (CONFIG.gateEnabled && rec.anchored && !rec.lifted && rec.pendingPromote) {
@@ -3065,7 +3094,9 @@ function summaryOf(rec) {
       // L2'（确认即恢复）：开关、是否被允许、当前确认信号、对照比例 —— 全部可见
       onConfirm: CONFIG.reanchorOnConfirm === true,
       confirmAllowed: confirmReanchorAllowed(rec),
-      confirm: rec.confirm ? { reason: rec.confirm.reason, turn: rec.confirm.turn, step: rec.confirm.step, handled: rec.confirm.handled === true } : null,
+      confirm: rec.confirm ? { reason: rec.confirm.reason, turn: rec.confirm.turn, step: rec.confirm.step, handled: rec.confirm.handled === true, detail: rec.confirm.detail || null } : null,
+      confirmDeclined: rec.confirmDeclined || 0,
+      claimedDoneAt: rec.claimedDoneAt || null,
       confirmControlRate: CONFIG.reanchorConfirmControlRate,
     },
     pullbackOutcome: rec.pullbackOutcome || null,
