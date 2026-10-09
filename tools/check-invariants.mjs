@@ -1007,8 +1007,20 @@ if (existsSync(readmePath)) {
       }
     } catch (e) { debtsLocal.push(`C26 driftEpisodes.json 解析失败：${e.message}`) }
   }
+  // 反事实候选的**消费者**（2026-10-09 接上）：以前这条数据是"休眠记账"（收窄时写、离线不读）。
+  // 消费者回答的是事故形态本身：**我们自己摘掉的工具，后来是不是被用到了**。
   if (/mineCounterfactualCandidates: true/.test(src)) {
-    debtsLocal.push('C26 mineCounterfactualCandidates 默认 true 但**无消费者**（收窄时记账、无人读）⇒ 或接上离线反事实分析、或默认关掉')
+    const consumer = resolve(dirname(indexPath), 'tools', 'counterfactual-report.mjs')
+    if (!existsSync(consumer)) {
+      debtsLocal.push('C26 反事实候选仍**无消费者**（收窄时记账、离线不读）⇒ 接上分析件或默认关掉')
+    } else {
+      const c = readFileSync(consumer, 'utf8')
+      if (!/matchedInjectedPattern/.test(c)) {
+        debtsLocal.push('C26 反事实消费者没有判"被用到没用到"（只读日志不算消费者）')
+      }
+      const rep = resolve(dirname(indexPath), 'counterfactualReport.json')
+      if (!existsSync(rep)) debtsLocal.push('C26 缺少 counterfactualReport.json（消费者结论没有随包发布）')
+    }
   }
   if (!existsSync(resolve(dirname(indexPath), 'tools', 'measure-drift-episodes.mjs'))) {
     debtsLocal.push('C26 缺少 tools/measure-drift-episodes.mjs（反解工具本身没有落地）')

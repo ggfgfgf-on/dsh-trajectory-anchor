@@ -1,4 +1,4 @@
-/**
+﻿/**
  * test-response-policy.mjs —— P1+P3+P4+P5+P6 的端到端契约回归（合成会话驱动真实 apply）
  *
  * 覆盖：

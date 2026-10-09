@@ -1,4 +1,4 @@
-/**
+﻿/**
  * dsh-trajectory-anchor — self-contained bundle plugin.
  *
  * All mechanisms live-validated on this harness family via dynamic-plugin
@@ -134,6 +134,13 @@ const DEFAULTS = {
     // 它的会话级空转率实测 15.9%（α=1e-3）～43.2%（α=0.01），按 5% 预算同样需要 ~1e-5；
     // 但它的能力层资格本就是 false（标定 FAIL），所以这里保留历史值 0.01/0.05 并在
     // 标定件接入后按各自的反解值覆盖。
+    // ⚠ 词典/风格通道**默认关闭**（2026-10-09，实测否定后移除判据面）：
+    // 它作为**漂移判据**已被实测否定——在真实语料上 α=0.05 时召回 4.3%、精确率 6.2%
+    // （低于 20% 的随机基线）；对强锚点的精度倍数也不到 1。留着它只会扩大噪音面
+    // （多一条可能误触发的通道、多一列要解释的状态）。
+    // **但它作为"锚定机制的判据"仍在用**：首轮 persona/工具面/上下文抑制三件套与晋升门
+    // （`anchor-gate:minimal-like` = 最近推理窗有 we、无 let me）依赖的是 `CONFIG.lexicon`
+    // 与逐分块的 `updateWindow`，**不是这条通道**——所以关掉它不影响锚定本身。
     lexicon: { enabled: true, refMinSteps: 12, testWindow: 4, actAlpha: 0.01, notifyAlpha: 0.05, consecutive: 1, capabilityEligible: false },
   },
   // ── L1 任务锚定拉回（信息型，默认关）──────────────────────────────────────────
