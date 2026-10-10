@@ -3357,6 +3357,12 @@ function buildSummary(filter) {
       pullbackEnabled: CONFIG.pullbackEnabled === true,
       pullbackMaxPerSession: CONFIG.pullbackMaxPerSession,
       pullbackControlRate: CONFIG.pullbackControlRate,
+      // 事实镜像四个开关必须可见：A/B 换臂前后要能直接核实"臂上的是什么配置"，
+      // 而不是事后从审计反推（配置不可见 = 能力其实没在跑的同类风险）。
+      contractReanchor: CONFIG.contractReanchor === true,
+      doneGapMirror: CONFIG.doneGapMirror === true,
+      scopeBreachMirror: CONFIG.scopeBreachMirror === true,
+      verifyStalenessMirror: CONFIG.verifyStalenessMirror === true,
       reanchorEnabled: CONFIG.reanchorEnabled === true,
       reanchorEvidencePath: CONFIG.reanchorEvidencePath || null,
       pullbackOutcomePath: CONFIG.pullbackOutcomePath || null,
