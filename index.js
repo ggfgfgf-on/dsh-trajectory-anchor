@@ -56,6 +56,11 @@ const DEFAULTS = {
   // 代理行为完全由"哪条指令最新"驱动，而插件全程沉默（ablation-log 第二十三条）。
   // 默认关（与其他执行器同一纪律：先有验收证据再默认开）。
   contractReanchor: false,
+  // 交付缺口回放（只读版，信息型）：代理宣告完成时，把它**自己最后一次验证输出里的失败**
+  // 回放到它眼前（"你宣布完成，但你自己刚跑的结果还有 N 个失败：…"）。由来：ark×Project2
+  // 五跑实测的失败形态是"早停 + 声明与证据脱节"（ablation-log §26/§28），L1 响"改完没验证"
+  // （它一直在验证，几乎不响）、L2' 回放 persona（对"还剩 21 个失败"零信息量）——都不对症。
+  doneGapMirror: false,
   bootstrapTools: ['bash', 'str_replace_editor', 'pwsh'],
   bootstrapMaxTokens: null,
   bootstrapPersona: 'You are a helpful software engineer assistant.',
@@ -1296,6 +1301,11 @@ const FAILURE_MARKERS = [
   /AssertionError/,
   /\bFAILED\b/,
   /Command failed/,
+  // 小写/计数形态（实测必需）：Project2 判定器输出 `[hidden] failed=21 errors=0`，
+  // unittest 风格输出 `FAIL: test_xxx`——旧表只认大写的 `FAILED`，对这两类**全是瞎的**。
+  /\bfailed\s*[:=]\s*[1-9]\d*/,
+  /\berrors?\s*[:=]\s*[1-9]\d*/,
+  /^FAIL:/m,
 ]
 
 /** 工具结果文本（DSH 会话日志形态：data.message.content[] → tool-result 文本块）。 */
@@ -2640,6 +2650,11 @@ function feedSessionEvent(session, event) {
       if (rec.lastVerifyCallKey && rec.lastVerifyCallKey === k) {
         const txt = toolResultText(event)
         if (txt && FAILURE_MARKERS.some((re) => re.test(txt))) {
+          // 交付缺口回放的**证据源**：无论说没说完成，都把"这次验证仍有失败"的证据记下来
+          // （失败条数与原文尾段）——宣告完成时拿它做"缺口回放"。
+          rec.lastVerifyFailureTail = txt.slice(-600)
+          const m = txt.match(/failed=(\d+)/) || txt.match(/(\d+) failed/)
+          rec.lastVerifyFailCount = m ? Number(m[1]) : null
           if (rec.claimedDoneAt) {
             noteConfirmation(rec, 'verify-failed', event.data && event.data.turn, event.data && event.data.step,
               `claimed@${rec.claimedDoneAt.turn}#${rec.claimedDoneAt.step} | ${txt.slice(-120)}`)
@@ -2680,6 +2695,11 @@ function feedSessionEvent(session, event) {
           if (first && CONFIG.contractReanchor === true && typeof rec.anchorsFromMessage === 'string' && rec.anchorsFromMessage.trim()) {
             rec.contractReanchor = { atTurn: rec.claimedDoneAt.turn, atStep: rec.claimedDoneAt.step, served: false }
             logAudit(rec, 'contract-reanchor', { atTurn: rec.claimedDoneAt.turn, atStep: rec.claimedDoneAt.step })
+          }
+          // 交付缺口回放：宣告完成，但它自己的最近一次验证**仍带失败** ⇒ 把缺口回放给它。
+          if (first && CONFIG.doneGapMirror === true && typeof rec.lastVerifyFailureTail === 'string' && rec.lastVerifyFailureTail.trim()) {
+            rec.doneGapMirror = { atTurn: rec.claimedDoneAt.turn, atStep: rec.claimedDoneAt.step, served: false, failCount: rec.lastVerifyFailCount }
+            logAudit(rec, 'done-gap-mirror', { atTurn: rec.claimedDoneAt.turn, atStep: rec.claimedDoneAt.step, failCount: rec.lastVerifyFailCount })
           }
         }
       }
@@ -3081,6 +3101,7 @@ function summaryOf(rec) {
     trialReleaseArmed: rec.trialReleaseArmed || null,
     trialReleaseUnavailable: rec.trialReleaseUnavailable || null,
     contractReanchor: rec.contractReanchor ? { atTurn: rec.contractReanchor.atTurn ?? null, atStep: rec.contractReanchor.atStep ?? null, served: rec.contractReanchor.served === true } : null,
+    doneGapMirror: rec.doneGapMirror ? { atTurn: rec.doneGapMirror.atTurn ?? null, atStep: rec.doneGapMirror.atStep ?? null, served: rec.doneGapMirror.served === true, failCount: rec.doneGapMirror.failCount ?? null } : null,
     policy: rec.lastPolicy,
     policyAction: rec.lastPolicyAction,
     policyChannel: rec.lastPolicyChannel,
@@ -3674,6 +3695,28 @@ export function apply(ctx, config) {
       }
     } catch (e) {
       warnOnce(`contract re-anchor failed, skipping: ${msg(e)}`)
+      return next(out)
+    }
+  }))
+
+  // ---- 交付缺口回放（只读、一次性）：宣告完成后的第一次组装回放"你自己还有 N 个失败" ----
+  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
+    try {
+      const id = payload && payload.agent && payload.agent.id
+      const rec = id ? recs.get(id) : null
+      if (!rec || !rec.doneGapMirror || rec.doneGapMirror.served === true) return next(out)
+      rec.doneGapMirror.served = true
+      const fail = rec.lastVerifyFailCount === null ? 'failures' : `${rec.lastVerifyFailCount} failures`
+      const section = {
+        name: 'trajectory-anchor:done-gap',
+        text: `[trajectory-anchor] You are about to declare this task done, but your OWN most recent verification still reported ${fail}. Evidence:\n\n${rec.lastVerifyFailureTail}\n\nMap each failure to its module and keep fixing; if you believe some of them do not count, say so explicitly before finishing.`,
+      }
+      return {
+        ...out,
+        sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections,
+      }
+    } catch (e) {
+      warnOnce(`done-gap mirror failed, skipping: ${msg(e)}`)
       return next(out)
     }
   }))

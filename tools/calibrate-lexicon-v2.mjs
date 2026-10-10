@@ -43,6 +43,11 @@ function classifyResult(text, okOnNeutral) {
   if (/AssertionError/.test(text)) return 'err'
   if (/\bFAILED\b/.test(text)) return 'err'
   if (/Command failed/.test(text)) return 'err'
+  // 小写/计数形态（与运行时的 FAILURE_MARKERS 同步，C8 守护）：Project2 判定器的
+  // `[hidden] failed=21 errors=0` 与 unittest 的 `FAIL: test_xxx`。
+  if (/\bfailed\s*[:=]\s*[1-9]\d*/.test(text)) return 'err'
+  if (/\berrors?\s*[:=]\s*[1-9]\d*/.test(text)) return 'err'
+  if (/^FAIL:/m.test(text)) return 'err'
   // 成功信号（明确）：退出码 0 / 项目自检的显式通过语句
   if (/\[exit code:\s*0\]/.test(text)) return 'ok'
   if (/all public tests passed/.test(text)) return 'ok'
