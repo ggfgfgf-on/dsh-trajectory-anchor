@@ -36,7 +36,11 @@ async function boot(config) {
       if (n === 'agents') return { get: (id) => agentsById.get(id), list: () => [...agentsById.values()] }
       return undefined
     },
-    on: (name, fn) => { handlers[name] = fn; return () => {} },
+    on: (name, fn) => {
+      if (name === 'system-prompt/assemble') (handlers[name] = handlers[name] || []).push(fn)
+      else handlers[name] = fn
+      return () => {}
+    },
     effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {} },
   }
   await mod.apply(ctx, { adaptiveStateEnabled: false, ...config })
@@ -57,7 +61,19 @@ function makeAgent(sid) {
   dispatch('agent/created', { agent })
   return { agent, session: { id: sid } }
 }
-const assemble = async (sid) => (await handlers['system-prompt/assemble']({ sections: [], contexts: [], tools: [], variables: {} }, { agent: { id: sid } }, async (o) => o))
+// 多监听器瀑布：真实运行时同名 assemble 监听器**全部**依次运行（P1/P4 → 契约 → 缺口 →
+// 越界 → 过期），next() 指向链上剩余监听器。旧的单槽 mock 只留最后一个（测试台缺陷，
+// 见 test-contract-reanchor.mjs 的同名注释；缺口套件自身在新监听器加入前也靠"最后注册"）。
+const assemble = (sid) => {
+  const list = handlers['system-prompt/assemble'] || []
+  let i = -1
+  const run = (out) => {
+    i += 1
+    if (i >= list.length) return out
+    return list[i](out, { agent: { id: sid } }, async (o) => run(o === undefined ? out : o))
+  }
+  return run({ sections: [], contexts: [], tools: [], variables: {} })
+}
 const gapSection = (out) => (out.sections || []).find((s) => s.name === 'trajectory-anchor:done-gap')
 
 // ── ① 默认关 ──────────────────────────────────────────────────────────────

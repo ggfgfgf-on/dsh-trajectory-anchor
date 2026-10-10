@@ -38,7 +38,11 @@ async function boot(config) {
       if (n === 'agents') return { get: (id) => agentsById.get(id), list: () => [...agentsById.values()] }
       return undefined
     },
-    on: (name, fn) => { handlers[name] = fn; return () => {} },
+    on: (name, fn) => {
+      if (name === 'system-prompt/assemble') (handlers[name] = handlers[name] || []).push(fn)
+      else handlers[name] = fn
+      return () => {}
+    },
     effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {} },
   }
   await mod.apply(ctx, { adaptiveStateEnabled: false, ...config })
@@ -58,7 +62,19 @@ function makeAgent(sid) {
   dispatch('agent/created', { agent })
   return { agent, session: { id: sid } }
 }
-const assemble = async (sid) => (await handlers['system-prompt/assemble']({ sections: [], contexts: [], tools: [], variables: {} }, { agent: { id: sid } }, async (o) => o))
+// 多监听器瀑布：真实运行时同名 assemble 监听器**全部**依次运行（P1/P4 → 契约 → 缺口 →
+// 越界 → 过期），next() 指向链上剩余监听器。旧的单槽 mock 只留最后一个 ⇒ 契约回放被
+// 缺口回放"影子"掉（基线 79a8fa1 上本套件就已静默变红——测试台缺陷，不是产品缺陷）。
+const assemble = (sid) => {
+  const list = handlers['system-prompt/assemble'] || []
+  let i = -1
+  const run = (out) => {
+    i += 1
+    if (i >= list.length) return out
+    return list[i](out, { agent: { id: sid } }, async (o) => run(o === undefined ? out : o))
+  }
+  return run({ sections: [], contexts: [], tools: [], variables: {} })
+}
 const contractSection = (out) => (out.sections || []).find((s) => s.name === 'trajectory-anchor:contract')
 
 // ── ① 默认关：宣告完成也不注入（与既有执行器同一纪律：先有验收证据再开）──────────

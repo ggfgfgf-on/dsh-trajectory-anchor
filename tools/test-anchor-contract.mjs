@@ -35,7 +35,11 @@ try {
     get: (n) => (n === 'tools'
       ? { register: (t) => { registeredTools[t.name] = t; return () => {} } }
       : undefined),
-    on: (name, fn) => { handlers[name] = fn; return () => {} },
+    on: (name, fn) => {
+      if (name === 'system-prompt/assemble') (handlers[name] = handlers[name] || []).push(fn)
+      else handlers[name] = fn
+      return () => {}
+    },
     effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {} },
   }
   await mod.apply(ctx, { adaptiveStateEnabled: false, rollbackEnabled: false, notARealKey: 123 })
@@ -76,14 +80,24 @@ check('surface: 无 name 的条目不抛错，且按 fail-open 保留（不误�
   mod.surfaceForPhase('narrowed', [{ name: 'pwsh' }, {}], PATTERNS).length === 2)
 
 {
-  const assemble = handlers['system-prompt/assemble']
-  check('assemble 处理器已注册', typeof assemble === 'function')
+  // 多监听器瀑布（真实运行时语义：同名 assemble 监听器全跑、next 指向链上剩余监听器）。
+  const runAssemble = (init, payload) => {
+    const list = handlers['system-prompt/assemble'] || []
+    let i = -1
+    const run = (out) => {
+      i += 1
+      if (i >= list.length) return out
+      return list[i](out, payload, async (o) => run(o === undefined ? out : o))
+    }
+    return run(init)
+  }
+  check('assemble 处理器已注册', Array.isArray(handlers['system-prompt/assemble']) && handlers['system-prompt/assemble'].length > 0)
   const asm = { sections: [], contexts: [], tools: TOOLS, variables: {} }
-  const passthrough = await assemble(asm, { agent: { id: 'not-tracked' } }, async () => asm)
+  const passthrough = await runAssemble(asm, { agent: { id: 'not-tracked' } })
   check('assemble: 未跟踪的 agent → 原样返回（不做任何收窄）', passthrough === asm)
   let out
   try {
-    out = await assemble(asm, { get agent() { throw new Error('boom') } }, async () => asm)
+    out = await runAssemble(asm, { get agent() { throw new Error('boom') } })
   } catch (e) {
     out = { threw: e.message }
   }

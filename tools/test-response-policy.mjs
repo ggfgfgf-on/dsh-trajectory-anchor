@@ -47,13 +47,30 @@ async function boot(config) {
       if (n === 'agents') return { get: (id) => agentsById.get(id), list: () => [...agentsById.values()] }
       return undefined
     },
-    on: (name, fn) => { handlers[name] = fn; return () => {} },
+    on: (name, fn) => {
+      if (name === 'system-prompt/assemble') (handlers[name] = handlers[name] || []).push(fn)
+      else handlers[name] = fn
+      return () => {}
+    },
     effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {} },
   }
   await mod.apply(ctx, { adaptiveStateEnabled: false, ...config })   // 测试隔离：不许继承别的套件写下的累积状态
 }
 const dispatch = (name, ...args) => handlers['internal/dispatch']('x', name, args, null)
 const sessionEvent = (session, event) => dispatch('session/event', session, event)
+// 多监听器瀑布（真实运行时语义：同名 assemble 监听器全跑、next 指向链上剩余监听器）。
+// 旧的单槽 mock 只留最后一个 ⇒ P1/P4 收窄被后注册的契约/缺口监听器"影子"掉
+// （基线 79a8fa1 上本套件场景 B/K5 就已静默变红——测试台缺陷，不是产品缺陷）。
+const runAssemble = async (init, payload) => {
+  const list = handlers['system-prompt/assemble'] || []
+  let i = -1
+  const run = (out) => {
+    i += 1
+    if (i >= list.length) return out
+    return list[i](out, payload, async (o) => run(o === undefined ? out : o))
+  }
+  return run(init)
+}
 
 /** 建一个被锚定 + 晋级的合成 agent；返回它的 session 与 agent。 */
 async function adoptAndLift(sid) {
@@ -124,7 +141,7 @@ await boot({ rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 3, respo
   const row = await summaryOf('sess-B')
   check('B: 4 步持续偏低 → 判定收窄', row.narrowedNow === true && row.surfacePhase === 'narrowed', `${row.policy}/${row.policyReason}`)
   check('B: p 值被记录且很小', typeof row.policyP === 'number' && row.policyP <= 0.01, String(row.policyP))
-  const out = await handlers['system-prompt/assemble'](asm(), { agent: { id: 'sess-B' } }, async () => asm())
+  const out = await runAssemble(asm(), { agent: { id: 'sess-B' } })
   const names = out.tools.map((t) => t.name)
   check('B: 组装期工具面被派生收窄（browser/vision/todo 被摘）',
     names.join(',') === 'pwsh,read,edit,grep', names.join(','))
@@ -136,7 +153,7 @@ await boot({ rollbackEnabled: true, notifyEnabled: true, maxDriftSteps: 3, respo
   const after = await summaryOf('sess-B')
   check('B: 到 maxDriftSteps 后能力预算耗尽且工具面自动恢复',
     after.capabilityBudgetExhausted === true && after.surfacePhase === 'stable', JSON.stringify({ b: after.capabilityBudgetExhausted, s: after.surfacePhase }))
-  const out2 = await handlers['system-prompt/assemble'](asm(), { agent: { id: 'sess-B' } }, async () => asm())
+  const out2 = await runAssemble(asm(), { agent: { id: 'sess-B' } })
   check('B: 预算耗尽后组装期回到全量（无需任何归还调用）', out2.tools.length === TOOLS.length, String(out2.tools.length))
 }
 
@@ -401,7 +418,7 @@ await boot({ rollbackEnabled: true, notifyEnabled: true, responseChannels: { ina
   cleanSteps(session, 1, 1, 24)
   for (let i = 25; i <= 28; i++) sessionEvent(session, msgAt(1, i, OK_TEXT))   // 无工具调用但回合继续
   const row = await summaryOf('sess-K5')
-  const out = await handlers['system-prompt/assemble'](asm(), { agent: { id: 'sess-K5' } }, async () => asm())
+  const out = await runAssemble(asm(), { agent: { id: 'sess-K5' } })
   const names = out.tools.map((t) => t.name).join(',')
   check('K5 出厂默认（词典关）下行为通道照样驱动收窄',
     row.narrowedNow === true && row.policyChannel === 'inaction', `${row.policyChannel}/${row.surfacePhase}`)
