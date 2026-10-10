@@ -66,7 +66,7 @@ if (!runTests) {
     'check-invariants.mjs', 'test-runtime-lexicon.mjs', 'test-anchor-contract.mjs', 'test-response-policy.mjs',
     'test-policy-gate.mjs', 'test-pullback.mjs', 'test-pullback-arms.mjs', 'test-pullback-evidence.mjs',
     'test-trial-release.mjs', 'test-reanchor.mjs', 'test-reanchor-confirm.mjs', 'test-family-prior.mjs',
-    'test-outcome-feedback.mjs', 'test-drift-label.mjs', 'test-task-anchor.mjs', 'test-anchor-switch.mjs', 'test-contract-reanchor.mjs', 'test-done-gap-mirror.mjs', 
+    'test-outcome-feedback.mjs', 'test-drift-label.mjs', 'test-task-anchor.mjs', 'test-anchor-switch.mjs', 'test-contract-reanchor.mjs', 'test-done-gap-mirror.mjs', 'test-scope-breach-mirror.mjs', 'test-verify-staleness-mirror.mjs', 
     'test-ledger-semantics.mjs', 'test-ledger-parity.mjs', 'test-audit-durability.mjs', 'test-context-suppression.mjs', 'test-adaptive-state.mjs', 'replay-interventions.mjs',
   ]
   for (const s of suites) {

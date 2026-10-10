@@ -454,3 +454,64 @@ export function unverifiedClaim(input) {
   }
   return { unverified: false, reason: null }
 }
+
+/**
+ * F5 验证过期事实（纯函数，可单测）：宣告完成/通过，但其**最后一次验证之后**
+ * 又改过验证覆盖的同一工件 ⇒ "验证早于这次改动"。
+ *
+ * 判据保守（宁可漏检也不误报）：
+ *   · 没有完成/通过宣告 ⇒ 不是过期，是无法判定；
+ *   · 验证命令里认不出工件路径（如裸 `npm test`）⇒ 绑定不上 ⇒ 不是过期；
+ *   · 改动必须属于"会让验证失效"的类型（changeInvalidatesVerification 同一判据）；
+ *   · 路径比较用 normalizePath + `./` 前缀归一（实测：命令里的相对路径常带 `./`，
+ *     而写工具的 file_path 不带——同一文件不能因此判成两个）。
+ *
+ * @param {object} input
+ * @param {object} [input.claim] 声明（含 claimedDone/claimedPass，可选 turn/step）
+ * @param {Array} input.verifyEvidence [{turn,step,cmd,artifacts,failed,...}]
+ * @param {Array} input.edits [{turn,step,path,invalidates,...}]
+ * @returns {{stale:boolean, reason:string|null, evidence:object|null}}
+ */
+export function verifyStaleness(input) {
+  const { claim = null, verifyEvidence = [], edits = [] } = input || {}
+  if (!claim || (claim.claimedDone !== true && claim.claimedPass === null)) {
+    return { stale: false, reason: 'no-completion-claim', evidence: null }
+  }
+  const hasPos = (v) => typeof v === 'number'
+  const after = (a, b) => (a.turn > b.turn) || (a.turn === b.turn && a.step > b.step)
+  const claimAt = hasPos(claim.turn) && hasPos(claim.step) ? { turn: claim.turn, step: claim.step } : null
+  const atOrBefore = (v) => !claimAt || !hasPos(v.turn) || !hasPos(v.step) || !after(v, claimAt)
+  const list = (verifyEvidence || []).filter((v) => v && atOrBefore(v))
+  const lastV = list[list.length - 1]
+  if (!lastV) return { stale: false, reason: 'no-verify-before-claim', evidence: null }
+  if (!hasPos(lastV.turn) || !hasPos(lastV.step)) return { stale: false, reason: 'verify-position-unknown', evidence: null }
+  const arts = (lastV.artifacts || []).map((a) => normComparable(a)).filter(Boolean)
+  if (arts.length === 0) return { stale: false, reason: 'no-artifact-binding', evidence: null }
+  const under = (p, d) => p === d || p.startsWith(d + '/') || d.startsWith(p + '/')
+  for (const e of edits || []) {
+    if (!e || e.invalidates !== true) continue
+    if (!hasPos(e.turn) || !hasPos(e.step)) continue
+    if (!after(e, lastV)) continue
+    const ep = normComparable(e.path)
+    if (!ep) continue
+    if (!arts.some((a) => under(ep, a))) continue
+    return {
+      stale: true,
+      reason: 'edited-after-verify',
+      evidence: {
+        verifyCmd: typeof lastV.cmd === 'string' ? lastV.cmd : null,
+        verifyTurn: lastV.turn, verifyStep: lastV.step,
+        editPath: e.path, editTurn: e.turn, editStep: e.step,
+      },
+    }
+  }
+  return { stale: false, reason: 'fresh', evidence: null }
+}
+
+/** 比较用路径：normalizePath + 去前导 `./`（`./a/b.py` 与 `a/b.py` 是同一个文件）。 */
+function normComparable(p) {
+  if (typeof p !== 'string' || p.length === 0) return ''
+  let s = normalizePath(p)
+  while (s.startsWith('./')) s = s.slice(2)
+  return s
+}

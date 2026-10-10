@@ -43,7 +43,7 @@ import { isAbsolute, resolve as resolvePath, dirname as dirname2 } from 'node:pa
 // （台账定稿 51 倍偏差、两级连续计数混层），所以本轮一律共用一份实现。
 import {
   parseTaskAnchors, inScope, isIgnorablePath, changeInvalidatesVerification, pathsFromCallStrict, isWriteTool,
-  verifyCommandKind, claimsFromFinalMessage,
+  verifyCommandKind, claimsFromFinalMessage, commandPaths, verifyStaleness,
 } from './tools/task-anchor-core.mjs'
 // 纠偏线索**共用离线标注那一份**（`drift-label-core` 零依赖、只读）：避免"标注用的判据"
 // 与"运行时触发的判据"各写一份、然后悄悄漂移（本项目在台账与形态识别上各栽过一次）。
@@ -61,6 +61,13 @@ const DEFAULTS = {
   // 五跑实测的失败形态是"早停 + 声明与证据脱节"（ablation-log §26/§28），L1 响"改完没验证"
   // （它一直在验证，几乎不响）、L2' 回放 persona（对"还剩 21 个失败"零信息量）——都不对症。
   doneGapMirror: false,
+  // 越界回放（只读版，信息型）：写操作落在首条指令声明的范围之外时，把"越界路径清单 +
+  // 原始范围条款"回放到它眼前（F3 事实，证据=它自己的工具调用轨迹）。默认关（同一纪律：
+  // 先有验收证据再默认开）。
+  scopeBreachMirror: false,
+  // 验证过期回放（只读版，信息型）：宣告完成时，若它最后一次验证**之后**又改过验证覆盖的
+  // 同一文件，把"验证命令 + 事后编辑"回放出来（F5 事实，"你的验证早于这次改动"）。默认关（同上）。
+  verifyStalenessMirror: false,
   bootstrapTools: ['bash', 'str_replace_editor', 'pwsh'],
   bootstrapMaxTokens: null,
   bootstrapPersona: 'You are a helpful software engineer assistant.',
@@ -2500,6 +2507,16 @@ function adopt(agent, doAnchor, channel) {
     lastVerifyAt: null,
     codeEditsAfterVerify: [],
     scopeViolations: [],
+    // ── 证据捕获（criteria 层重构 phase 1：把统计通道换成"可自证事实"的原料）──────
+    // 全部 append-only、有界、只存叶子字段；F3（越界）/F5（验证过期）的事实谓词吃这些料。
+    verifyEvidence: [],   // 每次验证运行一条：{turn,step,at,kind,cmd,artifacts,failed,failCount,outputTail}
+    edits: [],            // 每次**落地**的写：{turn,step,tool,path,invalidates,at}
+    claims: [],           // 每次完成/通过声明：{turn,step,text,claimedDone,claimedPass,claimedTotal}
+    lastVerifyCmd: null,  // 最近一次验证命令（结果回来时补全证据记录）
+    lastVerifyKind: null,
+    // F3/F5 事实的镜像干预标记（served 一次性语义与 done-gap 一致）
+    scopeBreachMirror: null,
+    verifyStalenessMirror: null,
     /** 待发出的拉回原因（工具调用时置位，pre-step 时消费；保证"触发点=说出口的点"）。 */
     pendingPullback: null,
     pullback: {
@@ -2649,12 +2666,15 @@ function feedSessionEvent(session, event) {
       const k = `${event.data && event.data.turn}#${event.data && event.data.step}`
       if (rec.lastVerifyCallKey && rec.lastVerifyCallKey === k) {
         const txt = toolResultText(event)
-        if (txt && FAILURE_MARKERS.some((re) => re.test(txt))) {
+        const failed = Boolean(txt && FAILURE_MARKERS.some((re) => re.test(txt)))
+        let failCount = null
+        if (failed) {
           // 交付缺口回放的**证据源**：无论说没说完成，都把"这次验证仍有失败"的证据记下来
           // （失败条数与原文尾段）——宣告完成时拿它做"缺口回放"。
           rec.lastVerifyFailureTail = txt.slice(-600)
           const m = txt.match(/failed=(\d+)/) || txt.match(/(\d+) failed/)
-          rec.lastVerifyFailCount = m ? Number(m[1]) : null
+          failCount = m ? Number(m[1]) : null
+          rec.lastVerifyFailCount = failCount
           if (rec.claimedDoneAt) {
             noteConfirmation(rec, 'verify-failed', event.data && event.data.turn, event.data && event.data.step,
               `claimed@${rec.claimedDoneAt.turn}#${rec.claimedDoneAt.step} | ${txt.slice(-120)}`)
@@ -2663,6 +2683,26 @@ function feedSessionEvent(session, event) {
             logAudit(rec, 'confirm-declined', { reason: 'verify-failed', note: '还未宣告完成 ⇒ 红色测试是正常工作状态，不算确认' })
           }
         }
+        // 证据捕获（F5 原料）：**每次**验证（通过/失败）都记一条证据记录——
+        // 过期事实需要"验证过哪些工件、在什么位置验证的"，与过没过无关。
+        rec.verifyEvidence.push({
+          turn: typeof (event.data && event.data.turn) === 'number' ? event.data.turn : null,
+          step: typeof (event.data && event.data.step) === 'number' ? event.data.step : null,
+          at: Date.now(),
+          kind: rec.lastVerifyKind || null,
+          cmd: rec.lastVerifyCmd || null,
+          artifacts: (rec.lastVerifyCmd ? commandPaths(rec.lastVerifyCmd) : []).slice(0, 12),
+          failed,
+          failCount,
+          outputTail: failed ? txt.slice(-600) : null,
+        })
+        if (rec.verifyEvidence.length > 30) rec.verifyEvidence.shift()
+        logAudit(rec, 'verify-evidence', {
+          turn: typeof (event.data && event.data.turn) === 'number' ? event.data.turn : null,
+          step: typeof (event.data && event.data.step) === 'number' ? event.data.step : null,
+          failed, failCount,
+          artifacts: rec.verifyEvidence[rec.verifyEvidence.length - 1].artifacts,
+        })
         rec.lastVerifyCallKey = null
       }
     }
@@ -2677,6 +2717,12 @@ function feedSessionEvent(session, event) {
       && typeof rec.lastVerifyFailureTail === 'string' && rec.lastVerifyFailureTail.trim()) {
       rec.doneGapMirror = { atTurn: (event.data && event.data.turn) ?? null, atStep: null, served: false, failCount: rec.lastVerifyFailCount }
       logAudit(rec, 'done-gap-mirror', { via: 'turn-end', atTurn: rec.doneGapMirror.atTurn, failCount: rec.lastVerifyFailCount })
+    }
+    // F3 越界事实的**边界触发**：回合结束时还有**落地**的越界写（失败的在 tool/result
+    // 已被成功门撤回）⇒ 挂标记，组装期回放一次。与 done-gap 共用"先挂标记、组装期注入"。
+    if (CONFIG.scopeBreachMirror === true && !rec.scopeBreachMirror && rec.scopeViolations.length > 0) {
+      rec.scopeBreachMirror = { served: false, via: 'turn-end', paths: rec.scopeViolations.slice(-10).map((v) => v.path) }
+      logAudit(rec, 'scope-breach-mirror', { via: 'turn-end', paths: rec.scopeBreachMirror.paths })
     }
   } else if (event.type === 'assistant/message') {
     rec.messages += 1
@@ -2700,6 +2746,26 @@ function feedSessionEvent(session, event) {
         if (c && (c.claimedDone === true || c.claimedPass !== null)) {
           const first = rec.claimedDoneAt == null
           rec.claimedDoneAt = { turn: turn ?? null, step: step ?? null }
+          // 证据捕获（F2/F5 原料）：每次完成/通过声明都记一条（含原文，有界）。
+          rec.claims.push({
+            turn: turn ?? null, step: step ?? null,
+            text: claimText.slice(0, 300),
+            claimedDone: c.claimedDone === true, claimedPass: c.claimedPass, claimedTotal: c.claimedTotal,
+          })
+          if (rec.claims.length > 20) rec.claims.shift()
+          // F5 验证过期事实：宣告完成，但其**最后一次验证之后**又改过同一工件 ⇒ 挂标记，
+          // 组装期回放"验证命令 + 事后编辑"。纯函数在 tools/task-anchor-core.mjs（单一实现）。
+          if (!rec.verifyStalenessMirror && CONFIG.verifyStalenessMirror === true) {
+            const stale = verifyStaleness({
+              claim: { turn: turn ?? null, step: step ?? null, claimedDone: c.claimedDone === true, claimedPass: c.claimedPass },
+              verifyEvidence: rec.verifyEvidence,
+              edits: rec.edits,
+            })
+            if (stale.stale === true) {
+              rec.verifyStalenessMirror = { ...stale.evidence, served: false, via: 'claim', atTurn: turn ?? null, atStep: step ?? null }
+              logAudit(rec, 'verify-staleness-mirror', { via: 'claim', ...stale.evidence })
+            }
+          }
           // 契约重锚定（只读、一次性）：**第一次**宣告完成时挂标记，组装期注入一次摘要。
           if (first && CONFIG.contractReanchor === true && typeof rec.anchorsFromMessage === 'string' && rec.anchorsFromMessage.trim()) {
             rec.contractReanchor = { atTurn: rec.claimedDoneAt.turn, atStep: rec.claimedDoneAt.step, served: false }
@@ -2870,6 +2936,10 @@ function noteTaskSignal(rec, event) {
         })
       }
       rec.lastVerifyAt = { turn, step }
+      // 证据捕获：记住这次验证的命令与形态——它的**结果**回来时补全 verifyEvidence 记录
+      // （通过/失败都要记：F5 要的是"验证过哪些工件、什么时候验证的"，与过没过无关）。
+      rec.lastVerifyCmd = String(cmdDecoded || args).slice(0, 300)
+      rec.lastVerifyKind = observedKind || (fromPrompt ? 'prompt-token' : null)
       if (rec.codeEditsAfterVerify.length > 0) {
         logAudit(rec, 'verify-run', { turn, step, clearedEdits: rec.codeEditsAfterVerify.length, cmd: String(cmdDecoded || args).slice(0, 160) })
       }
@@ -2888,10 +2958,14 @@ function noteTaskSignal(rec, event) {
     if (!isWriteTool(name)) return
     const scopeKnown = Boolean(anchors && anchors.parsed === true)
     const callId = typeof d.callId === 'string' ? d.callId : null
-    const arm = { callId, turn, step, tool: name, addedEdit: false, addedViolation: false, markN: null, armedReason: null }
+    const arm = { callId, turn, step, tool: name, addedEdit: false, addedViolation: false, editCount: 0, markN: null, armedReason: null }
     let sawViolation = false
     for (const path of pathsFromCallStrict(name, d.arguments)) {
       if (isIgnorablePath(path)) continue
+      // 证据捕获（F3/F5 的事实原料）：记下这次**发起**的写（失败由成功门在 tool/result 撤回）。
+      rec.edits.push({ turn, step, tool: name, path, invalidates: changeInvalidatesVerification(path), at: Date.now() })
+      if (rec.edits.length > 100) rec.edits.shift()
+      arm.editCount += 1
       if (scopeKnown && !inScope(path, anchors)) {
         const v = { turn, step, tool: name, path, at: Date.now() }
         rec.scopeViolations.push(v)
@@ -2969,6 +3043,13 @@ function retractArm(rec, event) {
     const a = rec.pendingArms.get(key)
     if (!a) return false
     rec.pendingArms.delete(key)
+    // 证据捕获的写台账也要同步撤回（成功门与 L1 信号同口径）。
+    if ((a.editCount || 0) > 0) {
+      for (let i = 0; i < a.editCount; i++) {
+        const lastE = rec.edits[rec.edits.length - 1]
+        if (lastE && lastE.turn === a.turn && lastE.step === a.step) rec.edits.pop()
+      }
+    }
     if (a.addedEdit) {
       const last = rec.codeEditsAfterVerify[rec.codeEditsAfterVerify.length - 1]
       if (last && last.turn === a.turn && last.step === a.step) rec.codeEditsAfterVerify.pop()
@@ -3111,6 +3192,14 @@ function summaryOf(rec) {
     trialReleaseUnavailable: rec.trialReleaseUnavailable || null,
     contractReanchor: rec.contractReanchor ? { atTurn: rec.contractReanchor.atTurn ?? null, atStep: rec.contractReanchor.atStep ?? null, served: rec.contractReanchor.served === true } : null,
     doneGapMirror: rec.doneGapMirror ? { atTurn: rec.doneGapMirror.atTurn ?? null, atStep: rec.doneGapMirror.atStep ?? null, served: rec.doneGapMirror.served === true, failCount: rec.doneGapMirror.failCount ?? null } : null,
+    // F3/F5 事实与证据捕获（criteria 层重构 phase 1）：触发、证据、台账计数全部可见
+    scopeBreachMirror: rec.scopeBreachMirror ? { served: rec.scopeBreachMirror.served === true, via: rec.scopeBreachMirror.via || null, paths: rec.scopeBreachMirror.paths || [] } : null,
+    verifyStalenessMirror: rec.verifyStalenessMirror ? { served: rec.verifyStalenessMirror.served === true, via: rec.verifyStalenessMirror.via || null, verifyCmd: rec.verifyStalenessMirror.verifyCmd || null, editPath: rec.verifyStalenessMirror.editPath || null, verifyTurn: rec.verifyStalenessMirror.verifyTurn ?? null, verifyStep: rec.verifyStalenessMirror.verifyStep ?? null, editTurn: rec.verifyStalenessMirror.editTurn ?? null, editStep: rec.verifyStalenessMirror.editStep ?? null } : null,
+    evidence: {
+      verifyEvidence: rec.verifyEvidence.length,
+      edits: rec.edits.length,
+      claims: rec.claims.length,
+    },
     policy: rec.lastPolicy,
     policyAction: rec.lastPolicyAction,
     policyChannel: rec.lastPolicyChannel,
@@ -3736,6 +3825,77 @@ export function apply(ctx, config) {
       }
     } catch (e) {
       warnOnce(`done-gap mirror failed, skipping: ${msg(e)}`)
+      return next(out)
+    }
+  }))
+
+  // ---- 越界回放（只读、一次性）：写到了声明范围之外 ⇒ 回放路径清单 + 原始范围条款 ----
+  // F3 事实：判据是转录事实（路径 vs 范围子句），不是统计分数。触发同样**惰性**：turn/end
+  // 只提前挂标记；下一次组装即注入一次（与 done-gap v3 同一惰性模式，两个边界都可能缺失）。
+  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
+    try {
+      const id = payload && payload.agent && payload.agent.id
+      const rec = id ? recs.get(id) : null
+      if (!rec) return next(out)
+      if (rec.scopeBreachMirror && rec.scopeBreachMirror.served === true) return next(out)
+      if (!rec.scopeBreachMirror) {
+        if (CONFIG.scopeBreachMirror !== true) return next(out)
+        if (!Array.isArray(rec.scopeViolations) || rec.scopeViolations.length === 0) return next(out)
+        rec.scopeBreachMirror = { served: false, via: 'post-fact-assemble', paths: rec.scopeViolations.slice(-10).map((v) => v.path) }
+        logAudit(rec, 'scope-breach-mirror', { via: rec.scopeBreachMirror.via, paths: rec.scopeBreachMirror.paths })
+      }
+      rec.scopeBreachMirror.served = true
+      const scopeClause = (rec.taskAnchors && rec.taskAnchors.evidence && rec.taskAnchors.evidence.scopeClause) || null
+      const section = {
+        name: 'trajectory-anchor:scope-breach',
+        text: '[trajectory-anchor] You wrote outside the declared scope:\n\n'
+          + (rec.scopeBreachMirror.paths || []).join('\n')
+          + `\n\nDeclared scope: ${scopeClause || '(parsed from the first instruction)'}`
+          + '\n\nRevert these writes or justify explicitly why they belong to the task before finishing.',
+      }
+      return {
+        ...out,
+        sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections,
+      }
+    } catch (e) {
+      warnOnce(`scope-breach mirror failed, skipping: ${msg(e)}`)
+      return next(out)
+    }
+  }))
+
+  // ---- 验证过期回放（只读、一次性）：宣告完成，但验证**之后**又改过同一文件 ----
+  // F5 事实："验证早于这次改动"。宣告路径先挂标记；若宣告事件缺失（实测交付报告形态
+  // 可能对不上宣告正则），组装期按最近一条声明记录**惰性**补判一次——两条路径共用 served。
+  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
+    try {
+      const id = payload && payload.agent && payload.agent.id
+      const rec = id ? recs.get(id) : null
+      if (!rec) return next(out)
+      if (rec.verifyStalenessMirror && rec.verifyStalenessMirror.served === true) return next(out)
+      if (!rec.verifyStalenessMirror) {
+        if (CONFIG.verifyStalenessMirror !== true) return next(out)
+        const lastClaim = Array.isArray(rec.claims) ? rec.claims[rec.claims.length - 1] : null
+        if (!lastClaim) return next(out)
+        const stale = verifyStaleness({ claim: lastClaim, verifyEvidence: rec.verifyEvidence, edits: rec.edits })
+        if (stale.stale !== true) return next(out)
+        rec.verifyStalenessMirror = { ...stale.evidence, served: false, via: 'post-claim-assemble' }
+        logAudit(rec, 'verify-staleness-mirror', { via: 'post-claim-assemble', ...stale.evidence })
+      }
+      rec.verifyStalenessMirror.served = true
+      const e = rec.verifyStalenessMirror
+      const section = {
+        name: 'trajectory-anchor:verify-staleness',
+        text: '[trajectory-anchor] You are declaring done, but your most recent verification ran BEFORE a later edit of the same file:\n\n'
+          + `Verification: ${e.verifyCmd || '(unrecognized)'} (turn ${e.verifyTurn ?? '?'}#${e.verifyStep ?? '?'})\n`
+          + `Edit after it: ${e.editPath} (turn ${e.editTurn ?? '?'}#${e.editStep ?? '?'})\n\n`
+          + 'Re-run the verification now and report the fresh result before finishing.',
+      }
+      return {
+        ...out,
+        sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections,
+      }
+    } catch (e) {
+      warnOnce(`verify-staleness mirror failed, skipping: ${msg(e)}`)
       return next(out)
     }
   }))
