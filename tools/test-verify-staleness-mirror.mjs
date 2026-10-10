@@ -197,10 +197,12 @@ await boot({ verifyStalenessMirror: true })
   check('⑧ 惰性：状态写明补判路径', row.verifyStalenessMirror && row.verifyStalenessMirror.via === 'post-claim-assemble', JSON.stringify(row.verifyStalenessMirror))
 }
 
-// ── ⑨ 纯函数反向对照（负向验证：改一个必要条件必须翻掉判定）──────────────────
+// ── ⑨ 纯函数对照（负向验证：改一个必要条件必须翻掉判定）──────────────────
+// 绑定规则（回放门 §8 门 2 收紧后）：文件=验证命令里的代码类文件路径（编辑同一文件才绑定）；
+// 目录=cd 目标**等于或位于**声明范围之内（cd 到范围之上/之外不绑定）。
 {
   const claim = { turn: 1, step: 3, claimedDone: true, claimedPass: null }
-  const verifyEvidence = [{ turn: 1, step: 1, cmd: 'python ./tests/run_hidden_tests.py', artifacts: ['./tests/run_hidden_tests.py'], failed: false }]
+  const verifyEvidence = [{ turn: 1, step: 1, cmd: 'python ./tests/run_hidden_tests.py', failed: false }]
   const edits = [{ turn: 1, step: 2, path: 'tests/run_hidden_tests.py', invalidates: true }]
   const base = verifyStaleness({ claim, verifyEvidence, edits })
   check('⑨ 纯函数：真过期 ⇒ stale=true 且证据齐全', base.stale === true && base.evidence && base.evidence.editPath === 'tests/run_hidden_tests.py', JSON.stringify(base))
@@ -208,12 +210,70 @@ await boot({ verifyStalenessMirror: true })
   check('⑨ 反向：无宣告 ⇒ 翻掉', flipClaim.stale === false && flipClaim.reason === 'no-completion-claim', JSON.stringify(flipClaim))
   const flipEdits = verifyStaleness({ claim, verifyEvidence, edits: [{ ...edits[0], invalidates: false }] })
   check('⑨ 反向：文档类改动 ⇒ 翻掉', flipEdits.stale === false && flipEdits.reason === 'fresh', JSON.stringify(flipEdits))
-  const flipArtifacts = verifyStaleness({ claim, verifyEvidence: [{ ...verifyEvidence[0], artifacts: [] }], edits })
-  check('⑨ 反向：认不出工件 ⇒ 翻掉', flipArtifacts.stale === false && flipArtifacts.reason === 'no-artifact-binding', JSON.stringify(flipArtifacts))
+  const flipBinding = verifyStaleness({ claim, verifyEvidence: [{ ...verifyEvidence[0], cmd: 'npm test' }], edits })
+  check('⑨ 反向：认不出被验证工件 ⇒ 翻掉', flipBinding.stale === false && flipBinding.reason === 'no-artifact-binding', JSON.stringify(flipBinding))
   const flipOrder = verifyStaleness({ claim, verifyEvidence: [{ ...verifyEvidence[0], turn: 1, step: 4 }], edits })
   check('⑨ 反向：验证晚于宣告 ⇒ 翻掉', flipOrder.stale === false && flipOrder.reason === 'no-verify-before-claim', JSON.stringify(flipOrder))
-  const dotPath = verifyStaleness({ claim, verifyEvidence: [{ ...verifyEvidence[0], artifacts: ['tests/run_hidden_tests.py'] }], edits })
+  const dotPath = verifyStaleness({ claim, verifyEvidence: [{ ...verifyEvidence[0], cmd: './tests/run_hidden_tests.py' }], edits })
   check('⑨ 正向：`./` 前缀与不带前缀的同一文件视为同一工件', dotPath.stale === true, JSON.stringify(dotPath))
+  const dirBind = verifyStaleness({
+    claim,
+    verifyEvidence: [{ turn: 1, step: 1, cmd: 'cd "D:/proj/ws"; python tests/run_public_tests.py', failed: false }],
+    edits: [{ turn: 1, step: 2, path: 'D:/proj/ws/gateway/auth.py', invalidates: true }],
+    scopeDirs: ['D:/proj/ws'],
+  })
+  check('⑨ 正向：cd 目标==声明范围 ⇒ 目录绑定成立（范围内编辑 ⇒ 过期）', dirBind.stale === true, JSON.stringify(dirBind))
+  const dirOutOfScope = verifyStaleness({
+    claim,
+    verifyEvidence: [{ turn: 1, step: 1, cmd: 'Set-Location D:\\proj; .\\.venv\\python.exe tests\\run_public_tests.py', failed: false }],
+    edits: [{ turn: 1, step: 2, path: 'D:/proj/_tmp_verify.py', invalidates: true }],
+    scopeDirs: ['D:/proj/ws'],
+  })
+  check('⑨ 反向：cd 目标是范围**之外**（父目录）⇒ 不绑定（回放门假阳形态）', dirOutOfScope.stale === false && dirOutOfScope.reason === 'no-artifact-binding', JSON.stringify(dirOutOfScope))
+  const tmpAdjacent = verifyStaleness({
+    claim,
+    verifyEvidence: [{ turn: 1, step: 1, cmd: 'cd "D:/proj/ws"; python tests/run_public_tests.py', failed: false }],
+    edits: [{ turn: 1, step: 2, path: 'D:/proj/_tmp_verify.py', invalidates: true }],
+    scopeDirs: ['D:/proj/ws'],
+  })
+  check('⑨ 反向：临时脚本在范围目录**旁边**（不在其内）⇒ 不绑定', tmpAdjacent.stale === false && tmpAdjacent.reason === 'fresh', JSON.stringify(tmpAdjacent))
+}
+
+// ── ⑩ 跨镜像：同一会话越界 + 过期都开火 ⇒ 两个段都注入（不短路）──────────
+await boot({ scopeBreachMirror: true, verifyStalenessMirror: true })
+{
+  const { session } = makeAgent('vs-both')
+  sessionEvent(session, { type: 'user/message', data: { source: { kind: 'user' }, turn: 1, step: 1, content: [{ type: 'text', text: 'Work only inside `bugfix-a1` directory. Verify with python ./tests/run_hidden_tests.py' }] } })
+  sessionEvent(session, verifyCall(1, 2, 'python ./tests/run_hidden_tests.py'))
+  sessionEvent(session, verifyResult(1, 2, PASS_TEXT))
+  sessionEvent(session, editCall(1, 3, 'tests/run_hidden_tests.py'))
+  sessionEvent(session, editOk(1, 3))
+  sessionEvent(session, editCall(1, 4, 'D:/elsewhere/extra.py', 'c9'))
+  sessionEvent(session, editOk(1, 4, 'c9'))
+  sessionEvent(session, doneEvent(1, 5))
+  const out = await assemble('vs-both')
+  const names = (out.sections || []).map((s) => s.name)
+  check('⑩ 跨镜像：越界段与过期段**都**注入（链不短路）',
+    names.includes('trajectory-anchor:scope-breach') && names.includes('trajectory-anchor:verify-staleness'), JSON.stringify(names))
+  const row = await summaryOf('vs-both')
+  check('⑩ 跨镜像：两个标记都 served=true',
+    row.scopeBreachMirror && row.scopeBreachMirror.served === true && row.verifyStalenessMirror && row.verifyStalenessMirror.served === true,
+    JSON.stringify({ sb: row.scopeBreachMirror, vs: row.verifyStalenessMirror }))
+}
+
+// ── ⑪ 反向：写/读工具的参数里带着测试命令 ⇒ 不算验证（回放门假阳形态）────────
+await boot({ verifyStalenessMirror: true })
+{
+  const { session } = makeAgent('vs-editargs')
+  // edit 的 new_string 含 "python -X utf8 tests/test_all.py"——旧实现把它当验证，
+  // 证据 cmd 变成一坨参数 JSON，随后对同一文件的编辑被误判"验证后改动"（本会话实测假阳）。
+  sessionEvent(session, { type: 'tool/call', data: { turn: 1, step: 1, name: 'edit', callId: 'c1', arguments: JSON.stringify({ file_path: 'tests/test_all.py', new_string: '    python -X utf8 tests/test_all.py', old_string: '    python tests/test_all.py' }) } })
+  sessionEvent(session, { type: 'tool/result', data: { turn: 1, step: 1, message: { source: { callId: 'c1' }, content: [{ type: 'tool-result', content: [{ type: 'text', text: 'ok' }] }] } } })
+  sessionEvent(session, doneEvent(1, 2))
+  const out = await assemble('vs-editargs')
+  const row = await summaryOf('vs-editargs')
+  check('⑪ 反向：编辑参数里的测试命令不算验证 ⇒ 不注入',
+    staleSection(out) === undefined && (row.evidence.verifyEvidence === 0), JSON.stringify({ v: row.evidence, sections: (out.sections || []).map((s) => s.name) }))
 }
 
 console.log(`\n${pass} pass, ${fail} fail`)

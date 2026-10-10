@@ -42,7 +42,7 @@ import { isAbsolute, resolve as resolvePath, dirname as dirname2 } from 'node:pa
 // 因此没有循环依赖）。为什么不在这里再写一份：本项目已经两次栽在"两套规则各说各话"
 // （台账定稿 51 倍偏差、两级连续计数混层），所以本轮一律共用一份实现。
 import {
-  parseTaskAnchors, inScope, isIgnorablePath, changeInvalidatesVerification, pathsFromCallStrict, isWriteTool,
+  parseTaskAnchors, inScope, isIgnorablePath, changeInvalidatesVerification, pathsFromCallStrict, isWriteTool, isReadTool,
   verifyCommandKind, claimsFromFinalMessage, commandPaths, verifyStaleness,
 } from './tools/task-anchor-core.mjs'
 // 纠偏线索**共用离线标注那一份**（`drift-label-core` 零依赖、只读）：避免"标注用的判据"
@@ -2760,6 +2760,7 @@ function feedSessionEvent(session, event) {
               claim: { turn: turn ?? null, step: step ?? null, claimedDone: c.claimedDone === true, claimedPass: c.claimedPass },
               verifyEvidence: rec.verifyEvidence,
               edits: rec.edits,
+              scopeDirs: (rec.taskAnchors && rec.taskAnchors.scopeDirs) || [],
             })
             if (stale.stale === true) {
               rec.verifyStalenessMirror = { ...stale.evidence, served: false, via: 'claim', atTurn: turn ?? null, atStep: step ?? null }
@@ -2912,6 +2913,10 @@ function noteTaskSignal(rec, event) {
     })()
     /** 参与命令形态识别的文本（解码结果 + 原始参数文本）。 */
     const cmdTexts = [cmdDecoded, args].filter((x) => typeof x === 'string' && x.length > 0)
+    // 回放门（§8 门 2）实测假阳：edit/write 的**参数文本**里常带着测试命令
+    // （new_string: "python -X utf8 tests/test_all.py"）⇒ 形态识别把它当"验证运行"，
+    // 证据记录里 cmd 变成一坨 JSON ⇒ F5 假火。写/读工具的参数不是命令，直接跳过验证检测。
+    const canRunCommands = !isWriteTool(name) && !isReadTool(name)
     // ① 验证运行——两种来源取并集：
     //    · 提示里声明的验证命令（anchors.verifyTokens，要求范围子句能解析出锚点）
     //    · **会话自身行为**里识别出的验证命令（verifyCommandKind）
@@ -2926,7 +2931,7 @@ function noteTaskSignal(rec, event) {
       const k = verifyCommandKind(c)
       if (k) { observedKind = k; observedIn = c === cmdDecoded ? 'decoded' : 'raw-args'; break }
     }
-    const isVerify = cmdTexts.length > 0 && (fromPrompt || observedKind !== null)
+    const isVerify = canRunCommands && cmdTexts.length > 0 && (fromPrompt || observedKind !== null)
     if (isVerify) {
       if (observedKind && !rec.verifyKinds[observedKind]) {
         rec.verifyKinds[observedKind] = 1
@@ -3787,10 +3792,13 @@ export function apply(ctx, config) {
           + '\n\nIf a later instruction appeared to change or cancel part of this contract, verify which one '
           + 'governs before finishing — and say so explicitly if they conflict.',
       }
-      return {
+      // 注入后**继续链**（next(modified)）：同名监听器是瀑布链——直接 return 会短路，
+      // 把链上更后面的镜像（done-gap/越界/过期）全部堵死（回放门 §8 门 2 实测：
+      // 越界开火后过期镜像在同一会话 served=false）。每个事实各自注入、互不堵链。
+      return next({
         ...out,
         sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections,
-      }
+      })
     } catch (e) {
       warnOnce(`contract re-anchor failed, skipping: ${msg(e)}`)
       return next(out)
@@ -3819,10 +3827,11 @@ export function apply(ctx, config) {
         name: 'trajectory-anchor:done-gap',
         text: `[trajectory-anchor] Your most recent verification still reported ${fail}. Evidence:\n\n${rec.lastVerifyFailureTail}\n\nMap each failure to its module and keep fixing; if you believe some of them do not count, say so explicitly before finishing.`,
       }
-      return {
+      // 注入后**继续链**（next(modified)），不短路后面的镜像（见契约处理器同处注释）。
+      return next({
         ...out,
         sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections,
-      }
+      })
     } catch (e) {
       warnOnce(`done-gap mirror failed, skipping: ${msg(e)}`)
       return next(out)
@@ -3853,10 +3862,11 @@ export function apply(ctx, config) {
           + `\n\nDeclared scope: ${scopeClause || '(parsed from the first instruction)'}`
           + '\n\nRevert these writes or justify explicitly why they belong to the task before finishing.',
       }
-      return {
+      // 注入后**继续链**（next(modified)），不短路后面的镜像（见契约处理器同处注释）。
+      return next({
         ...out,
         sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections,
-      }
+      })
     } catch (e) {
       warnOnce(`scope-breach mirror failed, skipping: ${msg(e)}`)
       return next(out)
@@ -3876,7 +3886,12 @@ export function apply(ctx, config) {
         if (CONFIG.verifyStalenessMirror !== true) return next(out)
         const lastClaim = Array.isArray(rec.claims) ? rec.claims[rec.claims.length - 1] : null
         if (!lastClaim) return next(out)
-        const stale = verifyStaleness({ claim: lastClaim, verifyEvidence: rec.verifyEvidence, edits: rec.edits })
+        const stale = verifyStaleness({
+          claim: lastClaim,
+          verifyEvidence: rec.verifyEvidence,
+          edits: rec.edits,
+          scopeDirs: (rec.taskAnchors && rec.taskAnchors.scopeDirs) || [],
+        })
         if (stale.stale !== true) return next(out)
         rec.verifyStalenessMirror = { ...stale.evidence, served: false, via: 'post-claim-assemble' }
         logAudit(rec, 'verify-staleness-mirror', { via: 'post-claim-assemble', ...stale.evidence })
@@ -3890,10 +3905,11 @@ export function apply(ctx, config) {
           + `Edit after it: ${e.editPath} (turn ${e.editTurn ?? '?'}#${e.editStep ?? '?'})\n\n`
           + 'Re-run the verification now and report the fresh result before finishing.',
       }
-      return {
+      // 注入后**继续链**（next(modified)），不短路后面的镜像（见契约处理器同处注释）。
+      return next({
         ...out,
         sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections,
-      }
+      })
     } catch (e) {
       warnOnce(`verify-staleness mirror failed, skipping: ${msg(e)}`)
       return next(out)

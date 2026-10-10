@@ -78,14 +78,23 @@ export function parseTaskAnchors(prompt) {
   //   ③ 实测第三处：`[^\s,.]+` 还会**在空格处截断**
   //      （`D:\My Projects\cf-b1` ⇒ `d:/my`，既丢掉真范围、又把范围放得过宽）
   //      ⇒ 所以**优先捕获引号/反引号包起来的整段**，裸 token 才退回"不许含空格"的匹配。
-  const enScope = text.match(/work only inside\s+`([^`]+)`/i)
+  //   ④ 回放门（设计 §8 门 2）实测第四处：`Work ONLY inside the directory `X`` 的
+  //      裸 token 兜底会抓到功能词 "the" ⇒ 范围变成 ["the"]，**范围内所有写都被判越界**
+  //      （cal-r1/cal-r2/cal2-r1 三个会话 5 条假阳）。修法：功能词不进范围，
+  //      且 "the directory `X`" 形态单独先抓引号内的 X。
+  let enScope = text.match(/work only inside\s+`([^`]+)`/i)
     || text.match(/work only inside\s+"([^"]+)"/i)
+    || text.match(/work only inside\s+(?:the |a |an |this |that )?(?:directory|folder|dir)\s*`([^`]+)`/i)
+    || text.match(/work only inside\s+(?:the |a |an |this |that )?(?:directory|folder|dir)\s*"([^"]+)"/i)
     || text.match(/work only inside\s+([^\s,.`"']+)/i)
     || text.match(/only (?:modify|touch|edit|change)[^.]*?\b([A-Za-z][\w.-]*-\w[\w.-]*)\b/i)
   if (enScope) {
     evidence.scopeClause = enScope[0].trim()
     const tok = stripWrappers(enScope[1])
-    if (isAbsPath(tok)) scopeDirs.push(normalizePath(tok))
+    if (/^(?:the|a|an|this|that|it|here|there|inside)$/i.test(tok)) {
+      // 功能词不算范围：宁可 parsed=false 也不把 "the" 当范围名（④的假阳就是这么来的）
+      enScope = null
+    } else if (isAbsPath(tok)) scopeDirs.push(normalizePath(tok))
     else {
       const n = baseName(tok)
       if (n) scopeNames.push(n)
@@ -93,8 +102,13 @@ export function parseTaskAnchors(prompt) {
   }
   // ② 中文式范围子句："工作区仅限 D:\...\workspace 目录" / "仅在 X 内" / "只依赖 workspace 内内容"
   //    同样优先捕获引号/反引号包裹的整段 —— 与英文式①是**同一个缺陷类**（空格截断）。
-  const cnScope = text.match(/(?:工作区)?(?:仅限|只限|仅|只)(?:在)?\s*`([^`]+)`/)
-    || text.match(/(?:工作区)?(?:仅限|只限|仅|只)(?:在)?\s*([A-Za-z]:[\\/][^\s，。；、）)]+)/)
+  //    回放门（§8 门 2）实测：裸 "仅 `X`"（不带"限/工作区"语境）会把依赖声明当成范围
+  //    ——本会话自己的计划书里 "依赖项仅有 `@deepseek-ai/cordis`" 被解析成范围 ⇒ 假阳。
+  //    修法：反引号形态必须带 仅限/只限/限定 或 工作区/范围 语境；裸 仅/只 只保留
+  //    **绝对路径**形态（依赖声明不会紧跟一个绝对路径）。
+  const cnScope = text.match(/(?:工作区|范围)?(?:仅限|只限|限定)(?:在|于)?\s*`([^`]+)`/)
+    || text.match(/(?:工作区|范围)(?:仅|只)(?:在|于)?\s*`([^`]+)`/)
+    || text.match(/(?:仅限|只限|仅|只)(?:在)?\s*([A-Za-z]:[\\/][^\s，。；、）)]+)/)
   if (cnScope) {
     evidence.scopeClause = evidence.scopeClause || cnScope[0].trim()
     scopeDirs.push(normalizePath(stripWrappers(cnScope[1])))
@@ -165,14 +179,22 @@ export function parseTaskAnchors(prompt) {
 export function inScope(path, anchors) {
   const p = normalizePath(path)
   if (!p) return true                     // 空路径不是"越界"，是无法判定
-  for (const d of anchors.scopeDirs || []) {
+  // 回放门（§8 门 2）实测假阳：范围是**绝对目录**、而写工具的路径是**相对路径**
+  // （`workspace/project2_task/...`）时，前缀匹配必然失败 ⇒ 范围内文件被误判越界
+  // （p2-gap3-a4 / p2-gap2-a3）。判据保守：相对路径没有范围名可对 ⇒ 无法判定 ⇒ 不判越界
+  // （宁可漏检；范围名的段匹配仍然照常做）。
+  const isRel = !isAbsPath(p)
+  const dirs = (anchors.scopeDirs || []).filter(Boolean)
+  const names = (anchors.scopeNames || []).filter(Boolean)
+  for (const d of dirs) {
     if (d && (p === d || p.startsWith(d + '/'))) return true
   }
-  for (const n of anchors.scopeNames || []) {
+  for (const n of names) {
     if (!n) continue
     const segs = p.split('/')
     if (segs.includes(n.toLowerCase())) return true
   }
+  if (isRel && dirs.length > 0 && names.length === 0) return true   // 无法判定 ⇒ 按不越界
   return false
 }
 
@@ -461,19 +483,27 @@ export function unverifiedClaim(input) {
  *
  * 判据保守（宁可漏检也不误报）：
  *   · 没有完成/通过宣告 ⇒ 不是过期，是无法判定；
- *   · 验证命令里认不出工件路径（如裸 `npm test`）⇒ 绑定不上 ⇒ 不是过期；
+ *   · 验证命令里认不出**被验证的工件**（见 verifyArtifactsFromCmd）⇒ 绑定不上 ⇒ 不是过期；
  *   · 改动必须属于"会让验证失效"的类型（changeInvalidatesVerification 同一判据）；
  *   · 路径比较用 normalizePath + `./` 前缀归一（实测：命令里的相对路径常带 `./`，
  *     而写工具的 file_path 不带——同一文件不能因此判成两个）。
  *
+ * 绑定规则（回放门 §8 门 2 实测收紧）：
+ *   · **文件**绑定：验证命令里出现的代码类文件路径，编辑同一文件才绑定；
+ *   · **目录**绑定：只认"验证命令的 cd/Set-Location 目标**等于或位于**声明范围目录之内"
+ *     的目录——cd 到范围**之外/之上**（如 `cd D:\DSHwork\modeltest` 而范围是
+ *     `…\modeltest\workspace`）不绑定。旧实现把所有 cd 目标都当绑定目录，
+ *     把"验证后写 `_tmp_verify.py` / 无关 ps1"这类**假阳**全部放了进来（3 条实测假阳）。
+ *
  * @param {object} input
  * @param {object} [input.claim] 声明（含 claimedDone/claimedPass，可选 turn/step）
- * @param {Array} input.verifyEvidence [{turn,step,cmd,artifacts,failed,...}]
+ * @param {Array} input.verifyEvidence [{turn,step,cmd,failed,...}]
  * @param {Array} input.edits [{turn,step,path,invalidates,...}]
+ * @param {Array} [input.scopeDirs] 声明范围目录（目录绑定的白名单来源）
  * @returns {{stale:boolean, reason:string|null, evidence:object|null}}
  */
 export function verifyStaleness(input) {
-  const { claim = null, verifyEvidence = [], edits = [] } = input || {}
+  const { claim = null, verifyEvidence = [], edits = [], scopeDirs = [] } = input || {}
   if (!claim || (claim.claimedDone !== true && claim.claimedPass === null)) {
     return { stale: false, reason: 'no-completion-claim', evidence: null }
   }
@@ -485,16 +515,17 @@ export function verifyStaleness(input) {
   const lastV = list[list.length - 1]
   if (!lastV) return { stale: false, reason: 'no-verify-before-claim', evidence: null }
   if (!hasPos(lastV.turn) || !hasPos(lastV.step)) return { stale: false, reason: 'verify-position-unknown', evidence: null }
-  const arts = (lastV.artifacts || []).map((a) => normComparable(a)).filter(Boolean)
-  if (arts.length === 0) return { stale: false, reason: 'no-artifact-binding', evidence: null }
-  const under = (p, d) => p === d || p.startsWith(d + '/') || d.startsWith(p + '/')
+  const { files, dirs } = verifyArtifactsFromCmd(lastV.cmd, scopeDirs)
+  if (files.length === 0 && dirs.length === 0) return { stale: false, reason: 'no-artifact-binding', evidence: null }
+  const underDir = (p, d) => p === d || p.startsWith(d + '/')
   for (const e of edits || []) {
     if (!e || e.invalidates !== true) continue
     if (!hasPos(e.turn) || !hasPos(e.step)) continue
     if (!after(e, lastV)) continue
     const ep = normComparable(e.path)
     if (!ep) continue
-    if (!arts.some((a) => under(ep, a))) continue
+    const bound = files.some((a) => ep === a) || dirs.some((d) => underDir(ep, d))
+    if (!bound) continue
     return {
       stale: true,
       reason: 'edited-after-verify',
@@ -506,6 +537,34 @@ export function verifyStaleness(input) {
     }
   }
   return { stale: false, reason: 'fresh', evidence: null }
+}
+
+/**
+ * 从验证命令里认出"被验证的工件"（F5 的绑定来源）。
+ *   · 文件：代码类扩展名的路径（绝对或 ./ 相对），编辑**同一文件**才绑定；
+ *   · 目录：cd/Set-Location 目标**等于或位于**声明范围目录之内（范围是白名单——
+ *     没有范围 ⇒ 没有目录绑定；cd 到范围之外/之上不绑定）。
+ * 返回的都是 normComparable 之后的路径。
+ */
+export function verifyArtifactsFromCmd(cmd, scopeDirs = []) {
+  if (typeof cmd !== 'string' || !cmd) return { files: [], dirs: [] }
+  const files = commandPaths(cmd)
+    .filter((p) => CODE_EXT_RE.test(p))
+    .map((p) => normComparable(p))
+    .filter(Boolean)
+  const scopes = (scopeDirs || []).map((d) => normComparable(d)).filter(Boolean)
+  const dirs = []
+  if (scopes.length > 0) {
+    const cdRe = /(?:^|[\s;&|])(?:cd|chdir|set-location)\s+["']?([A-Za-z]:[\\/][^"';&|]+)/gi
+    let m
+    while ((m = cdRe.exec(cmd)) !== null) {
+      const t = normComparable(m[1])
+      if (!t) continue
+      // 目标 == 范围，或目标在范围**之内**，才构成目录绑定
+      if (scopes.some((s) => t === s || t.startsWith(s + '/'))) dirs.push(t)
+    }
+  }
+  return { files, dirs }
 }
 
 /** 比较用路径：normalizePath + 去前导 `./`（`./a/b.py` 与 `a/b.py` 是同一个文件）。 */

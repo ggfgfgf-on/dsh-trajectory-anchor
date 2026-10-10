@@ -110,6 +110,43 @@ const ZH = '你正在接手一个本地护理/睡眠联调工程（Project2）�
     inScope('D:\\DSHwork\\runs\\cf-b2\\mod_report.py', a) === false, JSON.stringify(a.scopeDirs))
 }
 
+// ── ①e 回放门（§8 门 2）实测假阳的三个形态，每个都带反向对照 ────────────────
+// 由来：197 会话回放里 F3 开了 7 枪、人工复核 6 假阳，全部归入三种形态：
+//   ① `Work ONLY inside the directory `X`` —— 裸 token 兜底抓到功能词 "the"，
+//      范围变 ["the"] ⇒ 范围内所有写全被判越界（cal-r1/cal-r2/cal2-r1 三个会话 5 条假阳）；
+//   ② 相对路径写 vs 绝对范围目录（p2-gap3-a4/p2-gap2-a3）⇒ 前缀匹配必败；
+//   ③ 中文裸 "仅 `X`" 把依赖声明当范围（本会话自己的计划书 "依赖项仅有 `@deepseek-ai/cordis`"）。
+{
+  const THEDIR = 'Work ONLY inside the directory `D:\\DSHwork\\anchor-bench\\runs\\cal-r1`. Read task.md first.'
+  const a = parseTaskAnchors(THEDIR)
+  check('①e "the directory `X`" 形态：目录进 scopeDirs、范围名里没有 "the"',
+    a.parsed === true && a.scopeDirs.some((d) => d.includes('cal-r1')) && !a.scopeNames.includes('the'),
+    JSON.stringify({ dirs: a.scopeDirs, names: a.scopeNames }))
+  check('①e "the directory `X`" 形态：范围内的文件不判越界（假阳反例）',
+    inScope('D:\\DSHwork\\anchor-bench\\runs\\cal-r1\\mod_report.py', a) === true, JSON.stringify(a.scopeDirs))
+  check('①e "the directory `X`" 形态：范围外仍判越界（反向对照）',
+    inScope('D:\\DSHwork\\anchor-bench\\runs\\cal-r2\\mod_report.py', a) === false, JSON.stringify(a.scopeDirs))
+}
+{
+  const REL = 'Work ONLY inside `D:\\DSHwork\\anchor-bench\\runs\\p2-gap3-a4`. Step 1: read CANDIDATE_PROMPT.md.'
+  const a = parseTaskAnchors(REL)
+  check('①e 相对路径写 vs 绝对范围：**无法判定 ⇒ 按不越界**（保守，宁可漏检）',
+    inScope('workspace/project2_task/gateway/auth.py', a) === true, JSON.stringify(a.scopeDirs))
+  check('①e 相对路径写 vs 绝对范围：绝对路径判定照常（反向对照）',
+    inScope('D:\\DSHwork\\anchor-bench\\runs\\p2-gap3-a4\\workspace\\x.py', a) === true
+    && inScope('D:\\DSHwork\\elsewhere\\x.py', a) === false, JSON.stringify(a.scopeDirs))
+}
+{
+  const DEP = '《DSH 自包含轨迹锚定插件》实施计划书。依赖项仅有 `@deepseek-ai/cordis`，其余自研。'
+  const a = parseTaskAnchors(DEP)
+  check('①e 中文裸 "仅 `X`"（依赖声明）⇒ 不再解析成范围（假阳反例）',
+    a.parsed === false, JSON.stringify({ p: a.parsed, names: a.scopeNames, dirs: a.scopeDirs }))
+  const LIMIT = '工作区仅限 `D:\\DSHwork\\modeltest\\workspace`。里面有遗留 bug。'
+  const b = parseTaskAnchors(LIMIT)
+  check('①e 中文 "工作区仅限 `X`"（带限/工作区语境）⇒ 照常解析（反向对照，修完不许漏放）',
+    b.parsed === true && b.scopeDirs.some((d) => d.includes('modeltest/workspace')), JSON.stringify(b.scopeDirs))
+}
+
 // ── ② 不猜 ─────────────────────────────────────────────────────────────────
 {
   const a = parseTaskAnchors('帮我看看这个仓库有没有问题，随便改改就行')
