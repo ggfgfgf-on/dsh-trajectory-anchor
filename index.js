@@ -43,7 +43,7 @@ import { isAbsolute, resolve as resolvePath, dirname as dirname2 } from 'node:pa
 // （台账定稿 51 倍偏差、两级连续计数混层），所以本轮一律共用一份实现。
 import {
   parseTaskAnchors, inScope, isIgnorablePath, changeInvalidatesVerification, pathsFromCallStrict, isWriteTool, isReadTool,
-  verifyCommandKind, claimsFromFinalMessage, commandPaths, verifyStaleness,
+  verifyCommandKind, claimsFromFinalMessage, commandPaths, verifyStaleness, deliveryGate, claimFormatOk,
 } from './tools/task-anchor-core.mjs'
 // 纠偏线索**共用离线标注那一份**（`drift-label-core` 零依赖、只读）：避免"标注用的判据"
 // 与"运行时触发的判据"各写一份、然后悄悄漂移（本项目在台账与形态识别上各栽过一次）。
@@ -68,6 +68,13 @@ const DEFAULTS = {
   // 验证过期回放（只读版，信息型）：宣告完成时，若它最后一次验证**之后**又改过验证覆盖的
   // 同一文件，把"验证命令 + 事后编辑"回放出来（F5 事实，"你的验证早于这次改动"）。默认关（同上）。
   verifyStalenessMirror: false,
+  // ── phase 2：协议/预算型约束（docs/design-intervention-upgrade.md，默认关）────────
+  // 与信息型镜像的区别：**拒绝接收**交付声明（P1）/ 强制插入重验步骤（P2）/ 要求交付格式
+  // （P3），而不是"给证据让你自己决定"。触发仍用事实层；全部一次性/带预算，只加提示文本。
+  deliveryGate: false,             // P1 交付门：最后一次隐藏评测带失败或早于最近编辑 ⇒ 拒绝接收
+  verifyAfterEditBudget: false,    // P2 改后必验：每 verifyBudgetEvery 次落地代码改动注入一次强制重验
+  verifyBudgetEvery: 3,
+  claimFormatContract: false,      // P3 交付格式契约：声明过 PASS=n/m 格式就必须按格式交付
   bootstrapTools: ['bash', 'str_replace_editor', 'pwsh'],
   bootstrapMaxTokens: null,
   bootstrapPersona: 'You are a helpful software engineer assistant.',
@@ -2517,6 +2524,10 @@ function adopt(agent, doAnchor, channel) {
     // F3/F5 事实的镜像干预标记（served 一次性语义与 done-gap 一致）
     scopeBreachMirror: null,
     verifyStalenessMirror: null,
+    // phase-2 协议约束状态（默认关）
+    deliveryGate: null,        // { served, via, reason, evidence }
+    verifyBudget: { count: 0, armed: false },   // P2：落地代码改动计数；count≥K ⇒ armed，注入后清零
+    claimFormat: null,         // { served, via }
     /** 待发出的拉回原因（工具调用时置位，pre-step 时消费；保证"触发点=说出口的点"）。 */
     pendingPullback: null,
     pullback: {
@@ -2767,6 +2778,26 @@ function feedSessionEvent(session, event) {
               logAudit(rec, 'verify-staleness-mirror', { via: 'claim', ...stale.evidence })
             }
           }
+          // P1 交付门（phase 2）：宣告交付，但最后一次**隐藏评测**带失败或早于最近编辑 ⇒
+          // 拒绝接收（组装期注入"交付不被接受"的门消息）。纯函数在 task-anchor-core。
+          if (!rec.deliveryGate && CONFIG.deliveryGate === true) {
+            const g = deliveryGate({
+              claim: { turn: turn ?? null, step: step ?? null, claimedDone: c.claimedDone === true, claimedPass: c.claimedPass },
+              verifyEvidence: rec.verifyEvidence,
+              edits: rec.edits,
+            })
+            if (g.refuse === true) {
+              rec.deliveryGate = { served: false, via: 'claim', reason: g.reason, evidence: g.evidence }
+              logAudit(rec, 'delivery-gate', { via: 'claim', reason: g.reason, ...g.evidence })
+            }
+          }
+          // P3 交付格式契约（phase 2）：提示声明过 PASS=n/m 格式，交付却没带同分母行 ⇒ 要求补上。
+          if (!rec.claimFormat && CONFIG.claimFormatContract === true
+            && rec.taskAnchors && rec.taskAnchors.reportFormat
+            && !claimFormatOk(claimText, rec.taskAnchors.reportFormat)) {
+            rec.claimFormat = { served: false, via: 'claim' }
+            logAudit(rec, 'claim-format', { via: 'claim', total: rec.taskAnchors.reportFormat.total })
+          }
           // 契约重锚定（只读、一次性）：**第一次**宣告完成时挂标记，组装期注入一次摘要。
           if (first && CONFIG.contractReanchor === true && typeof rec.anchorsFromMessage === 'string' && rec.anchorsFromMessage.trim()) {
             rec.contractReanchor = { atTurn: rec.claimedDoneAt.turn, atStep: rec.claimedDoneAt.step, served: false }
@@ -2971,6 +3002,15 @@ function noteTaskSignal(rec, event) {
       rec.edits.push({ turn, step, tool: name, path, invalidates: changeInvalidatesVerification(path), at: Date.now() })
       if (rec.edits.length > 100) rec.edits.shift()
       arm.editCount += 1
+      // P2 改后必验预算（phase 2）：每 verifyBudgetEvery 次落地代码改动 ⇒ 组装期注入一次强制重验
+      if (CONFIG.verifyAfterEditBudget === true && changeInvalidatesVerification(path)) {
+        arm.invalidatingCount = (arm.invalidatingCount || 0) + 1
+        rec.verifyBudget.count += 1
+        if (rec.verifyBudget.count >= CONFIG.verifyBudgetEvery && !rec.verifyBudget.armed) {
+          rec.verifyBudget.armed = true
+          logAudit(rec, 'verify-budget-armed', { count: rec.verifyBudget.count, turn, step })
+        }
+      }
       if (scopeKnown && !inScope(path, anchors)) {
         const v = { turn, step, tool: name, path, at: Date.now() }
         rec.scopeViolations.push(v)
@@ -3054,6 +3094,11 @@ function retractArm(rec, event) {
         const lastE = rec.edits[rec.edits.length - 1]
         if (lastE && lastE.turn === a.turn && lastE.step === a.step) rec.edits.pop()
       }
+    }
+    // P2 预算计数同口径撤回（没落地的写不算"改过"）。
+    if ((a.invalidatingCount || 0) > 0) {
+      rec.verifyBudget.count = Math.max(0, rec.verifyBudget.count - a.invalidatingCount)
+      if (rec.verifyBudget.count < CONFIG.verifyBudgetEvery) rec.verifyBudget.armed = false
     }
     if (a.addedEdit) {
       const last = rec.codeEditsAfterVerify[rec.codeEditsAfterVerify.length - 1]
@@ -3200,6 +3245,10 @@ function summaryOf(rec) {
     // F3/F5 事实与证据捕获（criteria 层重构 phase 1）：触发、证据、台账计数全部可见
     scopeBreachMirror: rec.scopeBreachMirror ? { served: rec.scopeBreachMirror.served === true, via: rec.scopeBreachMirror.via || null, paths: rec.scopeBreachMirror.paths || [] } : null,
     verifyStalenessMirror: rec.verifyStalenessMirror ? { served: rec.verifyStalenessMirror.served === true, via: rec.verifyStalenessMirror.via || null, verifyCmd: rec.verifyStalenessMirror.verifyCmd || null, editPath: rec.verifyStalenessMirror.editPath || null, verifyTurn: rec.verifyStalenessMirror.verifyTurn ?? null, verifyStep: rec.verifyStalenessMirror.verifyStep ?? null, editTurn: rec.verifyStalenessMirror.editTurn ?? null, editStep: rec.verifyStalenessMirror.editStep ?? null } : null,
+    // phase-2 协议约束状态
+    deliveryGate: rec.deliveryGate ? { served: rec.deliveryGate.served === true, via: rec.deliveryGate.via || null, reason: rec.deliveryGate.reason || null } : null,
+    verifyBudget: { count: rec.verifyBudget.count, armed: rec.verifyBudget.armed === true },
+    claimFormat: rec.claimFormat ? { served: rec.claimFormat.served === true, via: rec.claimFormat.via || null } : null,
     evidence: {
       verifyEvidence: rec.verifyEvidence.length,
       edits: rec.edits.length,
@@ -3363,6 +3412,10 @@ function buildSummary(filter) {
       doneGapMirror: CONFIG.doneGapMirror === true,
       scopeBreachMirror: CONFIG.scopeBreachMirror === true,
       verifyStalenessMirror: CONFIG.verifyStalenessMirror === true,
+      deliveryGate: CONFIG.deliveryGate === true,
+      verifyAfterEditBudget: CONFIG.verifyAfterEditBudget === true,
+      verifyBudgetEvery: CONFIG.verifyBudgetEvery,
+      claimFormatContract: CONFIG.claimFormatContract === true,
       reanchorEnabled: CONFIG.reanchorEnabled === true,
       reanchorEvidencePath: CONFIG.reanchorEvidencePath || null,
       pullbackOutcomePath: CONFIG.pullbackOutcomePath || null,
@@ -3918,6 +3971,97 @@ export function apply(ctx, config) {
       })
     } catch (e) {
       warnOnce(`verify-staleness mirror failed, skipping: ${msg(e)}`)
+      return next(out)
+    }
+  }))
+
+  // ---- P1 交付门（phase 2，协议约束）：宣告交付但隐藏评测带失败/早于最近编辑 ⇒ 拒绝接收 ----
+  // 与镜像的区别：这条**不收**交付（"你的交付不被接受，直到…"），而不是"给你证据你自己决定"。
+  // 触发仍用事实层（deliveryGate 纯函数）；一次性；只在有隐藏评测证据时才设门（保守）。
+  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
+    try {
+      const id = payload && payload.agent && payload.agent.id
+      const rec = id ? recs.get(id) : null
+      if (!rec) return next(out)
+      if (rec.deliveryGate && rec.deliveryGate.served === true) return next(out)
+      if (!rec.deliveryGate) {
+        if (CONFIG.deliveryGate !== true) return next(out)
+        const lastClaim = Array.isArray(rec.claims) ? rec.claims[rec.claims.length - 1] : null
+        if (!lastClaim) return next(out)
+        const g = deliveryGate({ claim: lastClaim, verifyEvidence: rec.verifyEvidence, edits: rec.edits })
+        if (g.refuse !== true) return next(out)
+        rec.deliveryGate = { served: false, via: 'post-claim-assemble', reason: g.reason, evidence: g.evidence }
+        logAudit(rec, 'delivery-gate', { via: 'post-claim-assemble', reason: g.reason, ...g.evidence })
+      }
+      rec.deliveryGate.served = true
+      const reason = rec.deliveryGate.reason
+      const e = rec.deliveryGate.evidence || {}
+      const text = reason === 'edited-after-hidden-verify'
+        ? '[trajectory-anchor] DELIVERY NOT ACCEPTED. Your last hidden-grader run predates a later code edit:\n\n'
+          + `Grader run: ${e.verifyCmd || '(unrecognized)'} (turn ${e.verifyTurn ?? '?'}#${e.verifyStep ?? '?'})\n`
+          + `Edit after it: ${e.editPath} (turn ${e.editTurn ?? '?'}#${e.editStep ?? '?'})\n\n`
+          + 'Re-run the grader NOW, then quote its `[hidden]` line verbatim in your delivery. Until then the delivery is not accepted.'
+        : '[trajectory-anchor] DELIVERY NOT ACCEPTED. Your last hidden-grader run still reports failures:\n\n'
+          + `${e.outputTail || ''}\n\n`
+          + 'Map each failure to its module and fix it, re-run the grader, and quote its `[hidden]` line verbatim in your delivery. Until then the delivery is not accepted.'
+      const section = { name: 'trajectory-anchor:delivery-gate', text }
+      return next({ ...out, sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections })
+    } catch (e) {
+      warnOnce(`delivery gate failed, skipping: ${msg(e)}`)
+      return next(out)
+    }
+  }))
+
+  // ---- P2 改后必验预算（phase 2）：每 K 次落地代码改动注入一步强制重验 ----
+  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
+    try {
+      const id = payload && payload.agent && payload.agent.id
+      const rec = id ? recs.get(id) : null
+      if (!rec) return next(out)
+      if (CONFIG.verifyAfterEditBudget !== true || !rec.verifyBudget.armed) return next(out)
+      rec.verifyBudget.armed = false
+      rec.verifyBudget.count = 0
+      const lastCmd = rec.lastVerifyCmd || '(no verification seen this session)'
+      const section = {
+        name: 'trajectory-anchor:verify-budget',
+        text: '[trajectory-anchor] You have made code edits since your last verification. '
+          + `Before any further edits, re-run the verification (last seen: ${lastCmd.slice(0, 200)}) and quote its output.`,
+      }
+      logAudit(rec, 'verify-budget', { atTurn: payload.turn ?? null })
+      return next({ ...out, sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections })
+    } catch (e) {
+      warnOnce(`verify budget failed, skipping: ${msg(e)}`)
+      return next(out)
+    }
+  }))
+
+  // ---- P3 交付格式契约（phase 2）：声明过 PASS=n/m 就必须按格式交付 ----
+  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
+    try {
+      const id = payload && payload.agent && payload.agent.id
+      const rec = id ? recs.get(id) : null
+      if (!rec) return next(out)
+      if (rec.claimFormat && rec.claimFormat.served === true) return next(out)
+      if (!rec.claimFormat) {
+        if (CONFIG.claimFormatContract !== true) return next(out)
+        const lastClaim = Array.isArray(rec.claims) ? rec.claims[rec.claims.length - 1] : null
+        const fmt = rec.taskAnchors && rec.taskAnchors.reportFormat
+        if (!lastClaim || !fmt) return next(out)
+        if (claimFormatOk(lastClaim.text || '', fmt)) return next(out)
+        rec.claimFormat = { served: false, via: 'post-claim-assemble' }
+        logAudit(rec, 'claim-format', { via: 'post-claim-assemble', total: fmt.total })
+      }
+      rec.claimFormat.served = true
+      const fmt = rec.taskAnchors && rec.taskAnchors.reportFormat
+      const section = {
+        name: 'trajectory-anchor:claim-format',
+        text: '[trajectory-anchor] The task contract requires the report format '
+          + `PASS=<n>/${fmt.total}. Your delivery does not contain that line. `
+          + 'Add the exact line to your delivery.',
+      }
+      return next({ ...out, sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections })
+    } catch (e) {
+      warnOnce(`claim format gate failed, skipping: ${msg(e)}`)
       return next(out)
     }
   }))

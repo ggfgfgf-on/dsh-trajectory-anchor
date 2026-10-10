@@ -582,3 +582,77 @@ function normComparable(p) {
   while (s.startsWith('./')) s = s.slice(2)
   return s
 }
+
+/**
+ * P1 交付门事实（phase 2 设计 `docs/design-intervention-upgrade.md`，纯函数）：
+ * 宣告交付时，**最后一次隐藏评测形态的验证**（命令含 "hidden"，任务自己的打分命令）
+ * 仍带失败、或早于最近一次代码编辑 ⇒ 拒绝接收交付。
+ *
+ * 判据保守：
+ *   · 没有隐藏评测形态的验证记录 ⇒ 不拒（没有可依据的评测器证据时不设门）；
+ *   · 隐藏验证全绿且晚于所有代码编辑 ⇒ 不拒。
+ *
+ * @param {object} input
+ * @param {object} [input.claim] 声明（claimedDone/claimedPass，可选 turn/step）
+ * @param {Array} input.verifyEvidence [{turn,step,cmd,failed,outputTail,...}]
+ * @param {Array} input.edits [{turn,step,path,invalidates,...}]
+ * @returns {{refuse:boolean, reason:string|null, evidence:object|null}}
+ */
+export function deliveryGate(input) {
+  const { claim = null, verifyEvidence = [], edits = [] } = input || {}
+  if (!claim || (claim.claimedDone !== true && claim.claimedPass === null)) {
+    return { refuse: false, reason: 'no-completion-claim', evidence: null }
+  }
+  const hasPos = (v) => typeof v === 'number'
+  const after = (a, b) => (a.turn > b.turn) || (a.turn === b.turn && a.step > b.step)
+  const claimAt = hasPos(claim.turn) && hasPos(claim.step) ? { turn: claim.turn, step: claim.step } : null
+  const atOrBefore = (v) => !claimAt || !hasPos(v.turn) || !hasPos(v.step) || !after(v, claimAt)
+  const isHidden = (v) => typeof v.cmd === 'string' && /hidden/i.test(v.cmd)
+  const list = (verifyEvidence || []).filter((v) => v && isHidden(v) && atOrBefore(v))
+  const hiddenV = list[list.length - 1]
+  if (!hiddenV) return { refuse: false, reason: 'no-hidden-verification', evidence: null }
+  if (!hasPos(hiddenV.turn) || !hasPos(hiddenV.step)) return { refuse: false, reason: 'verify-position-unknown', evidence: null }
+  for (const e of edits || []) {
+    if (!e || e.invalidates !== true) continue
+    if (!hasPos(e.turn) || !hasPos(e.step)) continue
+    if (!after(e, hiddenV)) continue
+    return {
+      refuse: true,
+      reason: 'edited-after-hidden-verify',
+      evidence: {
+        verifyCmd: typeof hiddenV.cmd === 'string' ? hiddenV.cmd : null,
+        verifyTurn: hiddenV.turn, verifyStep: hiddenV.step,
+        editPath: e.path, editTurn: e.turn, editStep: e.step,
+        outputTail: typeof hiddenV.outputTail === 'string' ? hiddenV.outputTail : null,
+      },
+    }
+  }
+  if (hiddenV.failed === true) {
+    return {
+      refuse: true,
+      reason: 'hidden-verify-failed',
+      evidence: {
+        verifyCmd: typeof hiddenV.cmd === 'string' ? hiddenV.cmd : null,
+        verifyTurn: hiddenV.turn, verifyStep: hiddenV.step,
+        outputTail: typeof hiddenV.outputTail === 'string' ? hiddenV.outputTail : null,
+      },
+    }
+  }
+  return { refuse: false, reason: 'fresh-and-green', evidence: null }
+}
+
+/**
+ * P3 交付格式契约（phase 2，纯函数）：首条指令声明了报告格式（PASS=n/m）时，
+ * 交付文本必须带同分母的 PASS=n/m 行，否则格式不达标。
+ *
+ * @param {string} claimText 宣告文本
+ * @param {object} reportFormat parseTaskAnchors 的 reportFormat（{kind:'PASS=n/m', total}）
+ * @returns {boolean} 格式是否达标（未声明格式 ⇒ 恒 true，不设门）
+ */
+export function claimFormatOk(claimText, reportFormat) {
+  const t = typeof claimText === 'string' ? claimText : ''
+  if (!reportFormat || reportFormat.kind !== 'PASS=n/m' || !Number.isFinite(reportFormat.total)) return true
+  const total = reportFormat.total
+  const re = new RegExp(`PASS\\s*=\\s*\\d+\\s*\\/\\s*${total}\\b`, 'i')
+  return re.test(t)
+}
