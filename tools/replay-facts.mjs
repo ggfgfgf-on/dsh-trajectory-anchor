@@ -54,6 +54,11 @@ await mod.apply(ctx, {
   verifyStalenessMirror: true,
   doneGapMirror: false,
   contractReanchor: false,
+  // phase-2 协议约束也全开：同一回放门测"会在哪拒绝交付/强制重验/要求格式"
+  deliveryGate: true,
+  verifyAfterEditBudget: true,
+  verifyBudgetEvery: 3,
+  claimFormatContract: true,
 })
 const dispatch = (name, ...a) => handlers['internal/dispatch']('x', name, a, null)
 
@@ -133,6 +138,10 @@ for (const f of files) {
     scopeViolations: row.pullback?.scopeViolations ?? 0,
     scopeFire: row.scopeBreachMirror,
     stalenessFire: row.verifyStalenessMirror,
+    deliveryGate: row.deliveryGate,
+    verifyBudget: row.verifyBudget,
+    claimFormat: row.claimFormat,
+    auditKinds: row.auditKinds || [],
     fed,
   })
 }
@@ -140,20 +149,41 @@ for (const f of files) {
 // ── 报告 ──────────────────────────────────────────────────────────────────────
 const f3Fires = rows.filter((r) => r.scopeFire)
 const f5Fires = rows.filter((r) => r.stalenessFire)
+const p1Fires = rows.filter((r) => r.deliveryGate && r.deliveryGate.served === true)
+// P2 的"武装"是会话**过程中**的事件：回放只在结尾组装一次，armed 已被那次组装消费复位，
+// 所以开火率看**审计**里的 verify-budget-armed（机器可查的事件，不是终态字段）。
+const p2Armed = rows.filter((r) => (r.auditKinds || []).includes('verify-budget-armed'))
+const p3Fires = rows.filter((r) => r.claimFormat && r.claimFormat.served === true)
 const withAnchors = rows.filter((r) => r.anchorsParsed)
 const withClaims = rows.filter((r) => (r.evidence?.claims ?? 0) > 0)
 const withVerify = rows.filter((r) => (r.evidence?.verifyEvidence ?? 0) > 0)
 const withEdits = rows.filter((r) => (r.evidence?.edits ?? 0) > 0)
 
-console.log(`\n=== F3/F5 事实回放（${rows.length} 个会话）===`)
+console.log(`\n=== F3/F5/P1/P2/P3 回放（${rows.length} 个会话）===`)
 console.log(`解析出范围子句的会话        ${withAnchors.length}`)
 console.log(`有过验证运行的会话          ${withVerify.length}`)
 console.log(`有过落地写的会话            ${withEdits.length}`)
 console.log(`有过完成/通过宣告的会话     ${withClaims.length}`)
 console.log(`F3 越界开火                  ${f3Fires.length} 次（${withAnchors.length ? (f3Fires.length / withAnchors.length * 100).toFixed(1) : 0}% / 有范围会话）`)
 console.log(`F5 过期开火                  ${f5Fires.length} 次（${withClaims.length ? (f5Fires.length / withClaims.length * 100).toFixed(1) : 0}% / 有宣告会话）`)
+console.log(`P1 交付门拒绝               ${p1Fires.length} 次（${withClaims.length ? (p1Fires.length / withClaims.length * 100).toFixed(1) : 0}% / 有宣告会话）`)
+console.log(`P2 改后必验武装             ${p2Armed.length} 次（${withEdits.length ? (p2Armed.length / withEdits.length * 100).toFixed(1) : 0}% / 有落地写会话）`)
+console.log(`P3 格式要求                 ${p3Fires.length} 次（${withClaims.length ? (p3Fires.length / withClaims.length * 100).toFixed(1) : 0}% / 有宣告会话）`)
 
 if (onlyRe) console.log(`（--only ${onlyRe} 过滤中）`)
+
+console.log('\n--- P1 每次拒绝的证据（人工复核）---')
+for (const r of p1Fires) {
+  console.log(`  [${r.label}] ${r.sid}`)
+  console.log(`    via=${r.deliveryGate.via} reason=${r.deliveryGate.reason}`)
+}
+if (p1Fires.length === 0) console.log('  （无拒绝）')
+
+console.log('\n--- P3 每次格式要求的证据（人工复核）---')
+for (const r of p3Fires) {
+  console.log(`  [${r.label}] ${r.sid}  via=${r.claimFormat.via}`)
+}
+if (p3Fires.length === 0) console.log('  （无要求）')
 
 console.log('\n--- F3 每次开火的证据（人工复核）---')
 for (const r of f3Fires) {
@@ -175,6 +205,6 @@ for (const r of f5Fires) {
 if (f5Fires.length === 0) console.log('  （无开火）')
 
 if (jsonOut) {
-  writeFileSync(jsonOut, JSON.stringify({ at: new Date().toISOString(), sessionsDir, rows, f3Fires: f3Fires.map((r) => r.sid), f5Fires: f5Fires.map((r) => r.sid) }, null, 2))
+  writeFileSync(jsonOut, JSON.stringify({ at: new Date().toISOString(), sessionsDir, rows, f3Fires: f3Fires.map((r) => r.sid), f5Fires: f5Fires.map((r) => r.sid), p1Fires: p1Fires.map((r) => r.sid), p2Armed: p2Armed.map((r) => r.sid), p3Fires: p3Fires.map((r) => r.sid) }, null, 2))
   console.log(`\n报告已写：${jsonOut}`)
 }
