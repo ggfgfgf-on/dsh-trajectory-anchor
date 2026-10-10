@@ -170,7 +170,12 @@ else {
       ? '两组**尾巴**都满分 ⇒ 主要结局没有方差（尾部太容易，测不出差异）'
       : '两组全部满分 ⇒ 结局没有方差（任务太容易，测不出差异）'
   }
-  else if (e <= 0) { verdict = 'FAIL'; reason = `锚定并不更好（${artifact.primaryOutcome} 配对差均值 ${fmt(e)}）` }
+  // 方向的判语**必须先过显著性**，两个方向都一样。5 对真数据暴露过这一点：
+  // 均值 −2.6 但配对置换 p=0.254 ⇒ "锚定并不更好"与"锚定更好"一样没有依据。
+  else if (e <= 0) {
+    if (pPaired <= 0.05) { verdict = 'FAIL'; reason = `锚定**显著**更差（${artifact.primaryOutcome} 配对差均值 ${fmt(e)}，p=${pPaired.toFixed(4)}）` }
+    else { verdict = 'INSUFFICIENT'; reason = `方向为负但未显著（配对置换 p=${pPaired.toFixed(3)}，均值 ${fmt(e)}）` }
+  }
   else if (pPaired > 0.05) { verdict = 'INSUFFICIENT'; reason = `方向为正但未显著（配对置换 p=${pPaired.toFixed(3)}）` }
   else { verdict = 'PASS'; reason = `锚定更好且显著（${artifact.primaryOutcome} 配对差均值 ${fmt(e)}，p=${pPaired.toFixed(4)}）` }
 }
