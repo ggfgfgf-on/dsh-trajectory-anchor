@@ -28,6 +28,10 @@ for (let i = 0; i < args.length; i++) {
 const src = pos[0]
 if (!src) { console.error('用法：node tools/anchor-ab-report.mjs <results.jsonl> [--out 前缀]'); process.exit(1) }
 const val = (n, d) => (args.includes(n) ? args[args.indexOf(n) + 1] : d)
+// 臂标签可配置（P1 实验用 p1-on / p1-off，历史用 anchor-on / anchor-off）——
+// 标签只是分组键，语义由 --out 前缀与调用方注释承载。
+const ON_LABEL = String(val('--on', 'anchor-on'))
+const OFF_LABEL = String(val('--off', 'anchor-off'))
 // ⚠ The paired sign-flip permutation test has a **floor on its own p-value**: with n pairs the
 // smallest attainable p is 1/2^n, so n=4 can never reach 0.05 (1/16 = 0.0625) no matter how clean
 // the separation is. A run of 4 pairs therefore cannot return PASS even in principle — the harness
@@ -49,8 +53,8 @@ if (badLines.length > 0) {
   console.error(`⚠ ${badLines.length} 行无法解析（不会静默丢弃——要么修文件、要么解释为什么这行不算）：`)
   for (const b of badLines.slice(0, 5)) console.error(`  第 ${b.line} 行：${b.why}`)
 }
-const A = rows.filter((r) => r.condition === 'anchor-on')
-const B = rows.filter((r) => r.condition === 'anchor-off')
+const A = rows.filter((r) => r.condition === ON_LABEL)
+const B = rows.filter((r) => r.condition === OFF_LABEL)
 const fmt = (x, d = 2) => (x === null || x === undefined ? '—' : Number(x).toFixed(d))
 const mean = (xs) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null)
 
@@ -153,7 +157,8 @@ function permUnpaired(a, b, iters) {
   return (ge + 1) / (iters + 1)
 }
 
-console.log(`样本：A（锚定开）${A.length} 行 / B（锚定关）${B.length} 行；可配对任务 ${paired.length} 个`)
+const INT = String(val('--intervention', '锚定'))
+console.log(`样本：A（${INT}开）${A.length} 行 / B（${INT}关）${B.length} 行；可配对任务 ${paired.length} 个`)
 const artifact = {
   generatedAtUtc: new Date().toISOString(),
   kind: 'anchor-ab-intervention',
@@ -166,8 +171,8 @@ const artifact = {
   n: { on: A.length, off: B.length, paired: paired.length },
   primaryOutcome: tailComplete ? 'tail' : 'total (fallback: rows lack tail fields)',
   perCondition: {
-    'anchor-on': { tasks: A.length, meanGain: mean(A.map(primaryGain)), meanFinal: mean(A.map(totalGain)), perfect: A.filter((r) => r.final === r.total).length, tailPerfect: tailComplete ? A.filter((r) => r.tail === r.tailTotal).length : null },
-    'anchor-off': { tasks: B.length, meanGain: mean(B.map(primaryGain)), meanFinal: mean(B.map(totalGain)), perfect: B.filter((r) => r.final === r.total).length, tailPerfect: tailComplete ? B.filter((r) => r.tail === r.tailTotal).length : null },
+    [ON_LABEL]: { tasks: A.length, meanGain: mean(A.map(primaryGain)), meanFinal: mean(A.map(totalGain)), perfect: A.filter((r) => r.final === r.total).length, tailPerfect: tailComplete ? A.filter((r) => r.tail === r.tailTotal).length : null },
+    [OFF_LABEL]: { tasks: B.length, meanGain: mean(B.map(primaryGain)), meanFinal: mean(B.map(totalGain)), perfect: B.filter((r) => r.final === r.total).length, tailPerfect: tailComplete ? B.filter((r) => r.tail === r.tailTotal).length : null },
   },
   paired: paired.map((p) => ({ task: p.task, a: p.a, b: p.b, delta: p.delta, finalDelta: p.finalDelta })),
   passK: { on: passK(A), off: passK(B) },
@@ -197,7 +202,7 @@ else {
   const pUnpaired = permUnpaired(A.map(primaryGain), B.map(primaryGain), PERM)
   const e = mean(deltas)
   artifact.pairedTest = { outcome: artifact.primaryOutcome, meanDelta: e, oneSidedP: pPaired, unpairedP: pUnpaired, deltas }
-  console.log(`主要结局=${artifact.primaryOutcome}；配对差均值 ${fmt(e)}（正 = 锚定更好）；配对置换 p=${pPaired.toFixed(4)}；非配对 p=${pUnpaired.toFixed(4)}`)
+  console.log(`主要结局=${artifact.primaryOutcome}；配对差均值 ${fmt(e)}（正 = ${INT}更好）；配对置换 p=${pPaired.toFixed(4)}；非配对 p=${pUnpaired.toFixed(4)}`)
   // Saturation is checked on the **primary** outcome: if both arms are perfect on the tail there is
   // nothing to explain, however much the secondary total varies.
   const noVariance = tailComplete
@@ -212,11 +217,11 @@ else {
   // 方向的判语**必须先过显著性**，两个方向都一样。5 对真数据暴露过这一点：
   // 均值 −2.6 但配对置换 p=0.254 ⇒ "锚定并不更好"与"锚定更好"一样没有依据。
   else if (e <= 0) {
-    if (pPaired <= 0.05) { verdict = 'FAIL'; reason = `锚定**显著**更差（${artifact.primaryOutcome} 配对差均值 ${fmt(e)}，p=${pPaired.toFixed(4)}）` }
+    if (pPaired <= 0.05) { verdict = 'FAIL'; reason = `${INT}**显著**更差（${artifact.primaryOutcome} 配对差均值 ${fmt(e)}，p=${pPaired.toFixed(4)}）` }
     else { verdict = 'INSUFFICIENT'; reason = `方向为负但未显著（配对置换 p=${pPaired.toFixed(3)}，均值 ${fmt(e)}）` }
   }
   else if (pPaired > 0.05) { verdict = 'INSUFFICIENT'; reason = `方向为正但未显著（配对置换 p=${pPaired.toFixed(3)}）` }
-  else { verdict = 'PASS'; reason = `锚定更好且显著（${artifact.primaryOutcome} 配对差均值 ${fmt(e)}，p=${pPaired.toFixed(4)}）` }
+  else { verdict = 'PASS'; reason = `${INT}更好且显著（${artifact.primaryOutcome} 配对差均值 ${fmt(e)}，p=${pPaired.toFixed(4)}）` }
 }
 artifact.verdict = verdict
 artifact.verdictReason = reason
