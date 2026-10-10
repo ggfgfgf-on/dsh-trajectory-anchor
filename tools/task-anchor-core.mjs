@@ -382,7 +382,17 @@ export function claimsFromFinalMessage(text) {
   const re = /PASS\s*=\s*(\d+)\s*\/\s*(\d+)/gi
   let m
   while ((m = re.exec(t)) !== null) { claimedPass = Number(m[1]); claimedTotal = Number(m[2]); raw = m[0] }
-  const claimedDone = /(已修好|已修复|修复完成|完成|可提测|全部通过|all (?:tests )?pass|fixed|done)/i.test(t)
+  // 交付式宣告（收紧过）：只认"交付/完工"措辞，不认中途进度报告。
+  // 为什么收紧（2026-10-10 契约重锚定验收实测）：旧判据 `all (?:tests )?pass` 让 T2 的
+  // "A/B/C all pass"（一份**中途**报告）也被当成"宣告完成" ⇒ 契约回声在冲突回合就注入，
+  // 交付时早已过期（ablation-log 第二十四条原因①）。收紧后：
+  //   · 保留 PASS=n/m（含"取最后一次"）与中文完成措辞；
+  //   · 英文只认 (the )?(task|work|engagement) (is )?(done|complete|finished)、
+  //     all <n> (tests|checks|groups) (pass|green)、everything (passes|is done|…)。
+  const claimedDone = /(已修好|已修复|修复完成|完成|可提测|全部通过)/.test(t)
+    || /(?:the )?(?:task|work|engagement)(?: is)? (?:done|complete|finished)/i.test(t)
+    || /all (?:\d+ )?(?:tests|checks|groups) (?:pass|green)/i.test(t)
+    || /everything (?:passes|is done|is green|works)/i.test(t)
   return { claimedPass, claimedTotal, claimedDone, raw }
 }
 

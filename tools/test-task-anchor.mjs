@@ -192,6 +192,11 @@ const ZH = '你正在接手一个本地护理/睡眠联调工程（Project2）�
   check('⑤ 声明解析：中文完成声明', c2.claimedDone === true && c2.claimedPass === null, JSON.stringify(c2))
   const c3 = claimsFromFinalMessage('还在排查中')
   check('⑤ 模糊表述不当作声明', c3.claimedDone === false && c3.claimedPass === null, JSON.stringify(c3))
+  // 契约重锚定验收的教训：中途进度报告不是交付式宣告（旧判据在这里误触发过）
+  const c4 = claimsFromFinalMessage('A/B/C all pass (60/60 behaviour checks)')
+  check('⑤ 中途进度报告不算交付式宣告', c4.claimedDone === false && c4.claimedPass === null, JSON.stringify(c4))
+  const c5 = claimsFromFinalMessage('The task is done, all checks pass.')
+  check('⑤ 交付式宣告仍算（task is done + all checks pass）', c5.claimedDone === true, JSON.stringify(c5))
 }
 
 // ── ⑥ 路径抽取的边角 ───────────────────────────────────────────────────────
