@@ -214,7 +214,11 @@ export function verifyCommandKind(cmd) {
   const patterns = [
     ['pytest', /\bpytest\b/],
     ['python-unittest', /\bpython[0-9.]*\s+-m\s+(unittest|pytest)\b/],
-    ['python-test-file', /\bpython[0-9.]*\s+[^\s]*test[^\s]*\.py\b/],
+    // ⚠ python 解释器标志（-X utf8 / -u / -O …）在实测里是**常态**（本项目的评测命令
+    // 就是 `python -X utf8 evaluator/run_hidden_tests.py`），旧模式 `python\s+[^\s]*test…`
+    // 会把 "-X" 当脚本名 ⇒ 最重要的隐藏评测一次都认不出（flash f1 会话 23 条验证命令
+    // 只认到 1 条）。修：python 后允许任意个 `-<标志>`，再取脚本路径。
+    ['python-test-file', /\bpython[0-9.]*(?:\s+-[A-Za-z][^\s]*)*\s+[^\s]*test[^\s]*\.py\b/],
     ['npm-test', /\bnpm\s+(run\s+)?test\b/],
     ['pnpm-test', /\bpnpm\s+(run\s+)?(test|check|verify)\b/],
     ['yarn-test', /\byarn\s+(run\s+)?test\b/],
@@ -228,7 +232,11 @@ export function verifyCommandKind(cmd) {
     ['make-test', /\bmake\s+(test|check)\b/],
     ['gradle-test', /\b(\.\/)?gradlew?\s+\S*test\b/],
     ['maven-test', /\bmvn\s+\S*test\b/],
-    ['run-tests-script', /\b(run|invoke)[-_ ]?(public[-_ ]?)?tests?\.(py|ps1|sh|js|mjs)\b/],
+    // ⚠ run_hidden_tests.py / run_public_tests.py / run_full_eval.py 这类评测脚本名中间是
+    // **任意**单词（hidden/public/full/optional…），旧模式只认固定拼法 ⇒
+    // `python -X utf8 evaluator/run_hidden_tests.py` 两条规则都漏。锚词放宽到
+    // test/eval/check/verify/grade（run_debug_probe.py 仍不算——诊断探针不是验证）。
+    ['run-tests-script', /\b(run|invoke)[-_ ]?[\w-]*(?:test|eval|check|verify|grade)[\w-]*\.(py|ps1|sh|js|mjs)\b/],
     ['vitest-jest', /\b(vitest|jest)\b/],
     ['tsc-check', /\btsc\b[^|]*--noemit|--noemit[^|]*\btc\b/],
   ]

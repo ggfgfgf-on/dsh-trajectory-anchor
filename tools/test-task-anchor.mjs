@@ -252,6 +252,19 @@ const ZH = '你正在接手一个本地护理/睡眠联调工程（Project2）�
   check('⑥ 保守：build / 状态查询 / 非测试脚本不算验证',
     verifyCommandKind('node build.mjs') === null && verifyCommandKind('git status') === null
     && verifyCommandKind('node tools/check-invariants.mjs') === null && verifyCommandKind('') === null)
+  // 回放门/活体实测：解释器标志（-X utf8）与 run_<任意词>_tests.py 形态是评测命令的
+  // **常态**（本项目评测命令 = `python -X utf8 evaluator/run_hidden_tests.py`），
+  // 旧模式两条都漏 ⇒ 最重要的隐藏评测从未进 verify-evidence。
+  check('⑥ 识别带解释器标志的测试命令（实测缺口）',
+    verifyCommandKind('python -X utf8 evaluator/run_hidden_tests.py') === 'run-tests-script'
+    || verifyCommandKind('python -X utf8 evaluator/run_hidden_tests.py') === 'python-test-file')
+  check('⑥ 识别 run_hidden / run_public / run_full 等任意词评测脚本',
+    verifyCommandKind('python -X utf8 evaluator/run_hidden_tests.py') !== null
+    && verifyCommandKind('python evaluator/tests/run_public_tests.py workspace/project2_task') !== null
+    && verifyCommandKind('python -X utf8 evaluator/run_full_eval.py x') !== null)
+  check('⑥ 保守：非 run 前缀的普通脚本仍不算验证',
+    verifyCommandKind('python -X utf8 tools/deploy.py') === null
+    && verifyCommandKind('python -X utf8 prepare_candidate_handoff.py') === null)
 }
 
 // ── ⑦ 精度纪律：实测假阳必须被挡住（v1 在语料上刷出 62 条"越界写"，真越界为 0）──
