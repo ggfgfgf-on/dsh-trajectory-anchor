@@ -51,6 +51,11 @@ import { CORRECTION_CUES } from './tools/drift-label-core.mjs'
 
 const DEFAULTS = {
   anchorEnabled: true,
+  // 契约重锚定（只读版，信息型）：代理**宣告完成**时，把首轮任务陈述摘要重新注入近因位置，
+  // 供它在交付前自检"有没有偏离原契约"。由来：dil2 台实测"后续指令与首轮契约冲突"时，
+  // 代理行为完全由"哪条指令最新"驱动，而插件全程沉默（ablation-log 第二十三条）。
+  // 默认关（与其他执行器同一纪律：先有验收证据再默认开）。
+  contractReanchor: false,
   bootstrapTools: ['bash', 'str_replace_editor', 'pwsh'],
   bootstrapMaxTokens: null,
   bootstrapPersona: 'You are a helpful software engineer assistant.',
@@ -2669,7 +2674,13 @@ function feedSessionEvent(session, event) {
       if (claimText) {
         const c = claimsFromFinalMessage(claimText)
         if (c && (c.claimedDone === true || c.claimedPass !== null)) {
+          const first = rec.claimedDoneAt == null
           rec.claimedDoneAt = { turn: turn ?? null, step: step ?? null }
+          // 契约重锚定（只读、一次性）：**第一次**宣告完成时挂标记，组装期注入一次摘要。
+          if (first && CONFIG.contractReanchor === true && typeof rec.anchorsFromMessage === 'string' && rec.anchorsFromMessage.trim()) {
+            rec.contractReanchor = { atTurn: rec.claimedDoneAt.turn, atStep: rec.claimedDoneAt.step, served: false }
+            logAudit(rec, 'contract-reanchor', { atTurn: rec.claimedDoneAt.turn, atStep: rec.claimedDoneAt.step })
+          }
         }
       }
     } catch (e) { /* 观测侧永不抛 */ }
@@ -3069,6 +3080,7 @@ function summaryOf(rec) {
     // 本会话的资格是否由**人工试运行**授予（null = 本会话没走到那条路径）
     trialReleaseArmed: rec.trialReleaseArmed || null,
     trialReleaseUnavailable: rec.trialReleaseUnavailable || null,
+    contractReanchor: rec.contractReanchor ? { atTurn: rec.contractReanchor.atTurn ?? null, atStep: rec.contractReanchor.atStep ?? null, served: rec.contractReanchor.served === true } : null,
     policy: rec.lastPolicy,
     policyAction: rec.lastPolicyAction,
     policyChannel: rec.lastPolicyChannel,
@@ -3636,6 +3648,33 @@ export function apply(ctx, config) {
     } catch (e) {
       warnOnce(`surface filter failed, exposing full catalog: ${msg(e)}`)
       return out
+    }
+  }))
+
+  // ---- 契约重锚定（只读、一次性）：宣告完成后的第一次组装注入首轮契约摘要 ----
+  // 通道与 P4 相同（trajectory-anchor:* 段），不改工具面、不删信息，信息型。
+  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
+    try {
+      const id = payload && payload.agent && payload.agent.id
+      const rec = id ? recs.get(id) : null
+      if (!rec || !rec.contractReanchor || rec.contractReanchor.served === true) return next(out)
+      rec.contractReanchor.served = true
+      const summary = rec.anchorsFromMessage.slice(0, 700)
+      const section = {
+        name: 'trajectory-anchor:contract',
+        text: '[trajectory-anchor] You are about to declare this task done. Re-check your work against the '
+          + 'ORIGINAL contract from the first instruction:\n\n'
+          + summary
+          + '\n\nIf a later instruction appeared to change or cancel part of this contract, verify which one '
+          + 'governs before finishing — and say so explicitly if they conflict.',
+      }
+      return {
+        ...out,
+        sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections,
+      }
+    } catch (e) {
+      warnOnce(`contract re-anchor failed, skipping: ${msg(e)}`)
+      return next(out)
     }
   }))
 
