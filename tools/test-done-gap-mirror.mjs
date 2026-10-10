@@ -114,5 +114,53 @@ await boot({ doneGapMirror: true })
   check('④ 反向：没宣告完成就不注入', gapSection(out) === undefined, JSON.stringify((out.sections || []).map((s) => s.name)))
 }
 
+// ── ⑤ 边界触发（本轮核心）：不宣告、只 turn/end + 最近验证仍失败 ⇒ 回放 ──────────
+await boot({ doneGapMirror: true })
+{
+  const { session } = makeAgent('gap-boundary')
+  sessionEvent(session, verifyCall(1, 1))
+  sessionEvent(session, verifyResult(1, 1, FAIL_TEXT))
+  sessionEvent(session, { type: 'turn/end', data: { turn: 1 } })
+  const out = await assemble('gap-boundary')
+  const sec = gapSection(out)
+  const row = await summaryOf('gap-boundary')
+  check('⑤ 边界触发：turn/end 即回放（不需要代理说出 done）', sec !== undefined && /21 failures/.test(sec.text), JSON.stringify((out.sections || []).map((s) => s.name)))
+  check('⑤ 边界触发：审计写明 via=turn-end', Array.isArray(row.auditKinds) && row.auditKinds.includes('done-gap-mirror') && row.doneGapMirror && row.doneGapMirror.served === true, JSON.stringify(row.doneGapMirror))
+}
+
+// ── ⑥ 反向：turn/end 但最近验证已全绿 ⇒ 不注入 ───────────────────────────────
+await boot({ doneGapMirror: true })
+{
+  const { session } = makeAgent('gap-b-green')
+  sessionEvent(session, verifyCall(1, 1))
+  sessionEvent(session, verifyResult(1, 1, PASS_TEXT))
+  sessionEvent(session, { type: 'turn/end', data: { turn: 1 } })
+  const out = await assemble('gap-b-green')
+  check('⑥ 反向：验证已绿则边界也不注入', gapSection(out) === undefined, JSON.stringify((out.sections || []).map((s) => s.name)))
+}
+
+// ── ⑦ 反向：turn/end 但从没跑过验证 ⇒ 不注入 ────────────────────────────────
+await boot({ doneGapMirror: true })
+{
+  const { session } = makeAgent('gap-b-noverify')
+  sessionEvent(session, { type: 'turn/end', data: { turn: 1 } })
+  const out = await assemble('gap-b-noverify')
+  check('⑦ 反向：无验证证据则边界不注入', gapSection(out) === undefined, JSON.stringify((out.sections || []).map((s) => s.name)))
+}
+
+// ── ⑧ 双路径只注入一次：宣告先到 → 后续 turn/end 不再重复 ────────────────────
+await boot({ doneGapMirror: true })
+{
+  const { session } = makeAgent('gap-b-once')
+  sessionEvent(session, verifyCall(1, 1))
+  sessionEvent(session, verifyResult(1, 1, FAIL_TEXT))
+  sessionEvent(session, doneEvent(1, 2))
+  const first = await assemble('gap-b-once')
+  sessionEvent(session, { type: 'turn/end', data: { turn: 1 } })
+  const second = await assemble('gap-b-once')
+  check('⑧ 宣告路径注入后，边界不再重复', gapSection(first) !== undefined && gapSection(second) === undefined,
+    JSON.stringify({ first: (first.sections || []).map((s) => s.name), second: (second.sections || []).map((s) => s.name) }))
+}
+
 console.log(`\n${pass} pass, ${fail} fail`)
 if (fail > 0) process.exit(1)

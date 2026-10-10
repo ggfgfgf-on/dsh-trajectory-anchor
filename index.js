@@ -2669,6 +2669,15 @@ function feedSessionEvent(session, event) {
   } else if (event.type === 'turn/end') {
     // A′ 的关键排除：回合到此结束 ⇒ 最后一格"无工具调用"是合法收尾，不是停手。
     ledgerCloseTurn(rec, event.data && event.data.turn)
+    // done-gap 的**边界触发**：代理常常不按"语言宣告"格式报告完成（实测交付报告是
+    // "HIDDEN: failed=… passed=…"，claim 正则匹配不上 ⇒ 镜像一次都不开火，见 §29）。
+    // 回合结束就是天然交付边界：最近一次验证仍带失败就回放缺口。
+    // 与宣告路径共用 served 标记 ⇒ 两条路径都只注入一次。
+    if (CONFIG.doneGapMirror === true && !rec.doneGapMirror
+      && typeof rec.lastVerifyFailureTail === 'string' && rec.lastVerifyFailureTail.trim()) {
+      rec.doneGapMirror = { atTurn: (event.data && event.data.turn) ?? null, atStep: null, served: false, failCount: rec.lastVerifyFailCount }
+      logAudit(rec, 'done-gap-mirror', { via: 'turn-end', atTurn: rec.doneGapMirror.atTurn, failCount: rec.lastVerifyFailCount })
+    }
   } else if (event.type === 'assistant/message') {
     rec.messages += 1
     const turn = event.data && event.data.turn
