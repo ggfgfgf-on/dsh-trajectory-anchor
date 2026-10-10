@@ -38,8 +38,17 @@ const permFloor = (n) => 1 / (2 ** n)
 const PERM = Number(val('--perm', 20000))
 const outPrefix = resolve(val('--out', './anchor-ab-report'))
 
-const rows = readFileSync(resolve(src), 'utf8').split('\n').filter((l) => l.trim())
-  .map((l) => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
+const rawLines = readFileSync(resolve(src), 'utf8').split('\n').filter((l) => l.trim())
+const badLines = []
+const rows = rawLines
+  .map((l, i) => { try { return JSON.parse(l) } catch (e) { badLines.push({ line: i + 1, why: String(e.message).slice(0, 80) }); return null } })
+  .filter(Boolean)
+if (badLines.length > 0) {
+  // 实测踩到：PowerShell 的 Set-Content -Encoding UTF8 会给首行写 BOM ⇒ JSON.parse 失败。
+  // 静默丢弃会把"缺了第一行"伪装成正常样本——**不许静默**，坏行必须点名。
+  console.error(`⚠ ${badLines.length} 行无法解析（不会静默丢弃——要么修文件、要么解释为什么这行不算）：`)
+  for (const b of badLines.slice(0, 5)) console.error(`  第 ${b.line} 行：${b.why}`)
+}
 const A = rows.filter((r) => r.condition === 'anchor-on')
 const B = rows.filter((r) => r.condition === 'anchor-off')
 const fmt = (x, d = 2) => (x === null || x === undefined ? '—' : Number(x).toFixed(d))
@@ -97,6 +106,29 @@ const paired = comparable.filter((t) => pairOk(mA[t], mB[t])).map((t) => ({
   finalA: totalGain(mA[t]), finalB: totalGain(mB[t]), finalDelta: totalGain(mA[t]) - totalGain(mB[t]),
 }))
 
+/**
+ * 次要过程指标（设计 §9 的四个新指标）。行里带这些字段时逐项报：两臂均值 + **配对**差 +
+ * 符号置换 p。字段缺失 ⇒ 该项报 null 并**明说**（不悄悄换口径）。
+ * 方向约定：delta = A − B，符号原样给出（成本类指标的正负含义由字段名自明，不做极性换算）。
+ */
+const METRIC_FIELDS = ['durMin', 'steps', 'toolCalls', 'evalEdits', 'verifies', 'claims', 'earlyStop', 'destructive']
+const metrics = {}
+for (const name of METRIC_FIELDS) {
+  const aVals = paired.map((p) => mA[p.task][name]).filter((x) => Number.isFinite(x))
+  const bVals = paired.map((p) => mB[p.task][name]).filter((x) => Number.isFinite(x))
+  const ok = paired.length > 0 && aVals.length === paired.length && bVals.length === paired.length
+  if (!ok) { metrics[name] = null; continue }
+  const deltas = paired.map((p) => mA[p.task][name] - mB[p.task][name])
+  metrics[name] = {
+    meanA: mean(aVals), meanB: mean(bVals), pairedDelta: mean(deltas), p: permPaired(deltas, PERM),
+  }
+}
+const metricLines = METRIC_FIELDS.filter((n) => metrics[n]).map((n) => {
+  const m = metrics[n]
+  return `${n}: A=${fmt(m.meanA)} B=${fmt(m.meanB)} 配对差=${fmt(m.pairedDelta, 2)}（A−B） p=${m.p.toFixed(3)}`
+})
+const missingMetrics = METRIC_FIELDS.filter((n) => metrics[n] === null)
+
 function permPaired(deltas, iters) {
   const obs = Math.abs(mean(deltas))
   let ge = 0
@@ -140,6 +172,13 @@ const artifact = {
   paired: paired.map((p) => ({ task: p.task, a: p.a, b: p.b, delta: p.delta, finalDelta: p.finalDelta })),
   passK: { on: passK(A), off: passK(B) },
   refusedPairs: refused,
+  secondaryMetrics: metrics,
+  missingSecondaryMetrics: missingMetrics,
+  badLines,
+}
+if (metricLines.length > 0) {
+  console.log('次要过程指标（缺失项见产物 missingSecondaryMetrics）：')
+  for (const l of metricLines) console.log(`  ${l}`)
 }
 
 let verdict = 'INSUFFICIENT'
