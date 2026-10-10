@@ -104,14 +104,17 @@ await boot({ doneGapMirror: true })
   check('③ 反向：验证已全绿就不注入', gapSection(out) === undefined, JSON.stringify((out.sections || []).map((s) => s.name)))
 }
 
-// ── ④ 反向：有失败证据但**没宣告完成** ⇒ 不注入 ────────────────────────────
+// ── ④ 改版：无宣告、无 turn/end —— 失败验证后的下一次组装**就**回放（惰性触发）──
 await boot({ doneGapMirror: true })
 {
   const { session } = makeAgent('gap-noclaim')
   sessionEvent(session, verifyCall(1, 1))
   sessionEvent(session, verifyResult(1, 1, FAIL_TEXT))
   const out = await assemble('gap-noclaim')
-  check('④ 反向：没宣告完成就不注入', gapSection(out) === undefined, JSON.stringify((out.sections || []).map((s) => s.name)))
+  const sec = gapSection(out)
+  check('④ 改版：失败验证后的下一次组装即回放（无需宣告/边界）', sec !== undefined && /21 failures/.test(sec.text), JSON.stringify((out.sections || []).map((s) => s.name)))
+  const row = await summaryOf('gap-noclaim')
+  check('④ 改版：审计写明 via=post-failure-assemble', Array.isArray(row.auditKinds) && row.auditKinds.includes('done-gap-mirror'), JSON.stringify(row.auditKinds))
 }
 
 // ── ⑤ 边界触发（本轮核心）：不宣告、只 turn/end + 最近验证仍失败 ⇒ 回放 ──────────

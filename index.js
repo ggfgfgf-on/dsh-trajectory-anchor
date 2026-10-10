@@ -3708,17 +3708,27 @@ export function apply(ctx, config) {
     }
   }))
 
-  // ---- 交付缺口回放（只读、一次性）：宣告完成后的第一次组装回放"你自己还有 N 个失败" ----
+  // ---- 交付缺口回放（只读、一次性）：失败验证之后的下一次组装即回放"你自己还有 N 个失败" ----
+  // 触发改成**惰性**：不再要求"宣告完成"或 turn/end（实测这两个边界都可能缺失——a5 那次
+  // 会话在失败验证后没有 turn/end ⇒ 4/5 开火未达预注册门槛）。现在只要"最近一次验证仍带
+  // 失败证据 + 出现下一次提示组装"，就注入一次。宣告/turn-end 路径保留（它们只是提前挂标记）。
   disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
     try {
       const id = payload && payload.agent && payload.agent.id
       const rec = id ? recs.get(id) : null
-      if (!rec || !rec.doneGapMirror || rec.doneGapMirror.served === true) return next(out)
+      if (!rec) return next(out)
+      if (rec.doneGapMirror && rec.doneGapMirror.served === true) return next(out)
+      if (!rec.doneGapMirror) {
+        if (CONFIG.doneGapMirror !== true) return next(out)
+        if (typeof rec.lastVerifyFailureTail !== 'string' || !rec.lastVerifyFailureTail.trim()) return next(out)
+        rec.doneGapMirror = { atTurn: null, atStep: null, served: false, failCount: rec.lastVerifyFailCount }
+        logAudit(rec, 'done-gap-mirror', { via: 'post-failure-assemble', failCount: rec.lastVerifyFailCount })
+      }
       rec.doneGapMirror.served = true
       const fail = rec.lastVerifyFailCount === null ? 'failures' : `${rec.lastVerifyFailCount} failures`
       const section = {
         name: 'trajectory-anchor:done-gap',
-        text: `[trajectory-anchor] You are about to declare this task done, but your OWN most recent verification still reported ${fail}. Evidence:\n\n${rec.lastVerifyFailureTail}\n\nMap each failure to its module and keep fixing; if you believe some of them do not count, say so explicitly before finishing.`,
+        text: `[trajectory-anchor] Your most recent verification still reported ${fail}. Evidence:\n\n${rec.lastVerifyFailureTail}\n\nMap each failure to its module and keep fixing; if you believe some of them do not count, say so explicitly before finishing.`,
       }
       return {
         ...out,
