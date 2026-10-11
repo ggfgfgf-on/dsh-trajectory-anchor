@@ -1,8 +1,8 @@
 {
-  "generatedAtUtc": "2026-10-11T18:09:29.040Z",
+  "generatedAtUtc": "2026-10-11T18:25:36.983Z",
   "corpus": {
-    "sessionsScanned": 281,
-    "sessionsUsed": 182
+    "sessionsScanned": 289,
+    "sessionsUsed": 190
   },
   "axes": {
     "modelFamilies": [
@@ -12,7 +12,7 @@
       },
       {
         "key": "huoshan/ark-code-latest",
-        "sessions": 78
+        "sessions": 86
       },
       {
         "key": "deepseek-official/deepseek-v4-pro",
@@ -38,7 +38,7 @@
     "presets": [
       {
         "key": "(none)",
-        "sessions": 182
+        "sessions": 190
       }
     ]
   },
@@ -50,12 +50,12 @@
       "preset": null,
       "scope": "none",
       "sessions": 33,
-      "steps": 23278,
-      "meanSteps": 705,
+      "steps": 23353,
+      "meanSteps": 708,
       "baseRates": {
         "inaction": 0.0029,
-        "repetition": 0.0526,
-        "failure": 0.0445
+        "repetition": 0.0525,
+        "failure": 0.0446
       }
     },
     {
@@ -86,6 +86,21 @@
         "inaction": 0,
         "repetition": 0.0268,
         "failure": 0.0474
+      }
+    },
+    {
+      "key": "huoshan/ark-code-latest @ no-preset @ workspace",
+      "provider": "huoshan",
+      "model": "ark-code-latest",
+      "preset": null,
+      "scope": "workspace",
+      "sessions": 12,
+      "steps": 501,
+      "meanSteps": 42,
+      "baseRates": {
+        "inaction": 0,
+        "repetition": 0.022,
+        "failure": 0.1297
       }
     },
     {
@@ -161,21 +176,6 @@
         "inaction": 0,
         "repetition": 0.0236,
         "failure": 0.2756
-      }
-    },
-    {
-      "key": "huoshan/ark-code-latest @ no-preset @ workspace",
-      "provider": "huoshan",
-      "model": "ark-code-latest",
-      "preset": null,
-      "scope": "workspace",
-      "sessions": 4,
-      "steps": 249,
-      "meanSteps": 62,
-      "baseRates": {
-        "inaction": 0,
-        "repetition": 0.0361,
-        "failure": 0.0884
       }
     },
     {
@@ -1332,6 +1332,7 @@
     "11b4a17b-840": "deepseek-official/deepseek-v4-pro @ no-preset @ none",
     "15212447-a19": "huoshan/ark-code-latest @ no-preset @ p2-gap3-a4",
     "15f131f6-75c": "deepseek-official/deepseek-v4-flash @ no-preset @ p2-f1",
+    "16d98f19-93c": "huoshan/ark-code-latest @ no-preset @ workspace",
     "178fd3ce-ecc": "deepseek-official/deepseek-v4-pro @ no-preset @ workspace",
     "19d40eaa-f43": "huoshan/ark-code-latest @ no-preset @ p2-m1-6",
     "202be303-a4a": "vision-toolkit-deepseek-official/deepseek-v4-flash @ no-preset @ dil2-a1",
@@ -1393,6 +1394,7 @@
     "76c76202-e7f": "huoshan/ark-code-latest @ no-preset @ p2-m1-1",
     "7704ef64-844": "deepseek-official/deepseek-v4-pro @ no-preset @ workspace",
     "792d5656-386": "huoshan/ark-code-latest @ no-preset @ p2-ark-a5",
+    "7acfd1c8-6f1": "huoshan/ark-code-latest @ no-preset @ workspace",
     "7ae1305e-664": "huoshan/ark-code-latest @ no-preset @ p2-gap-a3",
     "7e9c488f-5fb": "vision-toolkit-deepseek-official/deepseek-v4-flash @ no-preset @ ip-r2",
     "7f1468c7-c43": "huoshan/ark-code-latest @ no-preset @ p2-m1-3",
@@ -1405,8 +1407,10 @@
     "8d5ca72e-817": "deepseek-official/deepseek-v4-flash @ no-preset @ p2-f2",
     "8d77849e-044": "vision-toolkit-deepseek-official/deepseek-v4-flash @ no-preset @ big-t01",
     "8def7726-4b7": "deepseek-official/deepseek-v4-pro @ no-preset @ none",
+    "8ec88cff-920": "huoshan/ark-code-latest @ no-preset @ workspace",
     "8fc5266f-e0e": "huoshan/ark-code-latest @ no-preset @ p2-gap2-a2",
     "9365edd5-98e": "huoshan/ark-code-latest @ no-preset @ p2-ark-r1",
+    "94105e74-2a4": "huoshan/ark-code-latest @ no-preset @ workspace",
     "978ea39c-41e": "huoshan/ark-code-latest @ no-preset @ p2-m1-5",
     "97ef7db2-62f": "huoshan/ark-code-latest @ no-preset @ p2-m1-8",
     "99265511-66e": "huoshan/ark-code-latest @ no-preset @ workspace",
@@ -1421,6 +1425,7 @@
     "aac602bc-4f0": "huoshan/ark-code-latest @ no-preset @ p2-m1-4",
     "ae4dd628-239": "deepseek-official/deepseek-v4-pro @ no-preset @ workspace",
     "b284dc27-c6e": "huoshan/ark-code-latest @ no-preset @ p2-m1-7",
+    "b42c7978-d2c": "huoshan/ark-code-latest @ no-preset @ workspace",
     "b5399480-835": "deepseek-official/deepseek-v4-pro @ no-preset @ workspace",
     "b9efb6ff-307": "deepseek-official/deepseek-v4-pro @ no-preset @ none",
     "bb31dbcd-297": "vision-toolkit-deepseek-official/deepseek-v4-flash @ no-preset @ cf-b3",
@@ -1434,6 +1439,7 @@
     "c4d89e1d-bcb": "huoshan/ark-code-latest @ no-preset @ p2-m1-6",
     "c4e60e20-a6e": "huoshan/ark-code-latest @ no-preset @ p2-m0-6",
     "c4f70ea5-eab": "vision-toolkit-deepseek-official/deepseek-v4-flash @ no-preset @ cp-r2",
+    "c69a8537-3d1": "huoshan/ark-code-latest @ no-preset @ workspace",
     "c76609d8-bb7": "huoshan/ark-code-latest @ no-preset @ p2-ark-b1",
     "c81522cb-ada": "deepseek-official/deepseek-v4-pro @ no-preset @ none",
     "c84ac680-698": "huoshan/ark-code-latest @ no-preset @ p2-gap3-a1",
@@ -1447,9 +1453,11 @@
     "d84da6ed-8f1": "deepseek-official/deepseek-v4-pro @ no-preset @ none",
     "d94b66d9-839": "huoshan/ark-code-latest @ no-preset @ p2-ark-a5b",
     "da49dda9-206": "huoshan/ark-code-latest @ no-preset @ p2-ark-r3",
+    "dac860d2-574": "huoshan/ark-code-latest @ no-preset @ workspace",
     "dc7f7034-a2b": "huoshan/ark-code-latest @ no-preset @ workspace",
     "dd231924-875": "huoshan/ark-code-latest @ no-preset @ p2-gap3-a3",
     "de7fe099-e13": "huoshan/ark-code-latest @ no-preset @ p2-m1-7",
+    "df6f14b5-9d2": "huoshan/ark-code-latest @ no-preset @ workspace",
     "e08d7015-ccf": "huoshan/ark-code-latest @ no-preset @ p2-m1-5",
     "e23c8909-8b1": "deepseek-official/deepseek-v4-pro @ no-preset @ none",
     "e31d7144-a83": "huoshan/ark-code-latest @ no-preset @ t03",
@@ -1508,26 +1516,26 @@
     {
       "channel": "repetition",
       "alpha": 0.01,
-      "sessions": 182,
-      "sessionsWithFamilyPrior": 182,
-      "noPrior": 0.1813186813186813,
-      "familyPrior": 0.2032967032967033
+      "sessions": 190,
+      "sessionsWithFamilyPrior": 190,
+      "noPrior": 0.1736842105263158,
+      "familyPrior": 0.19473684210526315
     },
     {
       "channel": "failure",
       "alpha": 0.01,
-      "sessions": 182,
-      "sessionsWithFamilyPrior": 182,
-      "noPrior": 0.2087912087912088,
-      "familyPrior": 0.2087912087912088
+      "sessions": 190,
+      "sessionsWithFamilyPrior": 190,
+      "noPrior": 0.2,
+      "familyPrior": 0.19473684210526315
     },
     {
       "channel": "inaction",
       "alpha": 0.01,
-      "sessions": 182,
-      "sessionsWithFamilyPrior": 182,
-      "noPrior": 0.06043956043956044,
-      "familyPrior": 0.06043956043956044
+      "sessions": 190,
+      "sessionsWithFamilyPrior": 190,
+      "noPrior": 0.05789473684210526,
+      "familyPrior": 0.05789473684210526
     }
   ]
 }

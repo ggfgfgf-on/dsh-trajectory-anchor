@@ -512,6 +512,42 @@ await boot({ deliveryArtifactStateGate: true })
   const row = await summaryOf('pg-q1p2e')
   check('Q1p2 开：多个候选时最浅命中优先', row.artifactBinding && row.artifactBinding.path === rootArt, JSON.stringify(row.artifactBinding))
 }
+// ── Q1''' 会话 cwd 捕获 + workdir 定位（§49.5 探针结论的修法）────────────────
+await boot({ deliveryArtifactStateGate: true })
+{
+  // 探针 m1q-1 场景：子代理的会话 cwd = 其 run workspace，验证命令纯相对路径
+  // （artifacts 为空）——捕获 session.header.cwd 后，相对路径与 cwd 都能指认工件。
+  const fix = mkdtempSync(join(tmpdir(), 'pg-q1p3-'))
+  const ws = join(fix, 'workspace')
+  const pt = join(ws, 'project2_task')
+  mkdirSync(pt, { recursive: true })
+  const art = join(pt, 'PULL_REQUEST_TEMPLATE.md')
+  writeFileSync(art, '# seed\n')
+  const sid = 'pg-q1p3'
+  const agent = { id: sid, session: { id: sid, events: [], header: { cwd: ws } }, ctx: { tools: { schemas: () => [], restrict: () => () => {} } } }
+  agentsById.set(sid, agent)
+  dispatch('agent/created', { agent })
+  const session = { id: sid }
+  sessionEvent(session, verifyCall(1, 1, 'python tests/run_public_tests.py project2_task'))
+  sessionEvent(session, verifyResult(1, 1, FAIL_TEXT))
+  const row = await summaryOf(sid)
+  check('Q1p3 开：会话 cwd 捕获 + 纯相对路径验证 ⇒ 绑定（探针 m1q-1 场景）',
+    row.artifactBinding && row.artifactBinding.path === art, JSON.stringify(row.artifactBinding))
+}
+await boot({ deliveryArtifactStateGate: true })
+{
+  // workdir 参数是比 cwd 更精确的定位线索：直接指认工件目录。
+  const fix = mkdtempSync(join(tmpdir(), 'pg-q1p3b-'))
+  const pt = join(fix, 'project2_task')
+  mkdirSync(pt, { recursive: true })
+  const art = join(pt, 'PULL_REQUEST_TEMPLATE.md')
+  writeFileSync(art, '# seed\n')
+  const { session } = makeAgent('pg-q1p3b')
+  sessionEvent(session, { type: 'tool/call', data: { turn: 1, step: 1, name: 'pwsh', arguments: JSON.stringify({ command: 'python tests/run_public_tests.py project2_task', workdir: fix }) } })
+  sessionEvent(session, verifyResult(1, 1, FAIL_TEXT))
+  const row = await summaryOf('pg-q1p3b')
+  check('Q1p3 开：验证调用的 workdir 参数 ⇒ 绑定', row.artifactBinding && row.artifactBinding.path === art, JSON.stringify(row.artifactBinding))
+}
 {
   // 纯函数负向对照：状态变化三轴（sha/size/mtime）各自触发、fail-open、删除 vs 读失败。
   const b = { path: '/x/PULL_REQUEST_TEMPLATE.md', sha: 'a'.repeat(64), size: 10, mtimeMs: 1000, turn: 1, step: 1, failed: false, failCount: null, verifyCmd: 'python evaluator/run_public_tests.py' }

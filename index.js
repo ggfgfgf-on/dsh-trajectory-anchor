@@ -313,26 +313,33 @@ function findDeliveryArtifact(rootDir) {
   return null
 }
 
-/** 绑定目录候选：验证命令里所有的 `cd '...'`（绝对路径且存在）+ 命令路径里存在的绝对目录
- *  + 绝对**文件** artifact 的父/祖父目录（grader 脚本在 evaluator\ 下，模板在运行根深处）
- *  + 会话 cwd。 */
+/** 绑定目录候选：验证命令里所有的 `cd '...'` + 命令路径里存在的目录/文件（父与祖父）
+ *  + 会话 cwd。相对路径一律用会话 cwd 解析（Q1'''：探针实测相对路径命令是常态，
+ *  §49.5 探针结论——4/8 会话的验证命令 artifacts 为空就是因为纯相对路径）。 */
 function artifactBindingDirs(cmd) {
   const dirs = []
+  const absOrNull = (p) => {
+    if (!p) return null
+    if (isAbsolute(p)) return p
+    return typeof sessionCwd === 'string' && sessionCwd ? resolvePath(sessionCwd, p) : null
+  }
   const cdRe = /(?:^|[;&\n])\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/gi
   let m
   while ((m = cdRe.exec(cmd || ''))) {
     const d = m[1] || m[2] || m[3]
-    if (d && isAbsolute(d) && existsSync(d)) dirs.push(d)
+    const abs = absOrNull(d)
+    if (abs && existsSync(abs)) dirs.push(abs)
   }
   for (const p of commandPaths(cmd || '').slice(0, 12)) {
-    if (!p || !isAbsolute(p)) continue
+    const abs = absOrNull(p)
+    if (!abs) continue
     try {
-      const st = statSync(p)
-      if (st.isDirectory()) dirs.push(p)
+      const st = statSync(abs)
+      if (st.isDirectory()) dirs.push(abs)
       else if (st.isFile()) {
         // 文件 artifact：把父目录（evaluator\）与祖父目录（运行根）都作为候选——
         // Q1 实测里 Test-Path/直接跑 grader 脚本的验证命令都只有文件路径。
-        const parent = dirname2(p)
+        const parent = dirname2(abs)
         if (existsSync(parent)) dirs.push(parent)
         const grand = dirname2(parent)
         if (grand !== parent && existsSync(grand)) dirs.push(grand)
@@ -346,8 +353,16 @@ function artifactBindingDirs(cmd) {
 /** 验证证据落地后调用：递归找到交付工件文件就绑定 {path, mtimeMs, size, sha, failed...}。 */
 function bindDeliveryArtifact(rec, turn, step) {
   const cmd = typeof rec.lastVerifyCmd === 'string' ? rec.lastVerifyCmd : ''
+  const dirs = []
+  // Q1'''：验证调用自己的 workdir（pwsh 参数）是最精确的定位线索，放最前。
+  if (typeof rec.lastVerifyWorkdir === 'string' && rec.lastVerifyWorkdir) {
+    const wd = isAbsolute(rec.lastVerifyWorkdir) ? rec.lastVerifyWorkdir
+      : (typeof sessionCwd === 'string' && sessionCwd ? resolvePath(sessionCwd, rec.lastVerifyWorkdir) : null)
+    if (wd && existsSync(wd)) dirs.push(wd)
+  }
+  for (const d of artifactBindingDirs(cmd)) dirs.push(d)
   const seen = new Set()
-  for (const d of artifactBindingDirs(cmd)) {
+  for (const d of dirs) {
     const key = d.toLowerCase()
     if (seen.has(key)) continue
     seen.add(key)
@@ -2569,6 +2584,12 @@ function sessionHasWork(agent) {
 function adopt(agent, doAnchor, channel) {
   bump(channel)
   if (!agent || typeof agent.id !== 'string' || agent.id.length === 0) return null
+  // Q1'''：捕获会话级工作目录（exec.agent.session.header.cwd——内置 read/write 工具用的
+  // 同一个源，dsh_notes §7）。探针实测：子代理的相对路径验证/编辑都落在会话 cwd 下，
+  // 而插件此前从未捕获它 ⇒ 相对路径验证命令的工件绑定永远为空（§49.5 探针结论）。
+  if (!sessionCwd && agent.session && agent.session.header && typeof agent.session.header.cwd === 'string' && agent.session.header.cwd) {
+    sessionCwd = agent.session.header.cwd
+  }
   const existing = recs.get(agent.id)
   if (existing) return existing
   if (doAnchor && sessionHasWork(agent)) {
@@ -2648,6 +2669,7 @@ function adopt(agent, doAnchor, channel) {
     claims: [],           // 每次完成/通过声明：{turn,step,text,claimedDone,claimedPass,claimedTotal}
     lastVerifyCmd: null,  // 最近一次验证命令（结果回来时补全证据记录）
     lastVerifyKind: null,
+    lastVerifyWorkdir: null,  // Q1'''：最近一次验证调用的 workdir（相对路径命令的工件定位线索，§49.5 探针结论）
     // F3/F5 事实的镜像干预标记（served 一次性语义与 done-gap 一致）
     scopeBreachMirror: null,
     verifyStalenessMirror: null,
@@ -2720,6 +2742,7 @@ function adopt(agent, doAnchor, channel) {
   if (initiatorSessionId !== null && agent.id === initiatorSessionId) rec.adoptedSelf = true
   recs.set(rec.sessionId, rec)
   logAudit(rec, 'adopted', { channel, anchor: doAnchor, self: rec.adoptedSelf })
+  if (sessionCwd) logAudit(rec, 'session-cwd-captured', { cwd: sessionCwd })
   backfill(rec, agent)
   if (doAnchor) anchorAgent(agent, rec, channel)
   return rec
@@ -3096,6 +3119,13 @@ function noteTaskSignal(rec, event) {
     const turn = typeof d.turn === 'number' ? d.turn : null
     const step = typeof d.step === 'number' ? d.step : null
     const args = typeof d.arguments === 'string' ? d.arguments : (d.arguments === undefined ? '' : JSON.stringify(d.arguments))
+    // Q1'''：验证调用自己的工作目录（pwsh 的 workdir 参数）——探针实测 4/8 会话的验证命令
+    // 是纯相对路径（artifacts 为空），只有 workdir/会话 cwd 能指认工件目录（§49.5 探针结论）。
+    const workdirOf = (() => {
+      if (d.arguments && typeof d.arguments === 'object' && typeof d.arguments.workdir === 'string') return d.arguments.workdir
+      const m = args.match(/"workdir"\s*:\s*"([^"]*)"/)
+      return m ? m[1] : null
+    })()
     // 命令文本：优先解码，抽不到就用**原始参数文本**兜底。
     // 为什么必须有兜底（实测踩到，属于"能力其实没在跑"的那一类）：真实会话里的命令常是多行
     // PowerShell 脚本、内含转义引号，此时 `"command"\s*:\s*"([^"]*)"` 只截到一个片段——
@@ -3150,6 +3180,7 @@ function noteTaskSignal(rec, event) {
       // （通过/失败都要记：F5 要的是"验证过哪些工件、什么时候验证的"，与过没过无关）。
       rec.lastVerifyCmd = String(cmdDecoded || args).slice(0, 300)
       rec.lastVerifyKind = observedKind || (fromPrompt ? 'prompt-token' : null)
+      rec.lastVerifyWorkdir = workdirOf || null
       if (rec.codeEditsAfterVerify.length > 0) {
         logAudit(rec, 'verify-run', { turn, step, clearedEdits: rec.codeEditsAfterVerify.length, cmd: String(cmdDecoded || args).slice(0, 160) })
       }

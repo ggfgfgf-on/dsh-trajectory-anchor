@@ -1,11 +1,11 @@
 {
-  "generatedAtUtc": "2026-10-11T18:11:28.958Z",
+  "generatedAtUtc": "2026-10-11T18:27:37.641Z",
   "scope": {
     "pluginVersion": "0.5.1",
     "release": "B3-calibration",
     "taskFamily": "dsh-sessions"
   },
-  "corpusFingerprint": "sessions:281:551193747:1791742135216",
+  "corpusFingerprint": "sessions:289:554389880:1791743101999",
   "calibration": {
     "withFamilyPrior": true,
     "priorStrength": 20,
@@ -23,12 +23,12 @@
       "derived": {
         "consecutive": 1,
         "alpha": 0.005,
-        "sessionHitRate": 0.02197802197802198
+        "sessionHitRate": 0.021052631578947368
       },
       "derivedWithFamilyPrior": {
         "consecutive": 1,
         "alpha": 0.0001,
-        "sessionHitRate": 0.016483516483516484
+        "sessionHitRate": 0.015789473684210527
       },
       "recallSide": {
         "feasibleOperatingPoints": 8,
@@ -53,17 +53,17 @@
         {
           "consecutive": 1,
           "alpha": 0.0001,
-          "sessionHitRate": 0.016483516483516484
+          "sessionHitRate": 0.015789473684210527
         },
         {
           "consecutive": 2,
           "alpha": 0.0001,
-          "sessionHitRate": 0.016483516483516484
+          "sessionHitRate": 0.015789473684210527
         },
         {
           "consecutive": 3,
           "alpha": 0.0001,
-          "sessionHitRate": 0.01098901098901099
+          "sessionHitRate": 0.010526315789473684
         },
         {
           "consecutive": 1,
@@ -105,12 +105,12 @@
       "derived": {
         "consecutive": 1,
         "alpha": 0.0001,
-        "sessionHitRate": 0.038461538461538464
+        "sessionHitRate": 0.03684210526315789
       },
       "derivedWithFamilyPrior": {
         "consecutive": 1,
         "alpha": 0.0001,
-        "sessionHitRate": 0.03296703296703297
+        "sessionHitRate": 0.031578947368421054
       },
       "recallSide": {
         "feasibleOperatingPoints": 4,
@@ -135,32 +135,32 @@
         {
           "consecutive": 2,
           "alpha": 0.001,
-          "sessionHitRate": 0.03296703296703297
+          "sessionHitRate": 0.031578947368421054
         },
         {
           "consecutive": 3,
           "alpha": 0.001,
-          "sessionHitRate": 0.02197802197802198
+          "sessionHitRate": 0.021052631578947368
         },
         {
           "consecutive": 1,
           "alpha": 0.0001,
-          "sessionHitRate": 0.03296703296703297
+          "sessionHitRate": 0.031578947368421054
         },
         {
           "consecutive": 2,
           "alpha": 0.0001,
-          "sessionHitRate": 0.016483516483516484
+          "sessionHitRate": 0.015789473684210527
         },
         {
           "consecutive": 3,
           "alpha": 0.0001,
-          "sessionHitRate": 0.01098901098901099
+          "sessionHitRate": 0.010526315789473684
         },
         {
           "consecutive": 1,
           "alpha": 0.00001,
-          "sessionHitRate": 0.005494505494505495
+          "sessionHitRate": 0.005263157894736842
         },
         {
           "consecutive": 2,
@@ -219,22 +219,22 @@
         {
           "consecutive": 3,
           "alpha": 0.005,
-          "sessionHitRate": 0.038461538461538464
+          "sessionHitRate": 0.03684210526315789
         },
         {
           "consecutive": 3,
           "alpha": 0.001,
-          "sessionHitRate": 0.02197802197802198
+          "sessionHitRate": 0.021052631578947368
         },
         {
           "consecutive": 1,
           "alpha": 0.0001,
-          "sessionHitRate": 0.03296703296703297
+          "sessionHitRate": 0.031578947368421054
         },
         {
           "consecutive": 2,
           "alpha": 0.0001,
-          "sessionHitRate": 0.016483516483516484
+          "sessionHitRate": 0.015789473684210527
         },
         {
           "consecutive": 3,
@@ -277,7 +277,7 @@
   "negativeControl": {
     "channel": "inaction",
     "variant": "turn-end-exclusion-removed",
-    "nullSessionRate": 0.10989010989010989,
+    "nullSessionRate": 0.10526315789473684,
     "expected": "unfit",
     "observed": "unfit"
   },
