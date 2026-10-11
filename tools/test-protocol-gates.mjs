@@ -226,6 +226,45 @@ await boot({ claimFormatContract: true })
   check('P3 ⑩ 反向：无格式声明 ⇒ 不要求', section(out, 'trajectory-anchor:claim-format') === undefined, JSON.stringify((out.sections || []).map((s) => s.name)))
 }
 
+// ── Q4 会话内编辑预算（process-front-loaded）───────────────────────────────
+await boot({ editBudgetCap: 3 })
+{
+  const { session } = makeAgent('pg-q4')
+  sessionEvent(session, verifyCall(1, 1, 'python -X utf8 evaluator/run_hidden_tests.py'))
+  sessionEvent(session, verifyResult(1, 1, PASS_TEXT))
+  sessionEvent(session, editCall(1, 2, 'gateway/auth.py', 'q1'))
+  sessionEvent(session, editOk(1, 2, 'q1'))
+  sessionEvent(session, editCall(1, 3, 'gateway/gateway.py', 'q2'))
+  sessionEvent(session, editOk(1, 3, 'q2'))
+  const out1 = await assemble('pg-q4')
+  check('Q4 反向：2 次改动（预算 3）⇒ 不注入', section(out1, 'trajectory-anchor:edit-budget') === undefined, JSON.stringify((out1.sections || []).map((s) => s.name)))
+  sessionEvent(session, editCall(1, 4, 'gateway/db.py', 'q3'))
+  sessionEvent(session, editOk(1, 4, 'q3'))
+  const out2 = await assemble('pg-q4')
+  const sec = section(out2, 'trajectory-anchor:edit-budget')
+  const row = await summaryOf('pg-q4')
+  check('Q4 开：第 3 次改动 ⇒ 注入"评分并交付"', sec !== undefined && /Stop editing/.test(sec.text), sec && sec.text.slice(0, 150))
+  check('Q4 开：状态可见（exhausted、count=3）', row.editBudget && row.editBudget.exhausted === true && row.editBudget.count === 3, JSON.stringify(row.editBudget))
+  const out3 = await assemble('pg-q4')
+  check('Q4 开：**只注一次**', section(out3, 'trajectory-anchor:edit-budget') === undefined, JSON.stringify((out3.sections || []).map((s) => s.name)))
+}
+await boot({ editBudgetCap: 3 })
+{
+  const { session } = makeAgent('pg-q4-retract')
+  sessionEvent(session, verifyCall(1, 1, 'python -X utf8 evaluator/run_hidden_tests.py'))
+  sessionEvent(session, verifyResult(1, 1, PASS_TEXT))
+  sessionEvent(session, editCall(1, 2, 'gateway/auth.py', 'r1'))
+  sessionEvent(session, editFail(1, 2, 'r1'))   // 被拒 ⇒ 不占预算
+  sessionEvent(session, editCall(1, 3, 'gateway/gateway.py', 'r2'))
+  sessionEvent(session, editFail(1, 3, 'r2'))   // 被拒 ⇒ 不占预算
+  sessionEvent(session, editCall(1, 4, 'gateway/db.py', 'r3'))
+  sessionEvent(session, editOk(1, 4, 'r3'))
+  const out = await assemble('pg-q4-retract')
+  const row = await summaryOf('pg-q4-retract')
+  check('Q4 反向：2 次被拒 + 1 次落地 ⇒ count=1、不注入',
+    section(out, 'trajectory-anchor:edit-budget') === undefined && row.editBudget.count === 1, JSON.stringify(row.editBudget))
+}
+
 // ── 纯函数负向对照 ──────────────────────────────────────────────────────────
 {
   const claim = { turn: 1, step: 3, claimedDone: true, claimedPass: null }

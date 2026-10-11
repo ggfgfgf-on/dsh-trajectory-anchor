@@ -155,6 +155,21 @@ await boot({ evidenceContradictionMirror: true })
   check('F7 ⑦ 反向：无验证证据 ⇒ 不注', section(out, 'trajectory-anchor:evidence-contradiction') === undefined, JSON.stringify((out.sections || []).map((s) => s.name)))
 }
 
+// ── F7 ⑧ 开：**文本型**全过声称（all tests pass）+ 最后验证失败 ⇒ 注（回放门加宽）──
+await boot({ evidenceContradictionMirror: true })
+{
+  const { session } = makeAgent('f7-text')
+  sessionEvent(session, verifyCall(1, 1))
+  sessionEvent(session, verifyResult(1, 1, FAIL_TEXT))
+  sessionEvent(session, doneEvent(1, 2, 'The task is done, all tests pass.'))
+  const out = await assemble('f7-text')
+  const sec = section(out, 'trajectory-anchor:evidence-contradiction')
+  const row = await summaryOf('f7-text')
+  check('F7 ⑧ 开：文本型全过声称 + 失败验证 ⇒ 注矛盾段',
+    sec !== undefined && /claims a full pass/.test(sec.text) && /test_voice_bridge/.test(sec.text), sec && sec.text.slice(0, 160))
+  check('F7 ⑧ 开：状态可见（reason=claim-perfect-but-verify-failed）', row.evidenceContradictionMirror && row.evidenceContradictionMirror.reason === 'claim-perfect-but-verify-failed', JSON.stringify(row.evidenceContradictionMirror))
+}
+
 // ── 纯函数负向对照 ──────────────────────────────────────────────────────────
 {
   const claim = { turn: 1, step: 2, claimedDone: true, claimedPass: 45, claimedTotal: 45 }
@@ -167,6 +182,12 @@ await boot({ evidenceContradictionMirror: true })
   check('纯函数 F7：声称未满分 ⇒ 翻掉', flipPartial.contradiction === false && flipPartial.reason === 'not-claiming-perfection', JSON.stringify(flipPartial))
   const flipNoVerify = evidenceContradiction({ claim, verifyEvidence: [] })
   check('纯函数 F7：零验证 ⇒ 翻掉', flipNoVerify.contradiction === false && flipNoVerify.reason === 'no-verification-evidence', JSON.stringify(flipNoVerify))
+  const textual = evidenceContradiction({ claim: { ...claim, claimedPass: null, claimedTotal: null, text: 'The task is done, all tests pass.' }, verifyEvidence: failed })
+  check('纯函数 F7：文本型全过声称 ⇒ 矛盾（加宽后）', textual.contradiction === true, JSON.stringify(textual))
+  const textualPassed = evidenceContradiction({ claim: { ...claim, claimedPass: null, claimedTotal: null, text: 'all tests pass' }, verifyEvidence: [{ ...failed[0], failed: false }] })
+  check('纯函数 F7：文本型声称 + 验证通过 ⇒ 翻掉', textualPassed.contradiction === false && textualPassed.reason === 'last-verify-passed', JSON.stringify(textualPassed))
+  const textualNeutral = evidenceContradiction({ claim: { ...claim, claimedPass: null, claimedTotal: null, text: 'some tests still fail' }, verifyEvidence: failed })
+  check('纯函数 F7：文本不是全过 ⇒ 翻掉', textualNeutral.contradiction === false && textualNeutral.reason === 'not-claiming-perfection', JSON.stringify(textualNeutral))
   const f6base = unsupportedClaim({ claim, verifyEvidence: [] })
   check('纯函数 F6：零验证 + 宣告 ⇒ 无出处', f6base.unsupported === true && f6base.reason === 'no-verification-evidence', JSON.stringify(f6base))
   const f6has = unsupportedClaim({ claim, verifyEvidence: failed })

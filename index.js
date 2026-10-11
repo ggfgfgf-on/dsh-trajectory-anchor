@@ -78,6 +78,8 @@ const DEFAULTS = {
   // ── F6/F7 事实镜像（criteria 设计第二波；默认关）────────────────────────────
   unsupportedClaimMirror: false,   // F6：交付声称结局但全会话零验证证据 ⇒ 回放"你的断言没有出处"
   evidenceContradictionMirror: false, // F7：声称全过但最后一次验证仍带失败 ⇒ 回放矛盾证据
+  // ── process-front-loaded（docs/design-process-gate.md，默认关）────────────────
+  editBudgetCap: 0,               // Q4 会话内编辑预算：落地代码改动上限；0=关。耗尽后注入"现在评分并交付"
   bootstrapTools: ['bash', 'str_replace_editor', 'pwsh'],
   bootstrapMaxTokens: null,
   bootstrapPersona: 'You are a helpful software engineer assistant.',
@@ -2536,6 +2538,8 @@ function adopt(agent, doAnchor, channel) {
     // F6/F7 事实镜像状态（默认关）
     unsupportedClaimMirror: null,      // { served, via, reason }
     evidenceContradictionMirror: null, // { served, via, reason, evidence }
+    // Q4 会话内编辑预算（0=关）
+    editBudget: { count: 0, exhausted: false, served: false },
     /** 待发出的拉回原因（工具调用时置位，pre-step 时消费；保证"触发点=说出口的点"）。 */
     pendingPullback: null,
     pullback: {
@@ -2820,7 +2824,7 @@ function feedSessionEvent(session, event) {
           // F7 证据矛盾（criteria 第二波）：声称全过但最后一次验证仍带失败 ⇒ 挂标记。
           if (!rec.evidenceContradictionMirror && CONFIG.evidenceContradictionMirror === true) {
             const x = evidenceContradiction({
-              claim: { turn: turn ?? null, step: step ?? null, claimedDone: c.claimedDone === true, claimedPass: c.claimedPass, claimedTotal: c.claimedTotal },
+              claim: { turn: turn ?? null, step: step ?? null, claimedDone: c.claimedDone === true, claimedPass: c.claimedPass, claimedTotal: c.claimedTotal, text: claimText.slice(0, 300) },
               verifyEvidence: rec.verifyEvidence,
             })
             if (x.contradiction === true) {
@@ -3032,13 +3036,25 @@ function noteTaskSignal(rec, event) {
       rec.edits.push({ turn, step, tool: name, path, invalidates: changeInvalidatesVerification(path), at: Date.now() })
       if (rec.edits.length > 100) rec.edits.shift()
       arm.editCount += 1
+      // P2/Q4 共用"落地代码改动"口径：arm 先记 invalidatingCount（供成功门撤回），
+      // 两个预算各自独立计数（P2 按间隔注入、Q4 按会话上限）。
+      if (changeInvalidatesVerification(path)) {
+        arm.invalidatingCount = (arm.invalidatingCount || 0) + 1
+      }
       // P2 改后必验预算（phase 2）：每 verifyBudgetEvery 次落地代码改动 ⇒ 组装期注入一次强制重验
       if (CONFIG.verifyAfterEditBudget === true && changeInvalidatesVerification(path)) {
-        arm.invalidatingCount = (arm.invalidatingCount || 0) + 1
         rec.verifyBudget.count += 1
         if (rec.verifyBudget.count >= CONFIG.verifyBudgetEvery && !rec.verifyBudget.armed) {
           rec.verifyBudget.armed = true
           logAudit(rec, 'verify-budget-armed', { count: rec.verifyBudget.count, turn, step })
+        }
+      }
+      // Q4 会话内编辑预算（process-front-loaded）：落地代码改动计入上限，耗尽即挂"评分并交付"
+      if (CONFIG.editBudgetCap > 0 && changeInvalidatesVerification(path)) {
+        rec.editBudget.count += 1
+        if (rec.editBudget.count >= CONFIG.editBudgetCap && !rec.editBudget.exhausted) {
+          rec.editBudget.exhausted = true
+          logAudit(rec, 'edit-budget-exhausted', { count: rec.editBudget.count, cap: CONFIG.editBudgetCap, turn, step })
         }
       }
       if (scopeKnown && !inScope(path, anchors)) {
@@ -3129,6 +3145,8 @@ function retractArm(rec, event) {
     if ((a.invalidatingCount || 0) > 0) {
       rec.verifyBudget.count = Math.max(0, rec.verifyBudget.count - a.invalidatingCount)
       if (rec.verifyBudget.count < CONFIG.verifyBudgetEvery) rec.verifyBudget.armed = false
+      // Q4 同口径：被拒的写不占编辑预算（耗尽态不回溯——一旦耗尽就保持"评分并交付"）。
+      if (CONFIG.editBudgetCap > 0) rec.editBudget.count = Math.max(0, rec.editBudget.count - a.invalidatingCount)
     }
     if (a.addedEdit) {
       const last = rec.codeEditsAfterVerify[rec.codeEditsAfterVerify.length - 1]
@@ -3281,6 +3299,7 @@ function summaryOf(rec) {
     claimFormat: rec.claimFormat ? { served: rec.claimFormat.served === true, via: rec.claimFormat.via || null } : null,
     unsupportedClaimMirror: rec.unsupportedClaimMirror ? { served: rec.unsupportedClaimMirror.served === true, via: rec.unsupportedClaimMirror.via || null, reason: rec.unsupportedClaimMirror.reason || null } : null,
     evidenceContradictionMirror: rec.evidenceContradictionMirror ? { served: rec.evidenceContradictionMirror.served === true, via: rec.evidenceContradictionMirror.via || null, reason: rec.evidenceContradictionMirror.reason || null } : null,
+    editBudget: { count: rec.editBudget.count, exhausted: rec.editBudget.exhausted === true, served: rec.editBudget.served === true },
     evidence: {
       verifyEvidence: rec.verifyEvidence.length,
       edits: rec.edits.length,
@@ -3450,6 +3469,7 @@ function buildSummary(filter) {
       claimFormatContract: CONFIG.claimFormatContract === true,
       unsupportedClaimMirror: CONFIG.unsupportedClaimMirror === true,
       evidenceContradictionMirror: CONFIG.evidenceContradictionMirror === true,
+      editBudgetCap: CONFIG.editBudgetCap,
       reanchorEnabled: CONFIG.reanchorEnabled === true,
       reanchorEvidencePath: CONFIG.reanchorEvidencePath || null,
       pullbackOutcomePath: CONFIG.pullbackOutcomePath || null,
@@ -4156,6 +4176,26 @@ export function apply(ctx, config) {
       return next({ ...out, sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections })
     } catch (e) {
       warnOnce(`evidence-contradiction mirror failed, skipping: ${msg(e)}`)
+      return next(out)
+    }
+  }))
+
+  // ---- Q4 会话内编辑预算（process-front-loaded）：耗尽后注入"现在评分并交付" ----
+  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
+    try {
+      const id = payload && payload.agent && payload.agent.id
+      const rec = id ? recs.get(id) : null
+      if (!rec) return next(out)
+      if (CONFIG.editBudgetCap <= 0 || !rec.editBudget.exhausted || rec.editBudget.served === true) return next(out)
+      rec.editBudget.served = true
+      const section = {
+        name: 'trajectory-anchor:edit-budget',
+        text: `[trajectory-anchor] Edit budget exhausted (${rec.editBudget.count}/${CONFIG.editBudgetCap} landed code edits). `
+          + 'Stop editing. Run the grading command now, quote its output, and deliver.',
+      }
+      return next({ ...out, sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections })
+    } catch (e) {
+      warnOnce(`edit budget failed, skipping: ${msg(e)}`)
       return next(out)
     }
   }))
