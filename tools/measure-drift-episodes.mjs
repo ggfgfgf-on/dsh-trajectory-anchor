@@ -108,15 +108,21 @@ if (openOnes.length) console.log(`仍未恢复的片段：n=${openOnes.length}  
 console.log(`\n=== 次口径：工具面收窄片段（surface narrowed → stable；P1 之后才有）===`)
 console.log(`  n=${surfClosed.length}${surfClosed.length ? `  p50=${q(surfClosed, 0.5)} p90=${q(surfClosed, 0.9)}` : '（能力层关着 ⇒ 预期为 0；第一次实现只看这个口径，才误判成"零样本"）'}`)
 
-const plan = { p50: 5, p75: 9, p90: 12, p95: 19, max: 22, episodes: 53 }
-console.log(`\n=== 与计划书声称的反解结果对照（README: 45 会话 / 3299 步 / 53 片段）===`)
-console.log(`  计划书: p50=${plan.p50} p75=${plan.p75} p90=${plan.p90} p95=${plan.p95} max=${plan.max}（${plan.episodes} 片段）`)
+const plan = { p50: 9, p75: 34, p90: 43, p95: 43, max: 122, episodes: 24, note: '2026-10-11 现定义（state drift → stable）在 235 会话上的重反解；默认 maxDriftSteps 即取此 p95' }
+console.log(`\n=== 与现行默认的反解依据对照（index.js 注释 + driftEpisodes.json 随包发布）===`)
+console.log(`  现行依据: p50=${plan.p50} p75=${plan.p75} p90=${plan.p90} p95=${plan.p95} max=${plan.max}（${plan.episodes} 片段）`)
 console.log(`  本次实测: p50=${q(closed, 0.5)} p75=${q(closed, 0.75)} p90=${q(closed, 0.9)} p95=${q(closed, 0.95)} max=${closed[closed.length - 1] ?? null}（${closed.length} 片段）`)
 
 const rec = closed.length >= 8
   ? Math.max(4, q(closed, 0.95))                 // 上界至少要覆盖 95% 的自然片段
   : null
-console.log(`\n反解建议：maxDriftSteps ≥ p95(自然片段) = ${rec === null ? '样本不足（<8 个自然片段）' : rec}    当前出厂值：12`)
+// 现行出厂值直接读 index.js 的 DEFAULTS（不硬编码，避免"工具说 12、代码说 43"各说各话）
+let shipped = null
+try {
+  const src = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../index.js'), 'utf8')
+  shipped = /maxDriftSteps: (\d+)/.exec(src)?.[1] ?? null
+} catch { shipped = null }
+console.log(`\n反解建议：maxDriftSteps ≥ p95(自然片段) = ${rec === null ? '样本不足（<8 个自然片段）' : rec}    当前出厂值：${shipped ?? '?'}`)
 
 writeFileSync(`${outPrefix}.json`, JSON.stringify({
   generatedAtUtc: new Date().toISOString(),

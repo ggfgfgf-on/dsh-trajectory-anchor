@@ -233,14 +233,16 @@ const DEFAULTS = {
   feedbackExploreAfterSessions: 30,
   // P6 不变量：收窄态的步数硬上限（退出条件必然可达）。0 = 关闭该上限（不推荐）。
   // 到顶后本漂移片段内禁止再次收窄，直到检验不再触发（片段结束）才复位。
-  // 取值来源（不是拍脑袋）：45 个历史会话 / 3299 步关上限回放得到的自然片段长度
-  //   p50=5  p75=9  p90=12  p95=19  p99=22  max=22
-  // → 12 = 自然长度的 p90，即"给证据与它在 90% 情形下自然需要的时间一样长"，
-  //   只截断尾部 5/53 个片段（见 D:\DSHwork\scratch\derive-max-drift-steps.mjs）。
+  // 取值来源（不是拍脑袋）：2026-10-11 按**现定义**（`state drift → stable` 自然片段，
+  //   tools/measure-drift-episodes.mjs → driftEpisodes.json）在 235 个会话上重反解：
+  //   自然恢复片段 n=24：p50=9  p75=34  p90=43  p95=43  max=122；仍有 32 个片段在日志
+  //   结束时未恢复（正是上界要兜住的形态）。旧值 12（旧定义"degraded run"的 p90）会
+  //   截断 45.8% 的自然片段——上限的意义是给自然恢复留足时间，截断自然恢复就本末倒置。
+  //   → 43 = 现定义自然片段长度的 p95（上界至少要覆盖 95% 的自然片段）。
   // 角色分工：本上限是**安全界**（必须存在、必须可达）；真正的预算杠杆是**误触发率**
   //   （由 tools/calibrate-response-policy.mjs 的 G1 门禁管）。标定件
   //   （responsePolicy.json）可按同一分位法重算该值并覆盖此默认。
-  maxDriftSteps: 12,
+  maxDriftSteps: 43,
   historyCap: 200,
   leanDenyPatterns: [
     'vision_*', 'browser_*', 'sandbox_*', 'desktop_*',

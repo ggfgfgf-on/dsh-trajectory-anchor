@@ -122,7 +122,7 @@ agent/disposed: RewardAnnotator process reward + trajectory JSONL final archive
 | `responsePolicyPath` | `null` | calibration artifact (`responsePolicy.json`) that decides which channels may act; `TRAJECTORY_ANCHOR_POLICY_PATH` is an equivalent source. Missing / unparseable / expired / `verdict ≠ PASS` ⇒ observe-only |
 | `measurementSafe` | `false` | evaluation protection: `true` forces observe-only (both layers), so a measured score cannot be attributed to the plugin |
 | `autoDemoteWindow` / `autoDemoteBudget` | `20` / `0.05` | online self-check: if more than `autoDemoteBudget` of the last `autoDemoteWindow` finished sessions narrowed, the plugin demotes **itself** to observe-only and writes an `auto-demote` audit event |
-| `maxDriftSteps` | `12` | hard bound on any narrowed episode — the exit condition that is **provably reachable**. ⚠ **The value is inherited, not current**: it was derived from the *previous* drift definition ("degraded run" = consecutive bottom-quartile steps, mean 4.27 steps; replaying 45 sessions / 3,299 steps gave p50=5, p75=9, **p90=12**, p95=19, max=22). The drift decision was redesigned twice since, and the quantity this bound actually limits today is *steps with a narrowed tool surface* — which has **zero observed samples** while the capability layer is closed. What *is* measurable today is the neighbouring quantity (drift-state episodes, `tools/measure-drift-episodes.mjs` → `driftEpisodes.json`): **p50=19, p75=40, p90=43, p95=56, max=122 over 14 natural episodes, with 32 episodes never closing at log end** — i.e. the pre-fix machine was far stickier than the inherited number suggests (64% of those episodes exceed 12). A re-derivation must wait for post-trial surface episodes; until then the value is a *safety bound* whose provenance is documented here rather than re-invented (invariant C26 tracks it as a debt) |
+| `maxDriftSteps` | `43` | hard bound on any narrowed episode — the exit condition that is **provably reachable**. Derived from the **current** definition (`state drift → stable` natural episodes, `tools/measure-drift-episodes.mjs` → `driftEpisodes.json`, 235 sessions / 24 natural episodes): p50=9, p75=34, p90=43, **p95=43**, max=122 — so 43 = p95 of natural recovery (the old value 12, from the previous "degraded run" definition, truncated 45.8% of naturally recovering episodes). 32 episodes still open at log end are exactly the shape the bound must contain |
 | `rollbackEnabled` / `notifyEnabled` | **`false` / `false`** | capability / notification switches. Both default OFF (observe-only) because the calibration measured the lexicon signal's session-level false-trigger rate at 15.9% (α=0.001) / 43.2% (α=0.01) — far above a 5% budget. See "Response policy" below |
 | `pullbackEnabled` / `pullbackMaxPerSession` | **`false`** / `3` | the informational pull-back (L1): advisories near the point of action when an out-of-scope write or an unverified code change is detected. Off by default because its mechanism is verified while its *effect* is not measurable from this corpus (there is no labelable drift in it) |
 | `reanchorEnabled` / `reanchorEvidencePath` | **`false`** / `null` | re-anchoring (L2): puts the first-round Minimal payload back near the point of action. Requires an online-evidence artifact (`verdict: PASS-online`, unexpired, non-synthetic) **and** that L1 already spoke; once per session |
@@ -834,8 +834,9 @@ Consequently the capability layer ships **closed**: the shipped calibration arti
 artifact itself; opening it requires an explicit artifact or a hand-run trial release. That is a
 measurement result, not an unfinished feature.
 
-**3. Not measured: whether anchoring improves the *outcome* ("防降智") — no evidence either way.**
-Two attempts to measure it from the existing corpus failed for structural reasons:
+**3. Measured (intervention A/B, n=8 pairs, ark × Project2, pre-registered): the mechanisms act;
+no attributable outcome effect so far.** Earlier attempts to measure from the observational corpus
+failed for structural reasons:
 
 - *Clean outcome* (did the session's last verification pass?) over 78 sessions: **pass 20 / fail 0**
   — there is no contrast, so nothing can be predicted from it.
@@ -843,19 +844,30 @@ Two attempts to measure it from the existing corpus failed for structural reason
   proxy**: anchor appearance rises 4% → 20% → 100% across <100 / 100–300 / ≥300-step buckets, with
   ρ(anchors, steps) = 0.53–0.68.
 
-So the observational corpus cannot answer the question, and the honest status is: **the mechanism
-demonstrably acts; its benefit is unproven.** "Not measured" is *not* "ineffective" — the null
-result that would license removal has not been obtained either. What exists instead is the
-instrument for answering it: `D:\DSHwork\anchor-bench\` (fixed multi-module tasks with a
-machine-readable score, a paired analyzer, and an outcome extractor that re-runs the *pristine*
-tests so an agent cannot score by editing them). Running it needs the anchoring switch flipped in
-the host composition, i.e. two phases with a restart, plus enough runs per arm that the outcome
-has variance.
+So an intervention experiment replaced the observational question (fixed task × arms, paired
+sign-flip permutation, firing-rate gate before any score comparison). Measured results:
 
-**4. Cost side: also unmeasured.** No measurement yet of what a reminder costs — steps added
-after a pull-back, repeated edits on the same file, tokens spent on the re-anchor payload. Until
-that exists, even a positive effect result would not by itself settle whether the plugin is worth
-leaving on.
+- F3 scope-breach / F5 verify-staleness mirrors: **fired 0/8** in the intervention arm ⇒ the
+  pre-registered gate judged "manipulation failed"; scores were never compared. The criteria do
+  not match this task's failure mode.
+- **P1 delivery gate: fired 7/8 (gate passed) — the first legally comparable arm in the project.
+  Paired delta −0.25, p=0.890 ⇒ no attributable effect.** The gate visibly changed behaviour
+  (longer sessions +0.9 min, +5.9 steps, +1.6 verifies, fewer completion claims) but not the score.
+- Also measured on the P1 arm: post-refusal re-grade rate **0/7** (in 6/7 the refusal landed after
+  the final tool call — the claim is the session's last action, so there was no turn left to act).
+
+The honest status is therefore: **the mechanisms demonstrably act (fires are recorded with
+verbatim evidence); no intervention has shown an attributable outcome benefit.** "No effect at
+n=8" is *not* "ineffective" — it is the measured null on one substrate (ark × Project2). The
+instrument is `D:\DSHwork\anchor-bench\` (fixed multi-module tasks with a machine-readable score,
+a paired analyzer, an outcome extractor that re-runs the *pristine* tests, a replay gate over the
+full session corpus, and the firing-rate gate). The design's stated next lever: move the protocol
+constraints earlier into the process and raise their strength, instead of adding more
+informational text.
+
+**4. Cost side: now partially measured.** The A/B rows carry per-arm duration / steps / tool
+calls (P1 arm: +0.9 min, +5.9 steps, +6.1 tool calls per session, all p>0.1); token-level cost is
+still unmeasured. Until a positive effect exists, the cost delta is the price of the null.
 
 ## License
 

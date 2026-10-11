@@ -1,8 +1,8 @@
 # Criteria-Layer Refactor: Statistical Channels → Self-Verifiable Facts
 
-Status: **design proposal** — phase 1 of the three-part plan (criteria refactor → intervention
-upgrade → n≥8 measurement). Not implemented. Grounded in the measured state at commit `79a8fa1`
-(see the project ablation log, §§27–31).
+Status: **implemented through the second wave (F6/F7)** — see the measured-status section at the
+end. Grounded in the measured state at commit `79a8fa1` (see the project ablation log, §§27–31);
+measurement outcomes since then are in ablation-log §§32–45.
 
 ## 1. Why this refactor
 
@@ -122,3 +122,19 @@ reviewer can adjudicate each fire; precision is measured in gate 2 before any A/
 
 Phases 2 (protocol/budget actuator) and 3 (n≥8 measurement with extra metrics) build directly on
 this layer: phase 2 consumes the facts, phase 3 measures them.
+
+## 10. Measured status (post-implementation; ablation-log §§32–45)
+
+| Item | Status |
+| --- | --- |
+| F1 done-gap mirror | implemented + accepted (5/5 fire, +0.8 ns); `doneGapMirror` default off |
+| F3 scope breach / F5 verify staleness | implemented; gate-2 replay fixed 10 false positives (4 root causes); live A/B **fired 0/8 ⇒ gate verdict "manipulation failed", scores never compared** — the criteria do not match this task's failure mode |
+| F6 unsupported outcome assertion | **implemented** (second wave, commit `216738e`), default off; suite 18 cases |
+| F7 evidence contradiction | **implemented** (same commit), default off |
+| F2 itemized claim-vs-evidence, F4 plan-action divergence, F8/F9 loop/epoch | **not yet implemented** — deferred per §9's "based on measured precision" ordering; the measurement points at the claim-evidence family (F2 is the next candidate), not F8/F9 |
+| verification detector | live gap found and fixed (`c751890`): interpreter flags + `run_*` grading scripts now recognized |
+| README value proposition | re-worded to the measured state (§10 of the README itself) |
+
+The measured failure mode on the Project2 substrate is the claim-vs-evidence family (F1/F7),
+which is exactly where P1 (the delivery gate) fires; see
+`docs/design-intervention-upgrade.md`'s measured-status section for the A/B outcome.

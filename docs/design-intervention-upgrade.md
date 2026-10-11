@@ -92,3 +92,20 @@ requires it to satisfy. Risk class stays informational-plus, not capability-remo
   delivery message itself)? Reusing the section channel keeps it reversible; blocking delivery
   is a capability-plane change and needs the trial-release discipline (explicit channels, α,
   expiry).
+
+## 7. Measured status (post-implementation; ablation-log §§39–45)
+
+| Item | Result |
+| --- | --- |
+| P1/P2/P3 implementation | done (commit `ee421bd`), all default off, suite 24 cases |
+| Replay gate (241 sessions) | P1 would refuse **9/9 evidence-correct** (8.6% of claim sessions, all in the task's documented failure mode); P2 would arm in 59.7% of write sessions; P3 2× |
+| P1 A/B (n=8 pairs, pre-registered §43) | **fired 7/8 (gate ≥5/8 passed — first legally comparable arm); paired delta −0.25, p=0.890 ⇒ no attributable effect.** Behaviour changed (durMin +0.90, steps +5.88, toolCalls +6.13, verifies +1.63, claims −0.38; all p>0.1) but the score did not |
+| §43 process outcome "re-grade rate after refusal" | **0/7** — and in 6/7 the refusal landed after the session's last tool call (the claim IS the final message; the gate fires into a turn that never comes). One session (m1-6) did re-verify after the refusal |
+| F3/F5 mirrors on the same substrate | fired 0/8 ⇒ "manipulation failed" (no score comparison) — the claim-vs-evidence family, not F3/F5, is this task's failure mode |
+
+**Design consequence (next iteration):** the delivery gate must reach the agent while a turn is
+still open — e.g. arm on the claim's own turn and refuse at the *next* tool call boundary, or
+bind the refusal to the task's written delivery artifact (the PR template the task requires),
+rather than to the final chat message. Together with §37's budget observation (a 60-call budget
+lifted v4-flash from non-termination to 44–45/45), the lever is *process placement + strength*,
+not more informational text.
