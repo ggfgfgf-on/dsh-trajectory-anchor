@@ -62,6 +62,8 @@ await mod.apply(ctx, {
   // criteria 第二波事实也全开
   unsupportedClaimMirror: true,
   evidenceContradictionMirror: true,
+  // criteria 第三波（F2 分项对证）也全开
+  itemizedClaimMirror: true,
   // process-front-loaded 约束（Q1/Q2/Q4）也全开
   deliveryArtifactGate: true,
   deliveryArtifactStateGate: true,
@@ -151,6 +153,7 @@ for (const f of files) {
     claimFormat: row.claimFormat,
     unsupportedFire: row.unsupportedClaimMirror,
     contradictionFire: row.evidenceContradictionMirror,
+    itemizedFire: row.itemizedClaimMirror,
     artifactGate: row.deliveryArtifactGate,
     artifactBinding: row.artifactBinding,
     editBudget: row.editBudget,
@@ -170,6 +173,7 @@ const p2Armed = rows.filter((r) => (r.auditKinds || []).includes('verify-budget-
 const p3Fires = rows.filter((r) => r.claimFormat && r.claimFormat.served === true)
 const f6Fires = rows.filter((r) => r.unsupportedFire && r.unsupportedFire.served === true)
 const f7Fires = rows.filter((r) => r.contradictionFire && r.contradictionFire.served === true)
+const f2Fires = rows.filter((r) => r.itemizedFire && r.itemizedFire.served === true)
 const q1Fires = rows.filter((r) => r.artifactGate && r.artifactGate.served === true)
 // Q1' 回放只测**绑定武装率**（绑定捕获在验证证据路径，回放可及；开火在 pre-step，回放不派发，
 // 且历史会话的文件状态今天已不可复现——开火率只能活体审计测，process-gate §6 已写明该边界）。
@@ -193,6 +197,7 @@ console.log(`P2 改后必验武装             ${p2Armed.length} 次（${withEdi
 console.log(`P3 格式要求                 ${p3Fires.length} 次（${withClaims.length ? (p3Fires.length / withClaims.length * 100).toFixed(1) : 0}% / 有宣告会话）`)
 console.log(`F6 无出处断言               ${f6Fires.length} 次（${withClaims.length ? (f6Fires.length / withClaims.length * 100).toFixed(1) : 0}% / 有宣告会话）`)
 console.log(`F7 证据矛盾                 ${f7Fires.length} 次（${withClaims.length ? (f7Fires.length / withClaims.length * 100).toFixed(1) : 0}% / 有宣告会话）`)
+console.log(`F2 分项缺口                 ${f2Fires.length} 次（${withClaims.length ? (f2Fires.length / withClaims.length * 100).toFixed(1) : 0}% / 有宣告会话）`)
 console.log(`Q1 工件门拒绝               ${q1Fires.length} 次`)
 console.log(`Q2 编辑保持武装             ${q2Armed.length} 次（${withEdits.length ? (q2Armed.length / withEdits.length * 100).toFixed(1) : 0}% / 有落地写会话）`)
 console.log(`Q4 编辑预算耗尽             ${q4Exhausted.length} 次（${withEdits.length ? (q4Exhausted.length / withEdits.length * 100).toFixed(1) : 0}% / 有落地写会话）`)

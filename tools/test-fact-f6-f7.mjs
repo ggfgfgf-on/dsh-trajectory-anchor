@@ -12,7 +12,7 @@ import { resolve } from 'node:path'
 
 const here = fileURLToPath(new URL('.', import.meta.url))
 const mod = await import(pathToFileURL(resolve(here, process.argv[2] || '../index.js')).href)
-const { unsupportedClaim, evidenceContradiction } = await import(pathToFileURL(resolve(here, 'task-anchor-core.mjs')).href)
+const { unsupportedClaim, evidenceContradiction, itemizedClaimFacts } = await import(pathToFileURL(resolve(here, 'task-anchor-core.mjs')).href)
 
 let pass = 0
 let fail = 0
@@ -194,6 +194,61 @@ await boot({ evidenceContradictionMirror: true })
   check('纯函数 F6：有验证 ⇒ 翻掉', f6has.unsupported === false && f6has.reason === 'has-verification-evidence', JSON.stringify(f6has))
   const f6noClaim = unsupportedClaim({ claim: { ...claim, claimedDone: false, claimedPass: null }, verifyEvidence: [] })
   check('纯函数 F6：无宣告 ⇒ 翻掉', f6noClaim.unsupported === false && f6noClaim.reason === 'no-completion-claim', JSON.stringify(f6noClaim))
+}
+
+// ── F2 分项声明-证据对照（criteria 第三波）─────────────────────────────────
+await boot({ itemizedClaimMirror: true })
+{
+  // 集成：编辑支持 + 验证输出支持 ⇒ 全绿不注；含一条无证据条目 ⇒ 注清单。
+  const { session } = makeAgent('f2-ok')
+  const claimText = 'The task is done.\n- Fixed the auth hashing in `gateway/auth.py`\n- Passed `test_voice_bridge`\n- Rewrote `README.md`'
+  sessionEvent(session, { type: 'tool/call', data: { turn: 1, step: 1, name: 'edit', callId: 'e1', arguments: JSON.stringify({ file_path: 'workspace/project2_task/gateway/auth.py' }) } })
+  sessionEvent(session, { type: 'tool/result', data: { turn: 1, step: 1, message: { source: { callId: 'e1' }, content: [{ type: 'tool-result', content: [{ type: 'text', text: 'ok' }] }] } } })
+  sessionEvent(session, verifyCall(1, 2))
+  sessionEvent(session, verifyResult(1, 2, FAIL_TEXT))
+  sessionEvent(session, doneEvent(1, 3, claimText))
+  const out = await assemble('f2-ok')
+  const sec = section(out, 'trajectory-anchor:itemized-claim-gap')
+  check('F2 ① 集成：编辑支持的条目不进清单，验证输出的 test 条目不进清单', sec !== undefined && /gateway\/auth\.py/.test(sec.text) === false && /test_voice_bridge/.test(sec.text) === false, sec && sec.text.slice(0, 200))
+  check('F2 ① 集成：README 条目无证据 ⇒ 清单里只有它', sec !== undefined && /README/.test(sec.text), sec && sec.text.slice(0, 200))
+  const row = await summaryOf('f2-ok')
+  check('F2 ① 集成：审计与状态可见', row.itemizedClaimMirror && row.itemizedClaimMirror.served === true && row.itemizedClaimMirror.unsupportedCount === 1, JSON.stringify(row.itemizedClaimMirror))
+  const out2 = await assemble('f2-ok')
+  check('F2 ① 集成：**只注一次**', section(out2, 'trajectory-anchor:itemized-claim-gap') === undefined, JSON.stringify((out2.sections || []).map((s) => s.name)))
+}
+await boot({ itemizedClaimMirror: true })
+{
+  const { session } = makeAgent('f2-allsupported')
+  const claimText = 'Done.\n- Fixed `gateway/auth.py`\n- Passed `test_voice_bridge`'
+  sessionEvent(session, { type: 'tool/call', data: { turn: 1, step: 1, name: 'edit', callId: 'e1', arguments: JSON.stringify({ file_path: 'workspace/project2_task/gateway/auth.py' }) } })
+  sessionEvent(session, { type: 'tool/result', data: { turn: 1, step: 1, message: { source: { callId: 'e1' }, content: [{ type: 'tool-result', content: [{ type: 'text', text: 'ok' }] }] } } })
+  sessionEvent(session, verifyCall(1, 2))
+  sessionEvent(session, verifyResult(1, 2, PASS_TEXT + 'test_voice_bridge passed'))
+  sessionEvent(session, doneEvent(1, 3, claimText))
+  const out = await assemble('f2-allsupported')
+  check('F2 ② 反向：全部条目有证据 ⇒ 不注', section(out, 'trajectory-anchor:itemized-claim-gap') === undefined, JSON.stringify((out.sections || []).map((s) => s.name)))
+}
+await boot({ itemizedClaimMirror: false })
+{
+  const { session } = makeAgent('f2-off')
+  sessionEvent(session, doneEvent(1, 1, 'Done.\n- Fixed `gateway/auth.py`'))
+  const out = await assemble('f2-off')
+  check('F2 ③ 反向：默认关 ⇒ 不注', section(out, 'trajectory-anchor:itemized-claim-gap') === undefined, JSON.stringify((out.sections || []).map((s) => s.name)))
+}
+{
+  // 纯函数双向
+  const edits = [{ turn: 1, step: 1, path: 'workspace/project2_task/gateway/auth.py', invalidates: true }]
+  const verifyEvidence = [{ turn: 1, step: 2, cmd: 'python -X utf8 evaluator/run_hidden_tests.py', outputTail: 'FAIL: test_voice_bridge' }]
+  const noAnchors = itemizedClaimFacts({ claimText: 'The task is done. Everything looks good.', edits, verifyEvidence })
+  check('纯函数 F2：无清单式条目 ⇒ 不判（不猜）', noAnchors.fired === false && noAnchors.reason === 'no-itemized-claim', JSON.stringify(noAnchors))
+  const unsupported = itemizedClaimFacts({ claimText: '- Fixed `gateway/auth.py`\n- Added `esp32/main.cpp`\n- Verified `test_voice_bridge`', edits, verifyEvidence })
+  check('纯函数 F2：编辑支持的条目 + 验证支持的条目 ⇒ 只留 esp32 那条', unsupported.fired === true && unsupported.unsupported.length === 1 && /esp32/.test(unsupported.unsupported[0]), JSON.stringify(unsupported))
+  const allOk = itemizedClaimFacts({ claimText: '- Fixed `gateway/auth.py`\n- Verified `test_voice_bridge`', edits, verifyEvidence })
+  check('纯函数 F2：全支持 ⇒ 翻掉', allOk.fired === false && allOk.reason === 'all-items-supported', JSON.stringify(allOk))
+  const noAnchorItems = itemizedClaimFacts({ claimText: '- Made everything more robust\n- Improved the architecture', edits, verifyEvidence })
+  check('纯函数 F2：条目全无锚点 ⇒ 不判（不猜）', noAnchorItems.fired === false, JSON.stringify(noAnchorItems))
+  const pathTailMatch = itemizedClaimFacts({ claimText: '- Fixed `gateway/auth.py`', edits: [{ turn: 1, step: 1, path: 'other/project/auth.py' }], verifyEvidence: [] })
+  check('纯函数 F2：裸 basename 不假支持（other/project/auth.py ≠ gateway/auth.py）', pathTailMatch.fired === true && pathTailMatch.unsupported.length === 1, JSON.stringify(pathTailMatch))
 }
 
 console.log(`\n${pass} pass, ${fail} fail`)

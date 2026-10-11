@@ -44,7 +44,7 @@ import { isAbsolute, resolve as resolvePath, dirname as dirname2 } from 'node:pa
 // （台账定稿 51 倍偏差、两级连续计数混层），所以本轮一律共用一份实现。
 import {
   parseTaskAnchors, inScope, isIgnorablePath, changeInvalidatesVerification, pathsFromCallStrict, isWriteTool, isReadTool,
-  verifyCommandKind, claimsFromFinalMessage, commandPaths, verifyStaleness, deliveryGate, claimFormatOk, unsupportedClaim, evidenceContradiction, artifactDeliveryFacts, artifactStateFacts,
+  verifyCommandKind, claimsFromFinalMessage, commandPaths, verifyStaleness, deliveryGate, claimFormatOk, unsupportedClaim, evidenceContradiction, artifactDeliveryFacts, artifactStateFacts, itemizedClaimFacts,
 } from './tools/task-anchor-core.mjs'
 // 纠偏线索**共用离线标注那一份**（`drift-label-core` 零依赖、只读）：避免"标注用的判据"
 // 与"运行时触发的判据"各写一份、然后悄悄漂移（本项目在台账与形态识别上各栽过一次）。
@@ -79,6 +79,7 @@ const DEFAULTS = {
   // ── F6/F7 事实镜像（criteria 设计第二波；默认关）────────────────────────────
   unsupportedClaimMirror: false,   // F6：交付声称结局但全会话零验证证据 ⇒ 回放"你的断言没有出处"
   evidenceContradictionMirror: false, // F7：声称全过但最后一次验证仍带失败 ⇒ 回放矛盾证据
+  itemizedClaimMirror: false,      // F2：清单式声明逐项对证（edits+验证证据），缺证据条目 ⇒ 回放清单
   // ── process-front-loaded（docs/design-process-gate.md，默认关）────────────────
   editBudgetCap: 0,               // Q4 会话内编辑预算：落地代码改动上限；0=关。耗尽后注入"现在评分并交付"
   editHoldEvery: 0,               // Q2 带保持的编辑预算：每 K 次落地代码改动且无验证 ⇒ 进入保持态，
@@ -2680,6 +2681,7 @@ function adopt(agent, doAnchor, channel) {
     // F6/F7 事实镜像状态（默认关）
     unsupportedClaimMirror: null,      // { served, via, reason }
     evidenceContradictionMirror: null, // { served, via, reason, evidence }
+    itemizedClaimMirror: null,         // F2 { served, via, reason, unsupported[] }
     // Q4 会话内编辑预算（0=关）
     editBudget: { count: 0, exhausted: false, served: false },
     // Q2 带保持的编辑预算（0=关）
@@ -2933,9 +2935,10 @@ function feedSessionEvent(session, event) {
           const first = rec.claimedDoneAt == null
           rec.claimedDoneAt = { turn: turn ?? null, step: step ?? null }
           // 证据捕获（F2/F5 原料）：每次完成/通过声明都记一条（含原文，有界）。
+          // F2 要逐项对证清单式声明，300 字符会截断多条目清单 ⇒ 提到 2000（20 条上限，可控）。
           rec.claims.push({
             turn: turn ?? null, step: step ?? null,
-            text: claimText.slice(0, 300),
+            text: claimText.slice(0, 2000),
             claimedDone: c.claimedDone === true, claimedPass: c.claimedPass, claimedTotal: c.claimedTotal,
           })
           if (rec.claims.length > 20) rec.claims.shift()
@@ -3495,6 +3498,7 @@ function summaryOf(rec) {
     claimFormat: rec.claimFormat ? { served: rec.claimFormat.served === true, via: rec.claimFormat.via || null } : null,
     unsupportedClaimMirror: rec.unsupportedClaimMirror ? { served: rec.unsupportedClaimMirror.served === true, via: rec.unsupportedClaimMirror.via || null, reason: rec.unsupportedClaimMirror.reason || null } : null,
     evidenceContradictionMirror: rec.evidenceContradictionMirror ? { served: rec.evidenceContradictionMirror.served === true, via: rec.evidenceContradictionMirror.via || null, reason: rec.evidenceContradictionMirror.reason || null } : null,
+    itemizedClaimMirror: rec.itemizedClaimMirror ? { served: rec.itemizedClaimMirror.served === true, via: rec.itemizedClaimMirror.via || null, reason: rec.itemizedClaimMirror.reason || null, unsupportedCount: Array.isArray(rec.itemizedClaimMirror.unsupported) ? rec.itemizedClaimMirror.unsupported.length : null } : null,
     editBudget: { count: rec.editBudget.count, exhausted: rec.editBudget.exhausted === true, served: rec.editBudget.served === true },
     editHold: { editsSinceVerify: rec.editHold.editsSinceVerify, holding: rec.editHold.holding === true, violations: rec.editHold.violations, released: rec.editHold.released, served: rec.editHold.served === true },
     deliveryArtifactGate: rec.deliveryArtifactGate ? { served: rec.deliveryArtifactGate.served === true, via: rec.deliveryArtifactGate.via || null, reason: rec.deliveryArtifactGate.reason || null } : null,
@@ -3668,6 +3672,7 @@ function buildSummary(filter) {
       claimFormatContract: CONFIG.claimFormatContract === true,
       unsupportedClaimMirror: CONFIG.unsupportedClaimMirror === true,
       evidenceContradictionMirror: CONFIG.evidenceContradictionMirror === true,
+      itemizedClaimMirror: CONFIG.itemizedClaimMirror === true,
       editBudgetCap: CONFIG.editBudgetCap,
       editHoldEvery: CONFIG.editHoldEvery,
       deliveryArtifactGate: CONFIG.deliveryArtifactGate === true,
@@ -4378,6 +4383,37 @@ export function apply(ctx, config) {
       return next({ ...out, sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections })
     } catch (e) {
       warnOnce(`evidence-contradiction mirror failed, skipping: ${msg(e)}`)
+      return next(out)
+    }
+  }))
+
+  // ---- F2 分项声明-证据对照（criteria 第三波）：清单式声明逐项对证，缺证据的条目回放 ----
+  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
+    try {
+      const id = payload && payload.agent && payload.agent.id
+      const rec = id ? recs.get(id) : null
+      if (!rec) return next(out)
+      if (rec.itemizedClaimMirror && rec.itemizedClaimMirror.served === true) return next(out)
+      if (!rec.itemizedClaimMirror) {
+        if (CONFIG.itemizedClaimMirror !== true) return next(out)
+        const lastClaim = Array.isArray(rec.claims) ? rec.claims[rec.claims.length - 1] : null
+        if (!lastClaim) return next(out)
+        const f = itemizedClaimFacts({ claimText: lastClaim.text || '', edits: rec.edits, verifyEvidence: rec.verifyEvidence })
+        if (f.fired !== true) return next(out)
+        rec.itemizedClaimMirror = { served: false, via: 'post-claim-assemble', reason: f.reason, unsupported: f.unsupported }
+        logAudit(rec, 'itemized-claim-gap', { via: 'post-claim-assemble', reason: f.reason, ...f.evidence })
+      }
+      rec.itemizedClaimMirror.served = true
+      const list = (rec.itemizedClaimMirror.unsupported || []).map((u) => `- ${u}`).join('\n')
+      const section = {
+        name: 'trajectory-anchor:itemized-claim-gap',
+        text: '[trajectory-anchor] These items in your delivery have no evidence in this session\'s own trajectory (no matching edit, no verification output):\n\n'
+          + `${list}\n\n`
+          + 'Back each item with an edit you made or a grading output you produced, or drop the item.',
+      }
+      return next({ ...out, sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections })
+    } catch (e) {
+      warnOnce(`itemized-claim mirror failed, skipping: ${msg(e)}`)
       return next(out)
     }
   }))

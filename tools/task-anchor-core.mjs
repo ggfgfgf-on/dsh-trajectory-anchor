@@ -810,3 +810,68 @@ export function artifactStateFacts(input) {
   if (typeof cur.mtimeMs === 'number' && typeof binding.mtimeMs === 'number' && cur.mtimeMs !== binding.mtimeMs) return { refuse: true, reason: 'artifact-changed-after-verify', evidence }
   return { refuse: false, reason: 'fresh-and-green', evidence: null }
 }
+
+/**
+ * F2 分项声明-证据对照（纯谓词；criteria-refactor §10 的下一候选，本轮实现）。
+ * 语义：收尾消息里的**清单式声明**逐条提取（bullet/编号行），每条提取文件路径/
+ * 测试名锚点，对照会话自己的证据（edits 路径 + verifyEvidence 的 cmd/outputTail）
+ * 逐项判定；有锚点但无任何证据 ⇒ unsupported；≥1 条 ⇒ 开火回放清单。
+ *
+ * 精度优先（与 F3/F5 同一纪律）：
+ *   · 无锚点的条目不判（纯散文不猜——F6 管"整条声明零验证"，F2 只管能逐项对证的）；
+ *   · 文件锚点按"最后两段路径"匹配（gateway/auth.py 只认结尾是 gateway/auth.py 的编辑，
+ *     不做裸 basename 匹配——裸匹配会把 A 文件的声明喂给 B 文件的编辑，假支持）；
+ *   · 测试名锚点要求验证文本**逐字**包含该测试名（不子串化）。
+ */
+export function itemizedClaimFacts(input) {
+  const { claimText = '', edits = [], verifyEvidence = [] } = input || {}
+  const text = typeof claimText === 'string' ? claimText : ''
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length >= 8 && l.length <= 400)
+  const ITEM_RE = /^(?:[-*•·]|\d{1,2}[.)、]|[一二三四五六七八九十]{1,2}[、.）)]|[①②③④⑤⑥⑦⑧⑨⑩])\s*/
+  const items = []
+  for (const l of lines) {
+    if (!ITEM_RE.test(l)) continue
+    items.push(l.replace(ITEM_RE, '').trim())
+  }
+  if (items.length === 0) return { fired: false, reason: 'no-itemized-claim', unsupported: [], supported: [], evidence: null }
+  const PATH_RE = /(?:[A-Za-z]:[\\/][^\s`"'<>|]+|`([^`]+)`)/g
+  const TEST_RE = /\b(test_[A-Za-z0-9_]+|[A-Za-z0-9_]+_test)\b/g
+  const norm = (s) => String(s).replace(/\\/g, '/').toLowerCase()
+  const tail2 = (p) => {
+    const parts = p.split('/').filter(Boolean)
+    return parts.slice(-2).join('/')
+  }
+  const editNorm = (edits || []).map((e) => (typeof e.path === 'string' ? norm(e.path) : '')).filter(Boolean)
+  const verifyNorm = norm((verifyEvidence || []).map((v) => `${v && v.cmd ? v.cmd : ''} ${v && v.outputTail ? v.outputTail : ''}`).filter(Boolean).join('\n'))
+  const supported = []
+  const unsupported = []
+  for (const item of items) {
+    const anchors = []
+    let m
+    const pr = new RegExp(PATH_RE.source, 'g')
+    while ((m = pr.exec(item))) anchors.push((m[1] || m[0]).trim())
+    const tr = new RegExp(TEST_RE.source, 'g')
+    while ((m = tr.exec(item))) anchors.push(m[0])
+    if (anchors.length === 0) continue
+    const matched = anchors.some((a) => {
+      const na = norm(a)
+      const looksPath = /[\\/.]/.test(a) && !/^test_/.test(a)
+      if (looksPath) {
+        const t = tail2(na)
+        if (t && editNorm.some((p) => p === na || p.endsWith('/' + t))) return true
+        return verifyNorm.includes(na)
+      }
+      return verifyNorm.includes(na)
+    })
+    if (matched) supported.push(item)
+    else unsupported.push(item.slice(0, 200))
+  }
+  if (unsupported.length === 0) return { fired: false, reason: 'all-items-supported', unsupported: [], supported, evidence: null }
+  return {
+    fired: true,
+    reason: 'itemized-claim-gap',
+    unsupported,
+    supported,
+    evidence: { itemCount: items.length, unsupportedCount: unsupported.length },
+  }
+}
