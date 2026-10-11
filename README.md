@@ -855,15 +855,24 @@ sign-flip permutation, firing-rate gate before any score comparison). Measured r
   (longer sessions +0.9 min, +5.9 steps, +1.6 verifies, fewer completion claims) but not the score.
 - Also measured on the P1 arm: post-refusal re-grade rate **0/7** (in 6/7 the refusal landed after
   the final tool call — the claim is the session's last action, so there was no turn left to act).
+- **Q1 deliverable-artifact gate (the P1 re-placement): fires 3/8 < 5/8 ⇒ "manipulation failed",
+  scores never compared** (§47). Autopsy found arming coverage 3/8: tool-channel-only observation
+  (script-channel artifact writes invisible) and a hidden-grader-only predicate.
+- **Q1′ artifact-state binding** replaced write-hooks with file-state binding (mtime/size/sha256)
+  + pre-step holds: live probes measured bindings/fires 4/8 (probe #1) → after the recursive
+  binding search + session-cwd capture (Q1″/Q1‴) **8/8** (probe #2, zero foreign bindings).
+- **§50 full A/B (n=8 pairs, pre-registered, gate frozen from probe #2): fire gate passed 6/8
+  sessions / 9 holds — paired delta 0.00, p=1.0000 ⇒ no attributable effect.** Process outcomes:
+  hold-release 3/9 (33%), rewrite-rehold 3× (one session ran the full refuse→re-verify→rewrite→
+  re-refuse loop three times). Secondary metrics all p>0.1 (verifies +1.25, durMin −0.70).
 
 The honest status is therefore: **the mechanisms demonstrably act (fires are recorded with
 verbatim evidence); no intervention has shown an attributable outcome benefit.** "No effect at
-n=8" is *not* "ineffective" — it is the measured null on one substrate (ark × Project2). The
-instrument is `D:\DSHwork\anchor-bench\` (fixed multi-module tasks with a machine-readable score,
-a paired analyzer, an outcome extractor that re-runs the *pristine* tests, a replay gate over the
-full session corpus, and the firing-rate gate). The design's stated next lever: move the protocol
-constraints earlier into the process and raise their strength, instead of adding more
-informational text.
+n=8" is *not* "ineffective" — it is the measured null on one substrate (ark × Project2). Two
+delivery-time informational interventions (P1, Q1′) now hold legally comparable nulls, with
+process metrics nudged toward "more verification" but non-significant; the design's stated next
+lever is the process-*hard* constraints (the Q2 edit hold, the Q4 edit budget), which have never
+been live-measured.
 
 **4. Cost side: now partially measured.** The A/B rows carry per-arm duration / steps / tool
 calls (P1 arm: +0.9 min, +5.9 steps, +6.1 tool calls per session, all p>0.1); token-level cost is
