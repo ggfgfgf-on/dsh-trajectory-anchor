@@ -62,6 +62,10 @@ await mod.apply(ctx, {
   // criteria 第二波事实也全开
   unsupportedClaimMirror: true,
   evidenceContradictionMirror: true,
+  // process-front-loaded 约束（Q1/Q2/Q4）也全开
+  deliveryArtifactGate: true,
+  editHoldEvery: 3,
+  editBudgetCap: 60,
 })
 const dispatch = (name, ...a) => handlers['internal/dispatch']('x', name, a, null)
 
@@ -146,6 +150,9 @@ for (const f of files) {
     claimFormat: row.claimFormat,
     unsupportedFire: row.unsupportedClaimMirror,
     contradictionFire: row.evidenceContradictionMirror,
+    artifactGate: row.deliveryArtifactGate,
+    editBudget: row.editBudget,
+    editHold: row.editHold,
     auditKinds: row.auditKinds || [],
     fed,
   })
@@ -161,6 +168,9 @@ const p2Armed = rows.filter((r) => (r.auditKinds || []).includes('verify-budget-
 const p3Fires = rows.filter((r) => r.claimFormat && r.claimFormat.served === true)
 const f6Fires = rows.filter((r) => r.unsupportedFire && r.unsupportedFire.served === true)
 const f7Fires = rows.filter((r) => r.contradictionFire && r.contradictionFire.served === true)
+const q1Fires = rows.filter((r) => r.artifactGate && r.artifactGate.served === true)
+const q2Armed = rows.filter((r) => (r.auditKinds || []).includes('edit-hold-armed'))
+const q4Exhausted = rows.filter((r) => (r.auditKinds || []).includes('edit-budget-exhausted'))
 const withAnchors = rows.filter((r) => r.anchorsParsed)
 const withClaims = rows.filter((r) => (r.evidence?.claims ?? 0) > 0)
 const withVerify = rows.filter((r) => (r.evidence?.verifyEvidence ?? 0) > 0)
@@ -178,6 +188,9 @@ console.log(`P2 改后必验武装             ${p2Armed.length} 次（${withEdi
 console.log(`P3 格式要求                 ${p3Fires.length} 次（${withClaims.length ? (p3Fires.length / withClaims.length * 100).toFixed(1) : 0}% / 有宣告会话）`)
 console.log(`F6 无出处断言               ${f6Fires.length} 次（${withClaims.length ? (f6Fires.length / withClaims.length * 100).toFixed(1) : 0}% / 有宣告会话）`)
 console.log(`F7 证据矛盾                 ${f7Fires.length} 次（${withClaims.length ? (f7Fires.length / withClaims.length * 100).toFixed(1) : 0}% / 有宣告会话）`)
+console.log(`Q1 工件门拒绝               ${q1Fires.length} 次`)
+console.log(`Q2 编辑保持武装             ${q2Armed.length} 次（${withEdits.length ? (q2Armed.length / withEdits.length * 100).toFixed(1) : 0}% / 有落地写会话）`)
+console.log(`Q4 编辑预算耗尽             ${q4Exhausted.length} 次（${withEdits.length ? (q4Exhausted.length / withEdits.length * 100).toFixed(1) : 0}% / 有落地写会话）`)
 
 if (onlyRe) console.log(`（--only ${onlyRe} 过滤中）`)
 

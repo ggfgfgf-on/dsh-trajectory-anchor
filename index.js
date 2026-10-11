@@ -43,7 +43,7 @@ import { isAbsolute, resolve as resolvePath, dirname as dirname2 } from 'node:pa
 // （台账定稿 51 倍偏差、两级连续计数混层），所以本轮一律共用一份实现。
 import {
   parseTaskAnchors, inScope, isIgnorablePath, changeInvalidatesVerification, pathsFromCallStrict, isWriteTool, isReadTool,
-  verifyCommandKind, claimsFromFinalMessage, commandPaths, verifyStaleness, deliveryGate, claimFormatOk, unsupportedClaim, evidenceContradiction,
+  verifyCommandKind, claimsFromFinalMessage, commandPaths, verifyStaleness, deliveryGate, claimFormatOk, unsupportedClaim, evidenceContradiction, artifactDeliveryFacts,
 } from './tools/task-anchor-core.mjs'
 // 纠偏线索**共用离线标注那一份**（`drift-label-core` 零依赖、只读）：避免"标注用的判据"
 // 与"运行时触发的判据"各写一份、然后悄悄漂移（本项目在台账与形态识别上各栽过一次）。
@@ -80,6 +80,10 @@ const DEFAULTS = {
   evidenceContradictionMirror: false, // F7：声称全过但最后一次验证仍带失败 ⇒ 回放矛盾证据
   // ── process-front-loaded（docs/design-process-gate.md，默认关）────────────────
   editBudgetCap: 0,               // Q4 会话内编辑预算：落地代码改动上限；0=关。耗尽后注入"现在评分并交付"
+  editHoldEvery: 0,               // Q2 带保持的编辑预算：每 K 次落地代码改动且无验证 ⇒ 进入保持态，
+                                  // 下一次 pre-step 注入"不许再改，先重验"；只有验证证据落地才解除。0=关。
+  deliveryArtifactGate: false,    // Q1 交付工件门：写交付工件（PR 模板）时隐藏评测带失败/早于最近编辑
+                                  // ⇒ 拒绝接收该工件（回合还开着的位置，P1 重跑率 0/7 的结构性修法）
   bootstrapTools: ['bash', 'str_replace_editor', 'pwsh'],
   bootstrapMaxTokens: null,
   bootstrapPersona: 'You are a helpful software engineer assistant.',
@@ -2540,6 +2544,10 @@ function adopt(agent, doAnchor, channel) {
     evidenceContradictionMirror: null, // { served, via, reason, evidence }
     // Q4 会话内编辑预算（0=关）
     editBudget: { count: 0, exhausted: false, served: false },
+    // Q2 带保持的编辑预算（0=关）
+    editHold: { editsSinceVerify: 0, holding: false, violations: 0, released: 0, served: false },
+    // Q1 交付工件门（默认关；每次工件重写可重新武装）
+    deliveryArtifactGate: null,
     /** 待发出的拉回原因（工具调用时置位，pre-step 时消费；保证"触发点=说出口的点"）。 */
     pendingPullback: null,
     pullback: {
@@ -2726,6 +2734,13 @@ function feedSessionEvent(session, event) {
           failed, failCount,
           artifacts: rec.verifyEvidence[rec.verifyEvidence.length - 1].artifacts,
         })
+        // Q2 解除条件：**证据落地**才解除保持态（不是计时器——设计 §3 Q2 的预算恢复语义）。
+        if (rec.editHold.holding) {
+          rec.editHold.holding = false
+          rec.editHold.editsSinceVerify = 0
+          rec.editHold.released += 1
+          logAudit(rec, 'edit-hold-released', { released: rec.editHold.released, via: 'verify-evidence' })
+        }
         rec.lastVerifyCallKey = null
       }
     }
@@ -3057,6 +3072,29 @@ function noteTaskSignal(rec, event) {
           logAudit(rec, 'edit-budget-exhausted', { count: rec.editBudget.count, cap: CONFIG.editBudgetCap, turn, step })
         }
       }
+      // Q2 带保持的编辑预算：落地代码改动计入"自上次验证以来的编辑数"；
+      // 保持态下的再编辑记 hold-violations（允许但不静默）。
+      if (CONFIG.editHoldEvery > 0 && changeInvalidatesVerification(path)) {
+        rec.editHold.editsSinceVerify += 1
+        if (rec.editHold.holding) {
+          rec.editHold.violations += 1
+          logAudit(rec, 'edit-hold-violation', { turn, step, path, violations: rec.editHold.violations })
+        } else if (rec.editHold.editsSinceVerify >= CONFIG.editHoldEvery) {
+          rec.editHold.holding = true
+          rec.editHold.served = false
+          logAudit(rec, 'edit-hold-armed', { editsSinceVerify: rec.editHold.editsSinceVerify, turn, step })
+        }
+      }
+      // Q1 交付工件门（process-front-loaded）：写交付工件（PR 模板）时，若最后一次隐藏
+      // 评测仍带失败/早于最近代码编辑 ⇒ 拒绝接收该工件。写入发生在最后一条消息**之前**，
+      // 代理还有回合可重跑（P1 重跑率 0/7 的结构性修法，§45）。工件重写可重新武装。
+      if (CONFIG.deliveryArtifactGate === true && /pull_request_template(\.md|\.txt)?$/i.test(String(path))) {
+        const g = artifactDeliveryFacts({ verifyEvidence: rec.verifyEvidence, edits: rec.edits, at: { turn, step } })
+        if (g.refuse === true) {
+          rec.deliveryArtifactGate = { served: false, via: 'artifact-write', reason: g.reason, evidence: g.evidence }
+          logAudit(rec, 'delivery-artifact-gate', { via: 'artifact-write', reason: g.reason, ...g.evidence })
+        }
+      }
       if (scopeKnown && !inScope(path, anchors)) {
         const v = { turn, step, tool: name, path, at: Date.now() }
         rec.scopeViolations.push(v)
@@ -3147,6 +3185,8 @@ function retractArm(rec, event) {
       if (rec.verifyBudget.count < CONFIG.verifyBudgetEvery) rec.verifyBudget.armed = false
       // Q4 同口径：被拒的写不占编辑预算（耗尽态不回溯——一旦耗尽就保持"评分并交付"）。
       if (CONFIG.editBudgetCap > 0) rec.editBudget.count = Math.max(0, rec.editBudget.count - a.invalidatingCount)
+      // Q2 同口径：被拒的写不占"自上次验证以来的编辑数"（保持态不因撤回解除）。
+      if (CONFIG.editHoldEvery > 0) rec.editHold.editsSinceVerify = Math.max(0, rec.editHold.editsSinceVerify - a.invalidatingCount)
     }
     if (a.addedEdit) {
       const last = rec.codeEditsAfterVerify[rec.codeEditsAfterVerify.length - 1]
@@ -3300,6 +3340,8 @@ function summaryOf(rec) {
     unsupportedClaimMirror: rec.unsupportedClaimMirror ? { served: rec.unsupportedClaimMirror.served === true, via: rec.unsupportedClaimMirror.via || null, reason: rec.unsupportedClaimMirror.reason || null } : null,
     evidenceContradictionMirror: rec.evidenceContradictionMirror ? { served: rec.evidenceContradictionMirror.served === true, via: rec.evidenceContradictionMirror.via || null, reason: rec.evidenceContradictionMirror.reason || null } : null,
     editBudget: { count: rec.editBudget.count, exhausted: rec.editBudget.exhausted === true, served: rec.editBudget.served === true },
+    editHold: { editsSinceVerify: rec.editHold.editsSinceVerify, holding: rec.editHold.holding === true, violations: rec.editHold.violations, released: rec.editHold.released, served: rec.editHold.served === true },
+    deliveryArtifactGate: rec.deliveryArtifactGate ? { served: rec.deliveryArtifactGate.served === true, via: rec.deliveryArtifactGate.via || null, reason: rec.deliveryArtifactGate.reason || null } : null,
     evidence: {
       verifyEvidence: rec.verifyEvidence.length,
       edits: rec.edits.length,
@@ -3470,6 +3512,8 @@ function buildSummary(filter) {
       unsupportedClaimMirror: CONFIG.unsupportedClaimMirror === true,
       evidenceContradictionMirror: CONFIG.evidenceContradictionMirror === true,
       editBudgetCap: CONFIG.editBudgetCap,
+      editHoldEvery: CONFIG.editHoldEvery,
+      deliveryArtifactGate: CONFIG.deliveryArtifactGate === true,
       reanchorEnabled: CONFIG.reanchorEnabled === true,
       reanchorEvidencePath: CONFIG.reanchorEvidencePath || null,
       pullbackOutcomePath: CONFIG.pullbackOutcomePath || null,
@@ -4200,6 +4244,31 @@ export function apply(ctx, config) {
     }
   }))
 
+  // ---- Q1 交付工件门（process-front-loaded）：工件写入时挂的拒绝，组装期回放 ----
+  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
+    try {
+      const id = payload && payload.agent && payload.agent.id
+      const rec = id ? recs.get(id) : null
+      if (!rec) return next(out)
+      if (!rec.deliveryArtifactGate || rec.deliveryArtifactGate.served === true) return next(out)
+      rec.deliveryArtifactGate.served = true
+      const e = rec.deliveryArtifactGate.evidence || {}
+      const text = rec.deliveryArtifactGate.reason === 'edited-after-hidden-verify'
+        ? '[trajectory-anchor] DELIVERY ARTIFACT NOT ACCEPTED. Your last hidden-grader run predates a later code edit:\n\n'
+          + `Grader run: ${e.verifyCmd || '(unrecognized)'} (turn ${e.verifyTurn ?? '?'}#${e.verifyStep ?? '?'})\n`
+          + `Edit after it: ${e.editPath} (turn ${e.editTurn ?? '?'}#${e.editStep ?? '?'})\n\n`
+          + 'Re-run the grader NOW, then rewrite the artifact with its verbatim `[hidden]` line. Until then the artifact is not accepted.'
+        : '[trajectory-anchor] DELIVERY ARTIFACT NOT ACCEPTED. Your last hidden-grader run still reports failures:\n\n'
+          + `${e.outputTail || ''}\n\n`
+          + 'Re-run the grader and rewrite the artifact with its verbatim `[hidden]` line. Until then the artifact is not accepted.'
+      const section = { name: 'trajectory-anchor:delivery-artifact-gate', text }
+      return next({ ...out, sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections })
+    } catch (e) {
+      warnOnce(`delivery artifact gate failed, skipping: ${msg(e)}`)
+      return next(out)
+    }
+  }))
+
   // ---- agent/request waterfall: opt-in first-round cap + explicit post-lift strip ----
   disposers.push(ctx.on('agent/request', async (payload, next) => {
     waterfallAgentRequest += 1
@@ -4246,6 +4315,18 @@ export function apply(ctx, config) {
       }
       const decision = await next()
       if (decision && decision.kind === 'reject') return decision
+      // ── Q2 带保持的编辑预算：保持态 ⇒ 本步注入"不许再改，先重验"（每次保持期一次，
+      //    注入后立即返回——保持消息在该步优先于 L1/L2）。解除只靠验证证据落地。──
+      if (CONFIG.editHoldEvery > 0 && rec.editHold.holding && !rec.editHold.served && decision && Array.isArray(decision.messages)) {
+        rec.editHold.served = true
+        logAudit(rec, 'edit-hold-injected', { editsSinceVerify: rec.editHold.editsSinceVerify, violations: rec.editHold.violations, turn: payload.turn, step: payload.step })
+        const holdMsg = {
+          source: { kind: 'trajectory-anchor-edit-hold' },
+          content: [{ type: 'text', text: '[trajectory-anchor] EDIT HOLD: you have made code edits since your last verification. '
+            + `No further edits until you re-run the verification (last seen: ${String(rec.lastVerifyCmd || '(none)').slice(0, 200)}) and quote its output.` }],
+        }
+        return { ...decision, messages: [...decision.messages, holdMsg] }
+      }
       // ── L1 任务锚定拉回：在**近因位置**追加一条独立消息 ───────────────────────
       // 为什么挂 pre-step 而不是 system prompt 前缀（社区 allostasis 的原文理由）：
       // 固定前缀离输出最远，长会话里纠偏信号会被近因压过去；这条必须落在近因位置。

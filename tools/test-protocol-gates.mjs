@@ -265,6 +265,112 @@ await boot({ editBudgetCap: 3 })
     section(out, 'trajectory-anchor:edit-budget') === undefined && row.editBudget.count === 1, JSON.stringify(row.editBudget))
 }
 
+// ── Q2 带保持的编辑预算（process-front-loaded）─────────────────────────────
+const preStep = async (sid, turn, step) => {
+  const h = handlers['agent/pre-step']
+  if (!h) return null
+  const payload = { agent: { id: sid }, messages: [], turn, step }
+  return h(payload, async () => ({ messages: [] }))
+}
+await boot({ editHoldEvery: 3 })
+{
+  const { session } = makeAgent('pg-q2')
+  sessionEvent(session, verifyCall(1, 1, 'python -X utf8 evaluator/run_hidden_tests.py'))
+  sessionEvent(session, verifyResult(1, 1, PASS_TEXT))
+  sessionEvent(session, editCall(1, 2, 'gateway/auth.py', 'h1'))
+  sessionEvent(session, editOk(1, 2, 'h1'))
+  sessionEvent(session, editCall(1, 3, 'gateway/gateway.py', 'h2'))
+  sessionEvent(session, editOk(1, 3, 'h2'))
+  const out1 = await preStep('pg-q2', 1, 4)
+  const held1 = (out1 && out1.messages || []).some((m) => m.source && m.source.kind === 'trajectory-anchor-edit-hold')
+  check('Q2 反向：2 次改动（K=3）⇒ pre-step 不注保持', held1 === false, JSON.stringify((out1 && out1.messages || []).map((m) => m.source && m.source.kind)))
+  sessionEvent(session, editCall(1, 4, 'gateway/db.py', 'h3'))
+  sessionEvent(session, editOk(1, 4, 'h3'))
+  const row = await summaryOf('pg-q2')
+  check('Q2 开：第 3 次改动 ⇒ holding=true', row.editHold && row.editHold.holding === true, JSON.stringify(row.editHold))
+  const out2 = await preStep('pg-q2', 1, 5)
+  const held2 = (out2 && out2.messages || []).some((m) => m.source && m.source.kind === 'trajectory-anchor-edit-hold')
+  check('Q2 开：保持态 pre-step 注入"不许再改，先重验"', held2 === true, JSON.stringify((out2 && out2.messages || []).map((m) => m.source && m.source.kind)))
+  const out2b = await preStep('pg-q2', 1, 6)
+  const held2b = (out2b && out2b.messages || []).some((m) => m.source && m.source.kind === 'trajectory-anchor-edit-hold')
+  check('Q2 开：**每次保持期只注一次**', held2b === false, JSON.stringify((out2b && out2b.messages || []).map((m) => m.source && m.source.kind)))
+  sessionEvent(session, editCall(1, 6, 'gateway/db.py', 'h4'))
+  sessionEvent(session, editOk(1, 6, 'h4'))
+  const row2 = await summaryOf('pg-q2')
+  check('Q2 开：保持态下再编辑 ⇒ violations=1（允许但计数）', row2.editHold.violations === 1, JSON.stringify(row2.editHold))
+  sessionEvent(session, verifyCall(1, 7, 'python -X utf8 evaluator/run_hidden_tests.py'))
+  sessionEvent(session, verifyResult(1, 7, PASS_TEXT))
+  const row3 = await summaryOf('pg-q2')
+  check('Q2 开：验证证据落地 ⇒ 解除（holding=false、editsSinceVerify=0、released=1）',
+    row3.editHold.holding === false && row3.editHold.editsSinceVerify === 0 && row3.editHold.released === 1, JSON.stringify(row3.editHold))
+}
+await boot({ editHoldEvery: 3 })
+{
+  const { session } = makeAgent('pg-q2-retract')
+  sessionEvent(session, verifyCall(1, 1, 'python -X utf8 evaluator/run_hidden_tests.py'))
+  sessionEvent(session, verifyResult(1, 1, PASS_TEXT))
+  sessionEvent(session, editCall(1, 2, 'gateway/auth.py', 'r1'))
+  sessionEvent(session, editFail(1, 2, 'r1'))
+  sessionEvent(session, editCall(1, 3, 'gateway/gateway.py', 'r2'))
+  sessionEvent(session, editFail(1, 3, 'r2'))
+  sessionEvent(session, editCall(1, 4, 'gateway/db.py', 'r3'))
+  sessionEvent(session, editOk(1, 4, 'r3'))
+  const row = await summaryOf('pg-q2-retract')
+  check('Q2 反向：2 次被拒 + 1 次落地 ⇒ editsSinceVerify=1、不保持',
+    row.editHold.editsSinceVerify === 1 && row.editHold.holding === false, JSON.stringify(row.editHold))
+}
+
+// ── Q1 交付工件门（process-front-loaded）───────────────────────────────────
+await boot({ deliveryArtifactGate: true })
+{
+  const { session } = makeAgent('pg-q1')
+  sessionEvent(session, verifyCall(1, 1, 'python -X utf8 evaluator/run_hidden_tests.py'))
+  sessionEvent(session, verifyResult(1, 1, FAIL_TEXT))
+  sessionEvent(session, editCall(1, 2, 'workspace/project2_task/PULL_REQUEST_TEMPLATE.md', 'a1'))
+  sessionEvent(session, editOk(1, 2, 'a1'))
+  const out = await assemble('pg-q1')
+  const sec = section(out, 'trajectory-anchor:delivery-artifact-gate')
+  const row = await summaryOf('pg-q1')
+  check('Q1 开：隐藏评测失败 + 写交付工件 ⇒ 拒绝接收（工件措辞）',
+    sec !== undefined && /DELIVERY ARTIFACT NOT ACCEPTED/.test(sec.text) && /test_voice_bridge/.test(sec.text), sec && sec.text.slice(0, 160))
+  check('Q1 开：留审计且状态可见', row.deliveryArtifactGate && row.deliveryArtifactGate.served === true && row.deliveryArtifactGate.reason === 'hidden-verify-failed', JSON.stringify(row.deliveryArtifactGate))
+  const out2 = await assemble('pg-q1')
+  check('Q1 开：**每次武装只拒一次**', section(out2, 'trajectory-anchor:delivery-artifact-gate') === undefined, JSON.stringify((out2.sections || []).map((s) => s.name)))
+  // 重写工件 ⇒ 重新武装
+  sessionEvent(session, editCall(1, 3, 'workspace/project2_task/PULL_REQUEST_TEMPLATE.md', 'a2'))
+  sessionEvent(session, editOk(1, 3, 'a2'))
+  const out3 = await assemble('pg-q1')
+  check('Q1 开：工件**重写 ⇒ 重新武装**（重跑评分前每次重写都会被拒）', section(out3, 'trajectory-anchor:delivery-artifact-gate') !== undefined, JSON.stringify((out3.sections || []).map((s) => s.name)))
+}
+await boot({ deliveryArtifactGate: true })
+{
+  const { session } = makeAgent('pg-q1-green')
+  sessionEvent(session, verifyCall(1, 1, 'python -X utf8 evaluator/run_hidden_tests.py'))
+  sessionEvent(session, verifyResult(1, 1, PASS_TEXT))
+  sessionEvent(session, editCall(1, 2, 'workspace/project2_task/PULL_REQUEST_TEMPLATE.md', 'a1'))
+  sessionEvent(session, editOk(1, 2, 'a1'))
+  const out = await assemble('pg-q1-green')
+  check('Q1 反向：全绿且新鲜 ⇒ 不拒', section(out, 'trajectory-anchor:delivery-artifact-gate') === undefined, JSON.stringify((out.sections || []).map((s) => s.name)))
+}
+await boot({ deliveryArtifactGate: true })
+{
+  const { session } = makeAgent('pg-q1-nohidden')
+  sessionEvent(session, editCall(1, 1, 'workspace/project2_task/PULL_REQUEST_TEMPLATE.md', 'a1'))
+  sessionEvent(session, editOk(1, 1, 'a1'))
+  const out = await assemble('pg-q1-nohidden')
+  check('Q1 反向：无隐藏评测证据 ⇒ 不拒（不猜）', section(out, 'trajectory-anchor:delivery-artifact-gate') === undefined, JSON.stringify((out.sections || []).map((s) => s.name)))
+}
+await boot({ deliveryArtifactGate: true })
+{
+  const { session } = makeAgent('pg-q1-other')
+  sessionEvent(session, verifyCall(1, 1, 'python -X utf8 evaluator/run_hidden_tests.py'))
+  sessionEvent(session, verifyResult(1, 1, FAIL_TEXT))
+  sessionEvent(session, editCall(1, 2, 'workspace/project2_task/README.md', 'a1'))
+  sessionEvent(session, editOk(1, 2, 'a1'))
+  const out = await assemble('pg-q1-other')
+  check('Q1 反向：非交付工件（README）⇒ 不拒', section(out, 'trajectory-anchor:delivery-artifact-gate') === undefined, JSON.stringify((out.sections || []).map((s) => s.name)))
+}
+
 // ── 纯函数负向对照 ──────────────────────────────────────────────────────────
 {
   const claim = { turn: 1, step: 3, claimedDone: true, claimedPass: null }

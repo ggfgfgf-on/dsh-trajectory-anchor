@@ -695,8 +695,7 @@ export function unsupportedClaim(input) {
  */
 const TEXTUAL_FULL_PASS = /\ball\s+(?:tests|checks|groups)\s+(?:pass|green|passed)\b|\ball green\b|全部通过/i
 
-export function evidenceContradiction(input) {
-  const { claim = null, verifyEvidence = [] } = input || {}
+export function evidenceContradiction(input) {  const { claim = null, verifyEvidence = [] } = input || {}
   if (!claim || (claim.claimedDone !== true && claim.claimedPass === null)) {
     return { contradiction: false, reason: 'no-completion-claim', evidence: null }
   }
@@ -723,4 +722,56 @@ export function evidenceContradiction(input) {
       outputTail: typeof lastV.outputTail === 'string' ? lastV.outputTail : null,
     },
   }
+}
+
+/**
+ * Q1 交付工件门（process-front-loaded 设计，纯函数）：代理**写交付工件**（PR 模板等）时，
+ * 若最后一次隐藏评测仍带失败、或早于最近一次代码编辑 ⇒ 拒绝接收该工件。
+ * 与 P1 的区别：参考点是**工件写入时刻**（回合还开着），不是最后一条聊天消息（宣告=收尾，
+ * 门开火时已无回合可响应——P1 重跑率 0/7 的结构性根因，§45）。
+ *
+ * @param {object} input
+ * @param {Array} input.verifyEvidence [{turn,step,cmd,failed,outputTail,...}]
+ * @param {Array} input.edits [{turn,step,path,invalidates,...}]
+ * @param {object} input.at 工件写入的位置 {turn, step}
+ * @returns {{refuse:boolean, reason:string|null, evidence:object|null}}
+ */
+export function artifactDeliveryFacts(input) {
+  const { verifyEvidence = [], edits = [], at = null } = input || {}
+  const hasPos = (v) => typeof v === 'number'
+  const after = (a, b) => (a.turn > b.turn) || (a.turn === b.turn && a.step > b.step)
+  const atOrBefore = (v) => !at || !hasPos(v.turn) || !hasPos(v.step) || !after(v, at)
+  const isHidden = (v) => typeof v.cmd === 'string' && /hidden/i.test(v.cmd)
+  const list = (verifyEvidence || []).filter((v) => v && isHidden(v) && atOrBefore(v))
+  const hiddenV = list[list.length - 1]
+  if (!hiddenV) return { refuse: false, reason: 'no-hidden-verification', evidence: null }
+  if (!hasPos(hiddenV.turn) || !hasPos(hiddenV.step)) return { refuse: false, reason: 'verify-position-unknown', evidence: null }
+  for (const e of edits || []) {
+    if (!e || e.invalidates !== true) continue
+    if (!hasPos(e.turn) || !hasPos(e.step)) continue
+    if (!after(e, hiddenV)) continue
+    if (at && after(e, at)) continue   // 写入之后的编辑不参与"早于工件"的判定
+    return {
+      refuse: true,
+      reason: 'edited-after-hidden-verify',
+      evidence: {
+        verifyCmd: typeof hiddenV.cmd === 'string' ? hiddenV.cmd : null,
+        verifyTurn: hiddenV.turn, verifyStep: hiddenV.step,
+        editPath: e.path, editTurn: e.turn, editStep: e.step,
+        outputTail: typeof hiddenV.outputTail === 'string' ? hiddenV.outputTail : null,
+      },
+    }
+  }
+  if (hiddenV.failed === true) {
+    return {
+      refuse: true,
+      reason: 'hidden-verify-failed',
+      evidence: {
+        verifyCmd: typeof hiddenV.cmd === 'string' ? hiddenV.cmd : null,
+        verifyTurn: hiddenV.turn, verifyStep: hiddenV.step,
+        outputTail: typeof hiddenV.outputTail === 'string' ? hiddenV.outputTail : null,
+      },
+    }
+  }
+  return { refuse: false, reason: 'fresh-and-green', evidence: null }
 }
