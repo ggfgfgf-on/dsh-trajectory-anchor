@@ -43,7 +43,7 @@ import { isAbsolute, resolve as resolvePath, dirname as dirname2 } from 'node:pa
 // （台账定稿 51 倍偏差、两级连续计数混层），所以本轮一律共用一份实现。
 import {
   parseTaskAnchors, inScope, isIgnorablePath, changeInvalidatesVerification, pathsFromCallStrict, isWriteTool, isReadTool,
-  verifyCommandKind, claimsFromFinalMessage, commandPaths, verifyStaleness, deliveryGate, claimFormatOk,
+  verifyCommandKind, claimsFromFinalMessage, commandPaths, verifyStaleness, deliveryGate, claimFormatOk, unsupportedClaim, evidenceContradiction,
 } from './tools/task-anchor-core.mjs'
 // 纠偏线索**共用离线标注那一份**（`drift-label-core` 零依赖、只读）：避免"标注用的判据"
 // 与"运行时触发的判据"各写一份、然后悄悄漂移（本项目在台账与形态识别上各栽过一次）。
@@ -75,6 +75,9 @@ const DEFAULTS = {
   verifyAfterEditBudget: false,    // P2 改后必验：每 verifyBudgetEvery 次落地代码改动注入一次强制重验
   verifyBudgetEvery: 3,
   claimFormatContract: false,      // P3 交付格式契约：声明过 PASS=n/m 格式就必须按格式交付
+  // ── F6/F7 事实镜像（criteria 设计第二波；默认关）────────────────────────────
+  unsupportedClaimMirror: false,   // F6：交付声称结局但全会话零验证证据 ⇒ 回放"你的断言没有出处"
+  evidenceContradictionMirror: false, // F7：声称全过但最后一次验证仍带失败 ⇒ 回放矛盾证据
   bootstrapTools: ['bash', 'str_replace_editor', 'pwsh'],
   bootstrapMaxTokens: null,
   bootstrapPersona: 'You are a helpful software engineer assistant.',
@@ -2528,6 +2531,9 @@ function adopt(agent, doAnchor, channel) {
     deliveryGate: null,        // { served, via, reason, evidence }
     verifyBudget: { count: 0, armed: false },   // P2：落地代码改动计数；count≥K ⇒ armed，注入后清零
     claimFormat: null,         // { served, via }
+    // F6/F7 事实镜像状态（默认关）
+    unsupportedClaimMirror: null,      // { served, via, reason }
+    evidenceContradictionMirror: null, // { served, via, reason, evidence }
     /** 待发出的拉回原因（工具调用时置位，pre-step 时消费；保证"触发点=说出口的点"）。 */
     pendingPullback: null,
     pullback: {
@@ -2797,6 +2803,28 @@ function feedSessionEvent(session, event) {
             && !claimFormatOk(claimText, rec.taskAnchors.reportFormat)) {
             rec.claimFormat = { served: false, via: 'claim' }
             logAudit(rec, 'claim-format', { via: 'claim', total: rec.taskAnchors.reportFormat.total })
+          }
+          // F6 无出处结果断言（criteria 第二波）：交付声称结局但全会话零验证证据 ⇒ 挂标记。
+          if (!rec.unsupportedClaimMirror && CONFIG.unsupportedClaimMirror === true) {
+            const u = unsupportedClaim({
+              claim: { turn: turn ?? null, step: step ?? null, claimedDone: c.claimedDone === true, claimedPass: c.claimedPass },
+              verifyEvidence: rec.verifyEvidence,
+            })
+            if (u.unsupported === true) {
+              rec.unsupportedClaimMirror = { served: false, via: 'claim', reason: u.reason }
+              logAudit(rec, 'unsupported-claim', { via: 'claim', reason: u.reason })
+            }
+          }
+          // F7 证据矛盾（criteria 第二波）：声称全过但最后一次验证仍带失败 ⇒ 挂标记。
+          if (!rec.evidenceContradictionMirror && CONFIG.evidenceContradictionMirror === true) {
+            const x = evidenceContradiction({
+              claim: { turn: turn ?? null, step: step ?? null, claimedDone: c.claimedDone === true, claimedPass: c.claimedPass, claimedTotal: c.claimedTotal },
+              verifyEvidence: rec.verifyEvidence,
+            })
+            if (x.contradiction === true) {
+              rec.evidenceContradictionMirror = { served: false, via: 'claim', reason: x.reason, evidence: x.evidence }
+              logAudit(rec, 'evidence-contradiction', { via: 'claim', reason: x.reason, ...x.evidence })
+            }
           }
           // 契约重锚定（只读、一次性）：**第一次**宣告完成时挂标记，组装期注入一次摘要。
           if (first && CONFIG.contractReanchor === true && typeof rec.anchorsFromMessage === 'string' && rec.anchorsFromMessage.trim()) {
@@ -3249,6 +3277,8 @@ function summaryOf(rec) {
     deliveryGate: rec.deliveryGate ? { served: rec.deliveryGate.served === true, via: rec.deliveryGate.via || null, reason: rec.deliveryGate.reason || null } : null,
     verifyBudget: { count: rec.verifyBudget.count, armed: rec.verifyBudget.armed === true },
     claimFormat: rec.claimFormat ? { served: rec.claimFormat.served === true, via: rec.claimFormat.via || null } : null,
+    unsupportedClaimMirror: rec.unsupportedClaimMirror ? { served: rec.unsupportedClaimMirror.served === true, via: rec.unsupportedClaimMirror.via || null, reason: rec.unsupportedClaimMirror.reason || null } : null,
+    evidenceContradictionMirror: rec.evidenceContradictionMirror ? { served: rec.evidenceContradictionMirror.served === true, via: rec.evidenceContradictionMirror.via || null, reason: rec.evidenceContradictionMirror.reason || null } : null,
     evidence: {
       verifyEvidence: rec.verifyEvidence.length,
       edits: rec.edits.length,
@@ -3416,6 +3446,8 @@ function buildSummary(filter) {
       verifyAfterEditBudget: CONFIG.verifyAfterEditBudget === true,
       verifyBudgetEvery: CONFIG.verifyBudgetEvery,
       claimFormatContract: CONFIG.claimFormatContract === true,
+      unsupportedClaimMirror: CONFIG.unsupportedClaimMirror === true,
+      evidenceContradictionMirror: CONFIG.evidenceContradictionMirror === true,
       reanchorEnabled: CONFIG.reanchorEnabled === true,
       reanchorEvidencePath: CONFIG.reanchorEvidencePath || null,
       pullbackOutcomePath: CONFIG.pullbackOutcomePath || null,
@@ -4062,6 +4094,66 @@ export function apply(ctx, config) {
       return next({ ...out, sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections })
     } catch (e) {
       warnOnce(`claim format gate failed, skipping: ${msg(e)}`)
+      return next(out)
+    }
+  }))
+
+  // ---- F6 无出处结果断言（criteria 第二波）：交付声称结局但全会话零验证证据 ----
+  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
+    try {
+      const id = payload && payload.agent && payload.agent.id
+      const rec = id ? recs.get(id) : null
+      if (!rec) return next(out)
+      if (rec.unsupportedClaimMirror && rec.unsupportedClaimMirror.served === true) return next(out)
+      if (!rec.unsupportedClaimMirror) {
+        if (CONFIG.unsupportedClaimMirror !== true) return next(out)
+        const lastClaim = Array.isArray(rec.claims) ? rec.claims[rec.claims.length - 1] : null
+        if (!lastClaim) return next(out)
+        const u = unsupportedClaim({ claim: lastClaim, verifyEvidence: rec.verifyEvidence })
+        if (u.unsupported !== true) return next(out)
+        rec.unsupportedClaimMirror = { served: false, via: 'post-claim-assemble', reason: u.reason }
+        logAudit(rec, 'unsupported-claim', { via: 'post-claim-assemble', reason: u.reason })
+      }
+      rec.unsupportedClaimMirror.served = true
+      const section = {
+        name: 'trajectory-anchor:unsupported-claim',
+        text: '[trajectory-anchor] Your delivery asserts an outcome, but this session contains NO verification evidence '
+          + 'to support it. Run the task\'s grading command and quote its output before finishing.',
+      }
+      return next({ ...out, sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections })
+    } catch (e) {
+      warnOnce(`unsupported-claim mirror failed, skipping: ${msg(e)}`)
+      return next(out)
+    }
+  }))
+
+  // ---- F7 证据矛盾（criteria 第二波）：声称全过但最后一次验证仍带失败 ----
+  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
+    try {
+      const id = payload && payload.agent && payload.agent.id
+      const rec = id ? recs.get(id) : null
+      if (!rec) return next(out)
+      if (rec.evidenceContradictionMirror && rec.evidenceContradictionMirror.served === true) return next(out)
+      if (!rec.evidenceContradictionMirror) {
+        if (CONFIG.evidenceContradictionMirror !== true) return next(out)
+        const lastClaim = Array.isArray(rec.claims) ? rec.claims[rec.claims.length - 1] : null
+        if (!lastClaim) return next(out)
+        const x = evidenceContradiction({ claim: lastClaim, verifyEvidence: rec.verifyEvidence })
+        if (x.contradiction !== true) return next(out)
+        rec.evidenceContradictionMirror = { served: false, via: 'post-claim-assemble', reason: x.reason, evidence: x.evidence }
+        logAudit(rec, 'evidence-contradiction', { via: 'post-claim-assemble', reason: x.reason, ...x.evidence })
+      }
+      rec.evidenceContradictionMirror.served = true
+      const e = rec.evidenceContradictionMirror.evidence || {}
+      const section = {
+        name: 'trajectory-anchor:evidence-contradiction',
+        text: '[trajectory-anchor] Your delivery claims a full pass, but your last verification still shows failures:\n\n'
+          + `${e.outputTail || ''}\n\n`
+          + 'Re-run the verification and quote its result, or say explicitly which failures you believe do not count.',
+      }
+      return next({ ...out, sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections })
+    } catch (e) {
+      warnOnce(`evidence-contradiction mirror failed, skipping: ${msg(e)}`)
       return next(out)
     }
   }))

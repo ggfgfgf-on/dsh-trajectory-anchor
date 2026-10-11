@@ -656,3 +656,65 @@ export function claimFormatOk(claimText, reportFormat) {
   const re = new RegExp(`PASS\\s*=\\s*\\d+\\s*\\/\\s*${total}\\b`, 'i')
   return re.test(t)
 }
+
+/**
+ * F6 无出处结果断言（纯函数）：交付声明了一个可测量的结局，但会话里**没有任何
+ * 验证证据**能支撑它。判据保守：只认"零验证证据"这一种无法辩解的情形——
+ * 有验证但没通过那是 F7/P1 的事。
+ *
+ * @param {object} input
+ * @param {object} [input.claim] 声明（claimedDone/claimedPass，可选 turn/step）
+ * @param {Array} input.verifyEvidence [{turn,step,...}]
+ * @returns {{unsupported:boolean, reason:string|null}}
+ */
+export function unsupportedClaim(input) {
+  const { claim = null, verifyEvidence = [] } = input || {}
+  if (!claim || (claim.claimedDone !== true && claim.claimedPass === null)) {
+    return { unsupported: false, reason: 'no-completion-claim' }
+  }
+  const hasPos = (v) => typeof v === 'number'
+  const after = (a, b) => (a.turn > b.turn) || (a.turn === b.turn && a.step > b.step)
+  const claimAt = hasPos(claim.turn) && hasPos(claim.step) ? { turn: claim.turn, step: claim.step } : null
+  const atOrBefore = (v) => !claimAt || !hasPos(v.turn) || !hasPos(v.step) || !after(v, claimAt)
+  const list = (verifyEvidence || []).filter((v) => v && atOrBefore(v))
+  if (list.length === 0) return { unsupported: true, reason: 'no-verification-evidence' }
+  return { unsupported: false, reason: 'has-verification-evidence' }
+}
+
+/**
+ * F7 证据矛盾（纯函数）：交付声称**全过**（claimedPass === claimedTotal），
+ * 但其最后一次验证仍带失败标记 ⇒ 声称与自己的证据直接矛盾。
+ * 与 P1 的区别：P1 只认**隐藏评测形态**的验证；F7 认**任何**验证（更宽的族成员）。
+ *
+ * @param {object} input
+ * @param {object} [input.claim] 声明（claimedDone/claimedPass/claimedTotal，可选 turn/step）
+ * @param {Array} input.verifyEvidence [{turn,step,failed,cmd,outputTail,...}]
+ * @returns {{contradiction:boolean, reason:string|null, evidence:object|null}}
+ */
+export function evidenceContradiction(input) {
+  const { claim = null, verifyEvidence = [] } = input || {}
+  if (!claim || (claim.claimedDone !== true && claim.claimedPass === null)) {
+    return { contradiction: false, reason: 'no-completion-claim', evidence: null }
+  }
+  if (claim.claimedPass === null || claim.claimedTotal === null || claim.claimedPass < claim.claimedTotal) {
+    return { contradiction: false, reason: 'not-claiming-perfection', evidence: null }
+  }
+  const hasPos = (v) => typeof v === 'number'
+  const after = (a, b) => (a.turn > b.turn) || (a.turn === b.turn && a.step > b.step)
+  const claimAt = hasPos(claim.turn) && hasPos(claim.step) ? { turn: claim.turn, step: claim.step } : null
+  const atOrBefore = (v) => !claimAt || !hasPos(v.turn) || !hasPos(v.step) || !after(v, claimAt)
+  const list = (verifyEvidence || []).filter((v) => v && atOrBefore(v))
+  const lastV = list[list.length - 1]
+  if (!lastV) return { contradiction: false, reason: 'no-verification-evidence', evidence: null }
+  if (lastV.failed !== true) return { contradiction: false, reason: 'last-verify-passed', evidence: null }
+  return {
+    contradiction: true,
+    reason: 'claim-perfect-but-verify-failed',
+    evidence: {
+      verifyCmd: typeof lastV.cmd === 'string' ? lastV.cmd : null,
+      verifyTurn: lastV.turn, verifyStep: lastV.step,
+      failCount: lastV.failCount ?? null,
+      outputTail: typeof lastV.outputTail === 'string' ? lastV.outputTail : null,
+    },
+  }
+}
