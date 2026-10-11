@@ -154,6 +154,7 @@ for (const f of files) {
     unsupportedFire: row.unsupportedClaimMirror,
     contradictionFire: row.evidenceContradictionMirror,
     itemizedFire: row.itemizedClaimMirror,
+    f2Unsupported: (row.itemizedClaimMirror && row.itemizedClaimMirror.served === true && Array.isArray(row.itemizedClaimMirror.unsupported)) ? row.itemizedClaimMirror.unsupported : null,
     artifactGate: row.deliveryArtifactGate,
     artifactBinding: row.artifactBinding,
     editBudget: row.editBudget,
@@ -248,6 +249,20 @@ for (const r of f7Fires) {
   console.log(`  [${r.label}] ${r.sid}  via=${r.contradictionFire.via} reason=${r.contradictionFire.reason}`)
 }
 if (f7Fires.length === 0) console.log('  （无开火）')
+
+// ── F2 复核材料导出（§55 记的债务）：每次开火的会话 + 被点名的无证据条目 ──────
+const f2ReviewPath = val('--f2-review', '')
+if (f2ReviewPath) {
+  const lines = []
+  let n = 0
+  for (const r of rows) {
+    if (!r.f2Unsupported || r.f2Unsupported.length === 0) continue
+    n += 1
+    lines.push(JSON.stringify({ sid: r.sid, label: r.label, unsupported: r.f2Unsupported, verifies: r.evidence ? r.evidence.verifyEvidence : null, edits: r.evidence ? r.evidence.edits : null }))
+  }
+  writeFileSync(resolve(f2ReviewPath), lines.join('\n') + '\n', 'utf8')
+  console.log(`\nF2 复核材料已写：${f2ReviewPath}（${n} 次开火）`)
+}
 
 if (jsonOut) {
   writeFileSync(jsonOut, JSON.stringify({ at: new Date().toISOString(), sessionsDir, rows, f3Fires: f3Fires.map((r) => r.sid), f5Fires: f5Fires.map((r) => r.sid), p1Fires: p1Fires.map((r) => r.sid), p2Armed: p2Armed.map((r) => r.sid), p3Fires: p3Fires.map((r) => r.sid), f6Fires: f6Fires.map((r) => r.sid), f7Fires: f7Fires.map((r) => r.sid), q1pBound: q1pBound.map((r) => r.sid) }, null, 2))

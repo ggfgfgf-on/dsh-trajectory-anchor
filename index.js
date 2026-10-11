@@ -3591,7 +3591,7 @@ function summaryOf(rec) {
     claimFormat: rec.claimFormat ? { served: rec.claimFormat.served === true, via: rec.claimFormat.via || null } : null,
     unsupportedClaimMirror: rec.unsupportedClaimMirror ? { served: rec.unsupportedClaimMirror.served === true, via: rec.unsupportedClaimMirror.via || null, reason: rec.unsupportedClaimMirror.reason || null } : null,
     evidenceContradictionMirror: rec.evidenceContradictionMirror ? { served: rec.evidenceContradictionMirror.served === true, via: rec.evidenceContradictionMirror.via || null, reason: rec.evidenceContradictionMirror.reason || null } : null,
-    itemizedClaimMirror: rec.itemizedClaimMirror ? { served: rec.itemizedClaimMirror.served === true, via: rec.itemizedClaimMirror.via || null, reason: rec.itemizedClaimMirror.reason || null, unsupportedCount: Array.isArray(rec.itemizedClaimMirror.unsupported) ? rec.itemizedClaimMirror.unsupported.length : null } : null,
+    itemizedClaimMirror: rec.itemizedClaimMirror ? { served: rec.itemizedClaimMirror.served === true, via: rec.itemizedClaimMirror.via || null, reason: rec.itemizedClaimMirror.reason || null, unsupportedCount: Array.isArray(rec.itemizedClaimMirror.unsupported) ? rec.itemizedClaimMirror.unsupported.length : null, unsupported: Array.isArray(rec.itemizedClaimMirror.unsupported) ? rec.itemizedClaimMirror.unsupported.slice(0, 8) : [] } : null,
     editBudget: { count: rec.editBudget.count, exhausted: rec.editBudget.exhausted === true, served: rec.editBudget.served === true },
     editHold: { editsSinceVerify: rec.editHold.editsSinceVerify, holding: rec.editHold.holding === true, violations: rec.editHold.violations, released: rec.editHold.released, served: rec.editHold.served === true },
     deliveryArtifactGate: rec.deliveryArtifactGate ? { served: rec.deliveryArtifactGate.served === true, via: rec.deliveryArtifactGate.via || null, reason: rec.deliveryArtifactGate.reason || null } : null,
@@ -4496,7 +4496,7 @@ export function apply(ctx, config) {
         const f = itemizedClaimFacts({ claimText: lastClaim.text || '', edits: rec.edits, verifyEvidence: rec.verifyEvidence })
         if (f.fired !== true) return next(out)
         rec.itemizedClaimMirror = { served: false, via: 'post-claim-assemble', reason: f.reason, unsupported: f.unsupported }
-        logAudit(rec, 'itemized-claim-gap', { via: 'post-claim-assemble', reason: f.reason, ...f.evidence })
+        logAudit(rec, 'itemized-claim-gap', { via: 'post-claim-assemble', reason: f.reason, ...f.evidence, unsupported: f.unsupported.slice(0, 8) })
       }
       rec.itemizedClaimMirror.served = true
       const list = (rec.itemizedClaimMirror.unsupported || []).map((u) => `- ${u}`).join('\n')
