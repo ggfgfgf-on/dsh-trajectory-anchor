@@ -11,7 +11,7 @@
  */
 import { pathToFileURL, fileURLToPath } from 'node:url'
 import { resolve, join } from 'node:path'
-import { writeFileSync, rmSync, mkdtempSync } from 'node:fs'
+import { writeFileSync, rmSync, mkdtempSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 
 const here = fileURLToPath(new URL('.', import.meta.url))
@@ -436,6 +436,81 @@ await boot({ deliveryArtifactStateGate: false })
   const row = await summaryOf('pg-q1p-off')
   check('Q1p 反向：默认关 ⇒ 不绑定、不注入', held === false && (!row.artifactBinding),
     JSON.stringify(row.artifactBinding))
+}
+// ── Q1'' 递归绑定增面（§49.5 探针前置的自查修法）────────────────────────────
+await boot({ deliveryArtifactStateGate: true })
+{
+  // grader 从运行根跑（模板埋在 workspace\project2_task 下两层）⇒ 递归找到并绑定（m1-2 场景）
+  const fix = mkdtempSync(join(tmpdir(), 'pg-q1p2-'))
+  const ws = join(fix, 'workspace', 'project2_task')
+  mkdirSync(ws, { recursive: true })
+  const art = join(ws, 'PULL_REQUEST_TEMPLATE.md')
+  writeFileSync(art, '# seed\n')
+  const { session } = makeAgent('pg-q1p2')
+  sessionEvent(session, verifyCall(1, 1, `cd '${fix}'; python -X utf8 evaluator/run_public_tests.py workspace/project2_task`))
+  sessionEvent(session, verifyResult(1, 1, FAIL_TEXT))
+  const row = await summaryOf('pg-q1p2')
+  check('Q1p2 开：cd 运行根 ⇒ 递归找到深层模板并绑定（m1-2 场景）',
+    row.artifactBinding && row.artifactBinding.path === art, JSON.stringify(row.artifactBinding))
+}
+await boot({ deliveryArtifactStateGate: true })
+{
+  // 文件 artifact 的祖父目录：Test-Path 只给 grader 脚本路径 ⇒ 从运行根找到模板（m1-7 场景）
+  const fix = mkdtempSync(join(tmpdir(), 'pg-q1p2b-'))
+  const ev = join(fix, 'evaluator')
+  mkdirSync(ev, { recursive: true })
+  writeFileSync(join(ev, 'run_hidden_tests.py'), 'print(1)\n')
+  const ws = join(fix, 'workspace', 'project2_task')
+  mkdirSync(ws, { recursive: true })
+  const art = join(ws, 'PULL_REQUEST_TEMPLATE.md')
+  writeFileSync(art, '# seed\n')
+  const { session } = makeAgent('pg-q1p2b')
+  sessionEvent(session, verifyCall(1, 1, `Test-Path '${join(ev, 'run_hidden_tests.py')}'`))
+  sessionEvent(session, verifyResult(1, 1, 'True'))
+  const row = await summaryOf('pg-q1p2b')
+  check('Q1p2 开：文件 artifact 的祖父目录 ⇒ 找到模板（m1-7 Test-Path 场景）',
+    row.artifactBinding && row.artifactBinding.path === art, JSON.stringify(row.artifactBinding))
+}
+await boot({ deliveryArtifactStateGate: true })
+{
+  // 深度超限 ⇒ 不绑（fail-open 不猜）
+  const fix = mkdtempSync(join(tmpdir(), 'pg-q1p2c-'))
+  const deep = join(fix, 'a', 'b', 'c', 'd', 'e', 'f')
+  mkdirSync(deep, { recursive: true })
+  writeFileSync(join(deep, 'PULL_REQUEST_TEMPLATE.md'), '# too deep\n')
+  const { session } = makeAgent('pg-q1p2c')
+  sessionEvent(session, verifyCall(1, 1, `cd '${fix}'; python -X utf8 evaluator/run_public_tests.py`))
+  sessionEvent(session, verifyResult(1, 1, FAIL_TEXT))
+  const row = await summaryOf('pg-q1p2c')
+  check('Q1p2 反向：模板埋过深（>4 层）⇒ 不绑', (!row.artifactBinding), JSON.stringify(row.artifactBinding))
+}
+await boot({ deliveryArtifactStateGate: true })
+{
+  // 跳过目录：node_modules 里的模板不算
+  const fix = mkdtempSync(join(tmpdir(), 'pg-q1p2d-'))
+  const nm = join(fix, 'node_modules', 'x')
+  mkdirSync(nm, { recursive: true })
+  writeFileSync(join(nm, 'PULL_REQUEST_TEMPLATE.md'), '# vendored\n')
+  const { session } = makeAgent('pg-q1p2d')
+  sessionEvent(session, verifyCall(1, 1, `cd '${fix}'; python -X utf8 evaluator/run_public_tests.py`))
+  sessionEvent(session, verifyResult(1, 1, FAIL_TEXT))
+  const row = await summaryOf('pg-q1p2d')
+  check('Q1p2 反向：node_modules 里的模板 ⇒ 不绑', (!row.artifactBinding), JSON.stringify(row.artifactBinding))
+}
+await boot({ deliveryArtifactStateGate: true })
+{
+  // 最浅命中优先：根有模板、深层也有 ⇒ 绑根的
+  const fix = mkdtempSync(join(tmpdir(), 'pg-q1p2e-'))
+  const rootArt = join(fix, 'PULL_REQUEST_TEMPLATE.md')
+  writeFileSync(rootArt, '# root\n')
+  const sub = join(fix, 'workspace', 'project2_task')
+  mkdirSync(sub, { recursive: true })
+  writeFileSync(join(sub, 'PULL_REQUEST_TEMPLATE.md'), '# sub\n')
+  const { session } = makeAgent('pg-q1p2e')
+  sessionEvent(session, verifyCall(1, 1, `cd '${fix}'; python -X utf8 evaluator/run_public_tests.py`))
+  sessionEvent(session, verifyResult(1, 1, FAIL_TEXT))
+  const row = await summaryOf('pg-q1p2e')
+  check('Q1p2 开：多个候选时最浅命中优先', row.artifactBinding && row.artifactBinding.path === rootArt, JSON.stringify(row.artifactBinding))
 }
 {
   // 纯函数负向对照：状态变化三轴（sha/size/mtime）各自触发、fail-open、删除 vs 读失败。

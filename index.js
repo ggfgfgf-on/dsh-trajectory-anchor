@@ -279,8 +279,43 @@ const CONFIG_KEYS = new Set(Object.keys(DEFAULTS))
 
 // ── Q1' 工件状态绑定门（process-gate §6）的绑定/快照助手 ──────────────────────
 const DELIVERY_ARTIFACT_NAMES = ['PULL_REQUEST_TEMPLATE.md', 'PULL_REQUEST_TEMPLATE.txt', 'PULL_REQUEST_TEMPLATE']
+// Windows 文件名大小写不敏感：匹配一律走小写（Q1 用 /pull_request_template/i 也是这个口径）。
+const DELIVERY_ARTIFACT_NAMES_LOWER = new Set(DELIVERY_ARTIFACT_NAMES.map((n) => n.toLowerCase()))
+// Q1'' 递归搜索边界（§49.5 探针前置的自查修法）：历史验证命令常从**运行根**跑 grader
+// （模板埋在 workspace\project2_task 下两层），naive 只看候选目录本身 ⇒ 绑定覆盖只有
+// 4/8。BFS 向下最多 ARTIFACT_SEARCH_DEPTH 层、总条目预算、跳过重型目录——每次验证只搜
+// 一次，成本有界；最浅命中优先，顺序确定。
+const ARTIFACT_SEARCH_DEPTH = 4
+const ARTIFACT_SEARCH_BUDGET = 400
+const ARTIFACT_SKIP_DIRS = new Set(['.git', 'node_modules', '__pycache__', '.venv', 'venv', 'dist', '.dsh'])
 
-/** 绑定目录候选：验证命令里所有的 `cd '...'`（绝对路径且存在）+ 命令路径里存在的绝对目录 + 会话 cwd。 */
+/** 从 rootDir 向下 BFS 找交付工件文件；找到返回绝对路径，超预算/超深返回 null（fail-open 不猜）。 */
+function findDeliveryArtifact(rootDir) {
+  let queue = [rootDir]
+  let entries = 0
+  for (let depth = 0; depth <= ARTIFACT_SEARCH_DEPTH && queue.length > 0; depth++) {
+    const next = []
+    for (const dir of queue) {
+      let names
+      try { names = readdirSync(dir) } catch { continue }
+      for (const name of names) {
+        if (entries++ > ARTIFACT_SEARCH_BUDGET) return null
+        const p = resolvePath(dir, name)
+        if (DELIVERY_ARTIFACT_NAMES_LOWER.has(name.toLowerCase())) {
+          try { if (statSync(p).isFile()) return p } catch { /* 读不到继续找 */ }
+        }
+        if (ARTIFACT_SKIP_DIRS.has(name)) continue
+        try { if (statSync(p).isDirectory()) next.push(p) } catch { /* 读不到跳过 */ }
+      }
+    }
+    queue = next
+  }
+  return null
+}
+
+/** 绑定目录候选：验证命令里所有的 `cd '...'`（绝对路径且存在）+ 命令路径里存在的绝对目录
+ *  + 绝对**文件** artifact 的父/祖父目录（grader 脚本在 evaluator\ 下，模板在运行根深处）
+ *  + 会话 cwd。 */
 function artifactBindingDirs(cmd) {
   const dirs = []
   const cdRe = /(?:^|[;&\n])\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/gi
@@ -290,13 +325,25 @@ function artifactBindingDirs(cmd) {
     if (d && isAbsolute(d) && existsSync(d)) dirs.push(d)
   }
   for (const p of commandPaths(cmd || '').slice(0, 12)) {
-    try { if (p && isAbsolute(p) && existsSync(p) && statSync(p).isDirectory()) dirs.push(p) } catch { /* 读不到就跳过 */ }
+    if (!p || !isAbsolute(p)) continue
+    try {
+      const st = statSync(p)
+      if (st.isDirectory()) dirs.push(p)
+      else if (st.isFile()) {
+        // 文件 artifact：把父目录（evaluator\）与祖父目录（运行根）都作为候选——
+        // Q1 实测里 Test-Path/直接跑 grader 脚本的验证命令都只有文件路径。
+        const parent = dirname2(p)
+        if (existsSync(parent)) dirs.push(parent)
+        const grand = dirname2(parent)
+        if (grand !== parent && existsSync(grand)) dirs.push(grand)
+      }
+    } catch { /* 读不到就跳过 */ }
   }
   if (typeof sessionCwd === 'string' && sessionCwd) dirs.push(sessionCwd)
   return dirs
 }
 
-/** 验证证据落地后调用：找到交付工件文件就绑定 {path, mtimeMs, size, sha, failed...}。 */
+/** 验证证据落地后调用：递归找到交付工件文件就绑定 {path, mtimeMs, size, sha, failed...}。 */
 function bindDeliveryArtifact(rec, turn, step) {
   const cmd = typeof rec.lastVerifyCmd === 'string' ? rec.lastVerifyCmd : ''
   const seen = new Set()
@@ -304,30 +351,28 @@ function bindDeliveryArtifact(rec, turn, step) {
     const key = d.toLowerCase()
     if (seen.has(key)) continue
     seen.add(key)
-    for (const name of DELIVERY_ARTIFACT_NAMES) {
-      const f = resolvePath(d, name)
-      try {
-        const st = statSync(f)
-        if (!st.isFile()) continue
-        const sha = createHash('sha256').update(readFileSync(f)).digest('hex')
-        const last = rec.verifyEvidence.length ? rec.verifyEvidence[rec.verifyEvidence.length - 1] : null
-        const binding = {
-          turn: typeof turn === 'number' ? turn : null,
-          step: typeof step === 'number' ? step : null,
-          at: Date.now(),
-          path: f,
-          mtimeMs: st.mtimeMs,
-          size: st.size,
-          sha,
-          failed: Boolean(last && last.failed === true),
-          failCount: last && typeof last.failCount === 'number' ? last.failCount : null,
-          verifyCmd: cmd.slice(0, 300),
-          served: false,
-        }
-        rec.artifactBinding = binding
-        return { turn: binding.turn, step: binding.step, path: binding.path, size: binding.size, failed: binding.failed, failCount: binding.failCount }
-      } catch { /* 继续找下一个候选 */ }
-    }
+    const f = findDeliveryArtifact(d)
+    if (!f) continue
+    try {
+      const st = statSync(f)
+      const sha = createHash('sha256').update(readFileSync(f)).digest('hex')
+      const last = rec.verifyEvidence.length ? rec.verifyEvidence[rec.verifyEvidence.length - 1] : null
+      const binding = {
+        turn: typeof turn === 'number' ? turn : null,
+        step: typeof step === 'number' ? step : null,
+        at: Date.now(),
+        path: f,
+        mtimeMs: st.mtimeMs,
+        size: st.size,
+        sha,
+        failed: Boolean(last && last.failed === true),
+        failCount: last && typeof last.failCount === 'number' ? last.failCount : null,
+        verifyCmd: cmd.slice(0, 300),
+        served: false,
+      }
+      rec.artifactBinding = binding
+      return { turn: binding.turn, step: binding.step, path: binding.path, size: binding.size, failed: binding.failed, failCount: binding.failCount }
+    } catch { /* 继续找下一个候选 */ }
   }
   return null
 }
