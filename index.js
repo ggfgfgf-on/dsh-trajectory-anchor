@@ -36,14 +36,15 @@
  * TRAJECTORY_ANCHOR_LEXICON_PATH; CJK-safe term matching (no ASCII \b).
  */
 
-import { readFileSync, mkdirSync, appendFileSync, existsSync, readdirSync, writeFileSync } from 'node:fs'
+import { readFileSync, mkdirSync, appendFileSync, existsSync, readdirSync, writeFileSync, statSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { isAbsolute, resolve as resolvePath, dirname as dirname2 } from 'node:path'
 // L1：任务锚定信号的**单一实现**（tools/task-anchor-core.mjs 是纯模块，不反向 import 本文件，
 // 因此没有循环依赖）。为什么不在这里再写一份：本项目已经两次栽在"两套规则各说各话"
 // （台账定稿 51 倍偏差、两级连续计数混层），所以本轮一律共用一份实现。
 import {
   parseTaskAnchors, inScope, isIgnorablePath, changeInvalidatesVerification, pathsFromCallStrict, isWriteTool, isReadTool,
-  verifyCommandKind, claimsFromFinalMessage, commandPaths, verifyStaleness, deliveryGate, claimFormatOk, unsupportedClaim, evidenceContradiction, artifactDeliveryFacts,
+  verifyCommandKind, claimsFromFinalMessage, commandPaths, verifyStaleness, deliveryGate, claimFormatOk, unsupportedClaim, evidenceContradiction, artifactDeliveryFacts, artifactStateFacts,
 } from './tools/task-anchor-core.mjs'
 // 纠偏线索**共用离线标注那一份**（`drift-label-core` 零依赖、只读）：避免"标注用的判据"
 // 与"运行时触发的判据"各写一份、然后悄悄漂移（本项目在台账与形态识别上各栽过一次）。
@@ -84,6 +85,9 @@ const DEFAULTS = {
                                   // 下一次 pre-step 注入"不许再改，先重验"；只有验证证据落地才解除。0=关。
   deliveryArtifactGate: false,    // Q1 交付工件门：写交付工件（PR 模板）时隐藏评测带失败/早于最近编辑
                                   // ⇒ 拒绝接收该工件（回合还开着的位置，P1 重跑率 0/7 的结构性修法）
+  deliveryArtifactStateGate: false, // Q1' 工件状态绑定门（process-gate §6）：验证时绑定工件文件状态
+                                  // （mtime/size/sha），pre-step 比对"最近验证后被动过/被删"⇒ 注入重验保持。
+                                  // 文件状态观测 ⇒ 脚本通道写入可见；任意 grader 验证都能绑定（Q1 的两个盲区）。
   bootstrapTools: ['bash', 'str_replace_editor', 'pwsh'],
   bootstrapMaxTokens: null,
   bootstrapPersona: 'You are a helpful software engineer assistant.',
@@ -272,6 +276,73 @@ const DEFAULTS = {
 }
 
 const CONFIG_KEYS = new Set(Object.keys(DEFAULTS))
+
+// ── Q1' 工件状态绑定门（process-gate §6）的绑定/快照助手 ──────────────────────
+const DELIVERY_ARTIFACT_NAMES = ['PULL_REQUEST_TEMPLATE.md', 'PULL_REQUEST_TEMPLATE.txt', 'PULL_REQUEST_TEMPLATE']
+
+/** 绑定目录候选：验证命令里所有的 `cd '...'`（绝对路径且存在）+ 命令路径里存在的绝对目录 + 会话 cwd。 */
+function artifactBindingDirs(cmd) {
+  const dirs = []
+  const cdRe = /(?:^|[;&\n])\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/gi
+  let m
+  while ((m = cdRe.exec(cmd || ''))) {
+    const d = m[1] || m[2] || m[3]
+    if (d && isAbsolute(d) && existsSync(d)) dirs.push(d)
+  }
+  for (const p of commandPaths(cmd || '').slice(0, 12)) {
+    try { if (p && isAbsolute(p) && existsSync(p) && statSync(p).isDirectory()) dirs.push(p) } catch { /* 读不到就跳过 */ }
+  }
+  if (typeof sessionCwd === 'string' && sessionCwd) dirs.push(sessionCwd)
+  return dirs
+}
+
+/** 验证证据落地后调用：找到交付工件文件就绑定 {path, mtimeMs, size, sha, failed...}。 */
+function bindDeliveryArtifact(rec, turn, step) {
+  const cmd = typeof rec.lastVerifyCmd === 'string' ? rec.lastVerifyCmd : ''
+  const seen = new Set()
+  for (const d of artifactBindingDirs(cmd)) {
+    const key = d.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    for (const name of DELIVERY_ARTIFACT_NAMES) {
+      const f = resolvePath(d, name)
+      try {
+        const st = statSync(f)
+        if (!st.isFile()) continue
+        const sha = createHash('sha256').update(readFileSync(f)).digest('hex')
+        const last = rec.verifyEvidence.length ? rec.verifyEvidence[rec.verifyEvidence.length - 1] : null
+        const binding = {
+          turn: typeof turn === 'number' ? turn : null,
+          step: typeof step === 'number' ? step : null,
+          at: Date.now(),
+          path: f,
+          mtimeMs: st.mtimeMs,
+          size: st.size,
+          sha,
+          failed: Boolean(last && last.failed === true),
+          failCount: last && typeof last.failCount === 'number' ? last.failCount : null,
+          verifyCmd: cmd.slice(0, 300),
+          served: false,
+        }
+        rec.artifactBinding = binding
+        return { turn: binding.turn, step: binding.step, path: binding.path, size: binding.size, failed: binding.failed, failCount: binding.failCount }
+      } catch { /* 继续找下一个候选 */ }
+    }
+  }
+  return null
+}
+
+/** pre-step 用的当前状态快照（读不到 ⇒ exists:false；ENOENT=被删，其余=读失败，谓词区分两者）。 */
+function artifactStateNow(path) {
+  try {
+    const st = statSync(path)
+    if (!st.isFile()) return { exists: false, missing: false }
+    const sha = createHash('sha256').update(readFileSync(path)).digest('hex')
+    return { exists: true, mtimeMs: st.mtimeMs, size: st.size, sha }
+  } catch (e) {
+    return { exists: false, missing: Boolean(e && e.code === 'ENOENT') }
+  }
+}
 
 export const name = 'dsh-trajectory-anchor'
 
@@ -2548,6 +2619,8 @@ function adopt(agent, doAnchor, channel) {
     editHold: { editsSinceVerify: 0, holding: false, violations: 0, released: 0, served: false },
     // Q1 交付工件门（默认关；每次工件重写可重新武装）
     deliveryArtifactGate: null,
+    // Q1' 工件状态绑定门（默认关；每次验证重新绑定=解除）
+    artifactBinding: null,
     /** 待发出的拉回原因（工具调用时置位，pre-step 时消费；保证"触发点=说出口的点"）。 */
     pendingPullback: null,
     pullback: {
@@ -2734,6 +2807,13 @@ function feedSessionEvent(session, event) {
           failed, failCount,
           artifacts: rec.verifyEvidence[rec.verifyEvidence.length - 1].artifacts,
         })
+        // Q1' 工件状态绑定（process-gate §6）：验证证据落地 ⇒ 把交付工件的文件状态绑定进记录
+        // （mtime/size/sha）。绑定只看文件状态 ⇒ 脚本通道写入可见（Q1 盲区修法）；
+        // 任意 grader 验证都会走到这里 ⇒ 不再只认 hidden（Q1 的第二个盲区）。
+        if (CONFIG.deliveryArtifactStateGate === true) {
+          const bound = bindDeliveryArtifact(rec, event.data && event.data.turn, event.data && event.data.step)
+          if (bound) logAudit(rec, 'artifact-binding', { ...bound })
+        }
         // Q2 解除条件：**证据落地**才解除保持态（不是计时器——设计 §3 Q2 的预算恢复语义）。
         if (rec.editHold.holding) {
           rec.editHold.holding = false
@@ -3342,6 +3422,7 @@ function summaryOf(rec) {
     editBudget: { count: rec.editBudget.count, exhausted: rec.editBudget.exhausted === true, served: rec.editBudget.served === true },
     editHold: { editsSinceVerify: rec.editHold.editsSinceVerify, holding: rec.editHold.holding === true, violations: rec.editHold.violations, released: rec.editHold.released, served: rec.editHold.served === true },
     deliveryArtifactGate: rec.deliveryArtifactGate ? { served: rec.deliveryArtifactGate.served === true, via: rec.deliveryArtifactGate.via || null, reason: rec.deliveryArtifactGate.reason || null } : null,
+    artifactBinding: rec.artifactBinding ? { path: rec.artifactBinding.path || null, boundTurn: rec.artifactBinding.turn ?? null, boundStep: rec.artifactBinding.step ?? null, sha: rec.artifactBinding.sha ? rec.artifactBinding.sha.slice(0, 12) : null, verifyFailed: rec.artifactBinding.failed === true, served: rec.artifactBinding.served === true } : null,
     evidence: {
       verifyEvidence: rec.verifyEvidence.length,
       edits: rec.edits.length,
@@ -3514,6 +3595,7 @@ function buildSummary(filter) {
       editBudgetCap: CONFIG.editBudgetCap,
       editHoldEvery: CONFIG.editHoldEvery,
       deliveryArtifactGate: CONFIG.deliveryArtifactGate === true,
+      deliveryArtifactStateGate: CONFIG.deliveryArtifactStateGate === true,
       reanchorEnabled: CONFIG.reanchorEnabled === true,
       reanchorEvidencePath: CONFIG.reanchorEvidencePath || null,
       pullbackOutcomePath: CONFIG.pullbackOutcomePath || null,
@@ -4326,6 +4408,29 @@ export function apply(ctx, config) {
             + `No further edits until you re-run the verification (last seen: ${String(rec.lastVerifyCmd || '(none)').slice(0, 200)}) and quote its output.` }],
         }
         return { ...decision, messages: [...decision.messages, holdMsg] }
+      }
+      // ── Q1' 工件状态绑定门（process-gate §6）：本步边界处，交付工件自最近一次验证后
+      //    被动过/被删 ⇒ 注入"先重验再交付"保持消息（每次绑定期一次；重验刷新绑定=解除）。
+      //    注入点在 pre-step：回合还开着（P1 的"最后一条消息"结构缺陷不在这个位置）。
+      if (CONFIG.deliveryArtifactStateGate === true && rec.artifactBinding && !rec.artifactBinding.served && decision && Array.isArray(decision.messages)) {
+        const cur = artifactStateNow(rec.artifactBinding.path)
+        const facts = artifactStateFacts({ binding: rec.artifactBinding, current: cur })
+        if (facts.refuse === true) {
+          rec.artifactBinding.served = true
+          logAudit(rec, 'artifact-stale-gate', { reason: facts.reason, ...(facts.evidence || {}), turn: payload.turn, step: payload.step })
+          const why = facts.reason === 'artifact-removed'
+            ? 'the delivery artifact is missing since your last verification — restore it, then re-run the grader and quote its output'
+            : 'the delivery artifact was modified since your last verification — re-run the grader and quote its output in the artifact before delivering'
+          const lastGrader = String((rec.artifactBinding && rec.artifactBinding.verifyCmd) || '(none)').slice(0, 200)
+          const failedNote = rec.artifactBinding.failed === true
+            ? `; that last run still showed failures (failed=${rec.artifactBinding.failCount ?? '?'})`
+            : ''
+          const gateMsg = {
+            source: { kind: 'trajectory-anchor-artifact-gate' },
+            content: [{ type: 'text', text: `[trajectory-anchor] DELIVERY ARTIFACT HOLD: ${why}${failedNote}. Last grader: ${lastGrader}` }],
+          }
+          return { ...decision, messages: [...decision.messages, gateMsg] }
+        }
       }
       // ── L1 任务锚定拉回：在**近因位置**追加一条独立消息 ───────────────────────
       // 为什么挂 pre-step 而不是 system prompt 前缀（社区 allostasis 的原文理由）：

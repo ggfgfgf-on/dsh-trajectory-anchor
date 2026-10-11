@@ -10,11 +10,13 @@
  * and the "must not fire" controls. Usage: node tools/test-protocol-gates.mjs [path/to/index.js]
  */
 import { pathToFileURL, fileURLToPath } from 'node:url'
-import { resolve } from 'node:path'
+import { resolve, join } from 'node:path'
+import { writeFileSync, rmSync, mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 
 const here = fileURLToPath(new URL('.', import.meta.url))
 const mod = await import(pathToFileURL(resolve(here, process.argv[2] || '../index.js')).href)
-const { deliveryGate, claimFormatOk } = await import(pathToFileURL(resolve(here, 'task-anchor-core.mjs')).href)
+const { deliveryGate, claimFormatOk, artifactStateFacts } = await import(pathToFileURL(resolve(here, 'task-anchor-core.mjs')).href)
 
 let pass = 0
 let fail = 0
@@ -369,6 +371,84 @@ await boot({ deliveryArtifactGate: true })
   sessionEvent(session, editOk(1, 2, 'a1'))
   const out = await assemble('pg-q1-other')
   check('Q1 反向：非交付工件（README）⇒ 不拒', section(out, 'trajectory-anchor:delivery-artifact-gate') === undefined, JSON.stringify((out.sections || []).map((s) => s.name)))
+}
+
+// ── Q1' 工件状态绑定门（process-gate §6）────────────────────────────────────
+await boot({ deliveryArtifactStateGate: true })
+{
+  // 真实临时工件文件：绑定与比对都走磁盘文件状态（脚本通道写入也可见）。
+  const fixDir = mkdtempSync(join(tmpdir(), 'pg-q1p-'))
+  const artPath = join(fixDir, 'PULL_REQUEST_TEMPLATE.md')
+  writeFileSync(artPath, '# seed template\n')
+  const { session } = makeAgent('pg-q1p')
+  sessionEvent(session, verifyCall(1, 1, `cd '${fixDir}'; python -X utf8 evaluator/run_public_tests.py`))
+  sessionEvent(session, verifyResult(1, 1, FAIL_TEXT))
+  const row0 = await summaryOf('pg-q1p')
+  check('Q1p 开：任意 grader 验证落地 ⇒ 绑定工件状态（public 也武装，且带失败证据）',
+    row0.artifactBinding && row0.artifactBinding.path === artPath && row0.artifactBinding.verifyFailed === true,
+    JSON.stringify(row0.artifactBinding))
+  const out0 = await preStep('pg-q1p', 1, 2)
+  const held0 = (out0 && out0.messages || []).some((m) => m.source && m.source.kind === 'trajectory-anchor-artifact-gate')
+  check('Q1p 反向：工件未动 ⇒ 不保持（红色验证本身不是交付）', held0 === false,
+    JSON.stringify((out0 && out0.messages || []).map((m) => m.source && m.source.kind)))
+  // 脚本通道写入：**没有**工具事件，直接改磁盘文件——Q1 的工具层观测看不见，Q1' 必须看见。
+  writeFileSync(artPath, '# modified by a script, no tool event\n')
+  const out1 = await preStep('pg-q1p', 1, 3)
+  const held1 = (out1 && out1.messages || []).some((m) => m.source && m.source.kind === 'trajectory-anchor-artifact-gate')
+  check('Q1p 开：脚本通道改工件 ⇒ pre-step 注入保持（§48 m1-5 盲区的修法）', held1 === true,
+    JSON.stringify((out1 && out1.messages || []).map((m) => m.source && m.source.kind)))
+  const row1 = await summaryOf('pg-q1p')
+  check('Q1p 开：留审计且状态可见（served=true）',
+    row1.artifactBinding && row1.artifactBinding.served === true, JSON.stringify(row1.artifactBinding))
+  const out1b = await preStep('pg-q1p', 1, 4)
+  const held1b = (out1b && out1b.messages || []).some((m) => m.source && m.source.kind === 'trajectory-anchor-artifact-gate')
+  check('Q1p 开：**每次绑定期只注一次**', held1b === false,
+    JSON.stringify((out1b && out1b.messages || []).map((m) => m.source && m.source.kind)))
+  // 重验 ⇒ 重新绑定 ⇒ 解除；工件未再动 ⇒ 不再保持。
+  sessionEvent(session, verifyCall(1, 5, `cd '${fixDir}'; python -X utf8 evaluator/run_public_tests.py`))
+  sessionEvent(session, verifyResult(1, 5, FAIL_TEXT))
+  const row2 = await summaryOf('pg-q1p')
+  check('Q1p 开：重验 ⇒ 重新绑定（解除保持，served=false、绑定步进到 5）',
+    row2.artifactBinding && row2.artifactBinding.served === false && row2.artifactBinding.boundStep === 5,
+    JSON.stringify(row2.artifactBinding))
+  const out2 = await preStep('pg-q1p', 1, 6)
+  const held2 = (out2 && out2.messages || []).some((m) => m.source && m.source.kind === 'trajectory-anchor-artifact-gate')
+  check('Q1p 反向：重验后工件未动 ⇒ 不保持', held2 === false,
+    JSON.stringify((out2 && out2.messages || []).map((m) => m.source && m.source.kind)))
+  // 工件被删 ⇒ 下一次边界注入保持。
+  rmSync(artPath)
+  const out3 = await preStep('pg-q1p', 1, 7)
+  const held3 = (out3 && out3.messages || []).some((m) => m.source && m.source.kind === 'trajectory-anchor-artifact-gate')
+  check('Q1p 开：工件被删 ⇒ 注入保持', held3 === true,
+    JSON.stringify((out3 && out3.messages || []).map((m) => m.source && m.source.kind)))
+}
+await boot({ deliveryArtifactStateGate: false })
+{
+  const fixDir2 = mkdtempSync(join(tmpdir(), 'pg-q1p-off-'))
+  const artPath2 = join(fixDir2, 'PULL_REQUEST_TEMPLATE.md')
+  writeFileSync(artPath2, '# seed\n')
+  const { session } = makeAgent('pg-q1p-off')
+  sessionEvent(session, verifyCall(1, 1, `cd '${fixDir2}'; python -X utf8 evaluator/run_public_tests.py`))
+  sessionEvent(session, verifyResult(1, 1, FAIL_TEXT))
+  writeFileSync(artPath2, '# changed while gate off\n')
+  const out = await preStep('pg-q1p-off', 1, 2)
+  const held = (out && out.messages || []).some((m) => m.source && m.source.kind === 'trajectory-anchor-artifact-gate')
+  const row = await summaryOf('pg-q1p-off')
+  check('Q1p 反向：默认关 ⇒ 不绑定、不注入', held === false && (!row.artifactBinding),
+    JSON.stringify(row.artifactBinding))
+}
+{
+  // 纯函数负向对照：状态变化三轴（sha/size/mtime）各自触发、fail-open、删除 vs 读失败。
+  const b = { path: '/x/PULL_REQUEST_TEMPLATE.md', sha: 'a'.repeat(64), size: 10, mtimeMs: 1000, turn: 1, step: 1, failed: false, failCount: null, verifyCmd: 'python evaluator/run_public_tests.py' }
+  const same = { exists: true, sha: 'a'.repeat(64), size: 10, mtimeMs: 1000 }
+  check('Q1p 纯：无绑定 ⇒ 不拒', artifactStateFacts({}).refuse === false && artifactStateFacts({}).reason === 'no-binding')
+  check('Q1p 纯：状态快照缺失 ⇒ fail-open', artifactStateFacts({ binding: b, current: null }).refuse === false && artifactStateFacts({ binding: b, current: null }).reason === 'state-unavailable')
+  check('Q1p 纯：sha 变 ⇒ 拒', artifactStateFacts({ binding: b, current: { ...same, sha: 'b'.repeat(64) } }).refuse === true)
+  check('Q1p 纯：size 变 ⇒ 拒', artifactStateFacts({ binding: b, current: { ...same, size: 11 } }).refuse === true)
+  check('Q1p 纯：mtime 变 ⇒ 拒', artifactStateFacts({ binding: b, current: { ...same, mtimeMs: 2000 } }).refuse === true)
+  check('Q1p 纯：三轴全同 ⇒ 不拒', artifactStateFacts({ binding: b, current: same }).refuse === false && artifactStateFacts({ binding: b, current: same }).reason === 'fresh-and-green')
+  check('Q1p 纯：ENOENT（被删）⇒ 拒', artifactStateFacts({ binding: b, current: { exists: false, missing: true } }).refuse === true && artifactStateFacts({ binding: b, current: { exists: false, missing: true } }).reason === 'artifact-removed')
+  check('Q1p 纯：非 ENOENT 读失败 ⇒ fail-open', artifactStateFacts({ binding: b, current: { exists: false, missing: false } }).refuse === false && artifactStateFacts({ binding: b, current: { exists: false, missing: false } }).reason === 'state-unavailable')
 }
 
 // ── 纯函数负向对照 ──────────────────────────────────────────────────────────

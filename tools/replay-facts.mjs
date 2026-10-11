@@ -64,6 +64,7 @@ await mod.apply(ctx, {
   evidenceContradictionMirror: true,
   // process-front-loaded 约束（Q1/Q2/Q4）也全开
   deliveryArtifactGate: true,
+  deliveryArtifactStateGate: true,
   editHoldEvery: 3,
   editBudgetCap: 60,
 })
@@ -151,6 +152,7 @@ for (const f of files) {
     unsupportedFire: row.unsupportedClaimMirror,
     contradictionFire: row.evidenceContradictionMirror,
     artifactGate: row.deliveryArtifactGate,
+    artifactBinding: row.artifactBinding,
     editBudget: row.editBudget,
     editHold: row.editHold,
     auditKinds: row.auditKinds || [],
@@ -169,6 +171,9 @@ const p3Fires = rows.filter((r) => r.claimFormat && r.claimFormat.served === tru
 const f6Fires = rows.filter((r) => r.unsupportedFire && r.unsupportedFire.served === true)
 const f7Fires = rows.filter((r) => r.contradictionFire && r.contradictionFire.served === true)
 const q1Fires = rows.filter((r) => r.artifactGate && r.artifactGate.served === true)
+// Q1' 回放只测**绑定武装率**（绑定捕获在验证证据路径，回放可及；开火在 pre-step，回放不派发，
+// 且历史会话的文件状态今天已不可复现——开火率只能活体审计测，process-gate §6 已写明该边界）。
+const q1pBound = rows.filter((r) => (r.auditKinds || []).includes('artifact-binding'))
 const q2Armed = rows.filter((r) => (r.auditKinds || []).includes('edit-hold-armed'))
 const q4Exhausted = rows.filter((r) => (r.auditKinds || []).includes('edit-budget-exhausted'))
 const withAnchors = rows.filter((r) => r.anchorsParsed)
@@ -191,6 +196,7 @@ console.log(`F7 证据矛盾                 ${f7Fires.length} 次（${withClaim
 console.log(`Q1 工件门拒绝               ${q1Fires.length} 次`)
 console.log(`Q2 编辑保持武装             ${q2Armed.length} 次（${withEdits.length ? (q2Armed.length / withEdits.length * 100).toFixed(1) : 0}% / 有落地写会话）`)
 console.log(`Q4 编辑预算耗尽             ${q4Exhausted.length} 次（${withEdits.length ? (q4Exhausted.length / withEdits.length * 100).toFixed(1) : 0}% / 有落地写会话）`)
+console.log(`Q1' 工件绑定武装           ${q1pBound.length} 次（${withVerify.length ? (q1pBound.length / withVerify.length * 100).toFixed(1) : 0}% / 有验证会话；只含今天仍能解析出工件文件的工具通道子集——脚本通道写入的开火率只能活体审计测）`)
 
 if (onlyRe) console.log(`（--only ${onlyRe} 过滤中）`)
 
@@ -239,6 +245,6 @@ for (const r of f7Fires) {
 if (f7Fires.length === 0) console.log('  （无开火）')
 
 if (jsonOut) {
-  writeFileSync(jsonOut, JSON.stringify({ at: new Date().toISOString(), sessionsDir, rows, f3Fires: f3Fires.map((r) => r.sid), f5Fires: f5Fires.map((r) => r.sid), p1Fires: p1Fires.map((r) => r.sid), p2Armed: p2Armed.map((r) => r.sid), p3Fires: p3Fires.map((r) => r.sid), f6Fires: f6Fires.map((r) => r.sid), f7Fires: f7Fires.map((r) => r.sid) }, null, 2))
+  writeFileSync(jsonOut, JSON.stringify({ at: new Date().toISOString(), sessionsDir, rows, f3Fires: f3Fires.map((r) => r.sid), f5Fires: f5Fires.map((r) => r.sid), p1Fires: p1Fires.map((r) => r.sid), p2Armed: p2Armed.map((r) => r.sid), p3Fires: p3Fires.map((r) => r.sid), f6Fires: f6Fires.map((r) => r.sid), f7Fires: f7Fires.map((r) => r.sid), q1pBound: q1pBound.map((r) => r.sid) }, null, 2))
   console.log(`\n报告已写：${jsonOut}`)
 }

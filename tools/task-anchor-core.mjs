@@ -775,3 +775,38 @@ export function artifactDeliveryFacts(input) {
   }
   return { refuse: false, reason: 'fresh-and-green', evidence: null }
 }
+
+/**
+ * Q1' 工件状态绑定门（纯谓词；process-gate §6）。
+ * 语义：交付工件（PR 模板）自最近一次验证绑定后被动过/被删 ⇒ refuse。
+ * 与 Q1 的差别：① 观测的是**文件状态**（mtime/size/sha），脚本通道写入也可见；
+ * ② 绑定来自**任意** grader 验证（不再只认 hidden）；③ 注入点在 pre-step（回合还开着）。
+ * 绑定里带的 failed/failCount 只作证据措辞，不独立触发——红色验证是正常工作状态，
+ * 只有"验证之后工件又变了"才说明交付未经重验（ablation-log §48 的 m1-5 实锤）。
+ */
+export function artifactStateFacts(input) {
+  const { binding = null, current = null } = input || {}
+  if (!binding) return { refuse: false, reason: 'no-binding', evidence: null }
+  const cur = current && typeof current === 'object' ? current : null
+  const evidence = {
+    path: typeof binding.path === 'string' ? binding.path : null,
+    boundSha: typeof binding.sha === 'string' ? binding.sha.slice(0, 12) : null,
+    currentSha: cur && typeof cur.sha === 'string' ? cur.sha.slice(0, 12) : null,
+    boundAtTurn: typeof binding.turn === 'number' ? binding.turn : null,
+    boundAtStep: typeof binding.step === 'number' ? binding.step : null,
+    verifyFailed: binding.failed === true,
+    failCount: typeof binding.failCount === 'number' ? binding.failCount : null,
+    verifyCmd: typeof binding.verifyCmd === 'string' ? binding.verifyCmd : null,
+  }
+  // 读不到当前状态 ⇒ fail-open（能力永远优先；社区 fail-open 原则，matrix §三.2）
+  if (!cur) return { refuse: false, reason: 'state-unavailable', evidence: null }
+  if (cur.exists !== true) {
+    // ENOENT = 工件被删 ⇒ 拒绝；其余读失败 = fail-open
+    if (cur.missing === true) return { refuse: true, reason: 'artifact-removed', evidence }
+    return { refuse: false, reason: 'state-unavailable', evidence: null }
+  }
+  if (cur.sha && binding.sha && cur.sha !== binding.sha) return { refuse: true, reason: 'artifact-changed-after-verify', evidence }
+  if (typeof cur.size === 'number' && typeof binding.size === 'number' && cur.size !== binding.size) return { refuse: true, reason: 'artifact-changed-after-verify', evidence }
+  if (typeof cur.mtimeMs === 'number' && typeof binding.mtimeMs === 'number' && cur.mtimeMs !== binding.mtimeMs) return { refuse: true, reason: 'artifact-changed-after-verify', evidence }
+  return { refuse: false, reason: 'fresh-and-green', evidence: null }
+}

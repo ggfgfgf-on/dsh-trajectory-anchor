@@ -1,7 +1,9 @@
 # Process-Front-Loaded Constraints: the Next Iteration
 
-Status: **design proposal** — the next intervention iteration after the P1 A/B null
-(ablation-log §§44–45). Not implemented.
+Status: **implemented + measured** — Q1–Q4 shipped (ablation-log §46, commit `5e34fc2`);
+Q1 A/B verdict recorded (§§47–48: fire-rate gate unmet ⇒ no score comparison, per
+pre-registration); Q1' (§6 below) is the next iteration. Q2/Q3/Q4 await their live
+fire-rate gates.
 
 ## 1. What the measurements established (design inputs)
 
@@ -80,3 +82,48 @@ produced the §37 observation.
 - No capability-plane removal (no tool blocking) — holds are message-level and audit-visible.
 - No change to the fact layer's triggers — only placement, statefulness, and wording strength.
 - All four default off; the informational arm remains the measurement control.
+
+## 6. Q1' — artifact-state binding (post-§48 fix; Q1's measured failure mode)
+
+What §48 established about Q1 (every point audit-verified):
+
+- Arming point = a tool-channel-observable `PULL_REQUEST_TEMPLATE*` write. Hit rate: **3/8**
+  (below the pre-registered 5/8 gate ⇒ verdict "manipulation failed", scores never compared).
+- Blind spot (a): **script-channel artifact writes** — m1-5 changed the template's file
+  (SHA256 ≠ seed) while the audit holds zero template-write records; the gate never saw it.
+- Blind spot (b): **hidden-verify-only predicate** — m1-2 ran public graders only, so the
+  predicate can never arm regardless of behaviour.
+
+Q1' replaces the *observation channel*, not the placement principle:
+
+1. **Binding, not write-hooks.** On every grader-run verification (any kind — hidden/public/
+   `run_*` grading scripts, the `verifyCommandKind` family), after the verify lands, bind the
+   artifact's file state under the verified workspace: `{turn, step, path, mtimeMs, size,
+   sha256}`. Every verification refreshes the binding — evidence ends the constraint, never a
+   timer (same principle as Q2's hold release).
+2. **Predicate at the next step boundary.** At each `agent/pre-step`, compare the artifact's
+   live file state against the last binding; refuse (informational hold) when:
+   - the artifact changed after the last verify (mtime/size/hash differs) — script-channel
+     writes are caught because *file state* is observed, not tool calls; or
+   - the artifact was deleted since the last binding (ENOENT).
+   The binding records whether that verification still showed failures — the hold quotes those
+   failures as evidence, but a red verify alone (with the artifact untouched) does not hold:
+   red-green iteration is normal work, only an un-verified artifact *change* is a delivery.
+   One hold per binding; the agent clears it by re-running any grader (the new verify re-binds).
+3. **Deliberate limits.** Replay over the historical corpus can only measure the tool-channel
+   subset (file mtimes are not in session logs) — the script-channel arm rate is live-audit-only.
+   The refusal stays message-level; no capability removal (unchanged non-goals).
+
+Audit: `artifact-binding` capture events + `artifact-stale-gate` refusal events; config key
+`deliveryArtifactStateGate` (default off). Q1 (`deliveryArtifactGate`) stays as measured.
+
+## 7. Measured status (ablation-log §§46–48)
+
+| Item | Result |
+| --- | --- |
+| Q1–Q4 implementation | done (commit `5e34fc2`), all default off, protocol-gates suite 43 cases |
+| Replay (268 sessions) | Q1 16 refusals; Q2 arms 64.7% of write sessions; Q3 2×; Q4 exhausts 7× (cap 60) |
+| Q1 A/B (arm A, n=8, pre-registered §47) | **fires 3/8 < 5/8 ⇒ manipulation failed; scores never compared (barred by §47.3).** Arm B not run. Armed sites fired 3/3, served 3/3 |
+| §47 process outcomes (n=3 armed sessions) | re-grade after refusal 1/5; artifact re-write 2/5; P1's structural flaw (artifact = final message) fixed where armed — m1-1 re-verified after the refusal |
+| Q1 failure-mode autopsy (§48) | arming coverage 3/8: tool-channel-only observation (m1-5 script write invisible), hidden-verify-only predicate (m1-2 public-only never arms), 2 provider-failed sessions |
+| Q1' artifact-state binding | this document §6; implementation + replay → ablation-log §49; live A/B needs its own pre-registration (§50) |
