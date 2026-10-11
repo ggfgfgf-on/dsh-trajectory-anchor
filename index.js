@@ -89,6 +89,9 @@ const DEFAULTS = {
   deliveryArtifactStateGate: false, // Q1' 工件状态绑定门（process-gate §6）：验证时绑定工件文件状态
                                   // （mtime/size/sha），pre-step 比对"最近验证后被动过/被删"⇒ 注入重验保持。
                                   // 文件状态观测 ⇒ 脚本通道写入可见；任意 grader 验证都能绑定（Q1 的两个盲区）。
+  fileStateHoldEvery: 0,          // Q2' 文件状态编辑计数（process-gate §6b）：验证时给工作区代码文件做
+                                  // 状态快照（≤300 文件），pre-step 数"自验证以来变过的文件"≥K ⇒ 注入保持。
+                                  // 脚本通道写入也可见（Q2 的盲区修法）。0=关。
   bootstrapTools: ['bash', 'str_replace_editor', 'pwsh'],
   bootstrapMaxTokens: null,
   bootstrapPersona: 'You are a helpful software engineer assistant.',
@@ -404,6 +407,88 @@ function artifactStateNow(path) {
     return { exists: false, missing: Boolean(e && e.code === 'ENOENT') }
   }
 }
+
+// ── Q2' 文件状态编辑计数（process-gate §6b）的绑定/差分助手 ─────────────────
+// 为什么不用 sessionCwd 当走查根（与 Q1' 的关键区别）：子代理 session.header.cwd =
+// 父工作区（D:\DSHwork），走它会把**别的项目/会话**的文件收进快照，差分会被无关
+// 写入污染（§50 重跑实测过 Q1' 的越界绑定风险）。Q2' 只用验证命令自身的定位源。
+const FILE_STATE_CODE_RE = /\.(py|md|cpp|h|hpp|c|js|mjs|ts|json|yml|yaml|ps1|sh|txt)$/i
+const FILE_STATE_BINDING_MAX = 300
+
+/** 有界 BFS 收集代码文件状态（跳过重目录；条目预算 = 绑定上限的 4 倍，防病态走查）。 */
+function collectFileStates(rootDir, out, budget) {
+  let queue = [rootDir]
+  for (let depth = 0; depth <= ARTIFACT_SEARCH_DEPTH && queue.length > 0; depth++) {
+    const next = []
+    for (const dir of queue) {
+      let names
+      try { names = readdirSync(dir) } catch { continue }
+      for (const name of names) {
+        if (budget.used > budget.max) return
+        budget.used += 1
+        if (ARTIFACT_SKIP_DIRS.has(name)) continue
+        const p = resolvePath(dir, name)
+        let st
+        try { st = statSync(p) } catch { continue }
+        if (st.isDirectory()) next.push(p)
+        else if (st.isFile() && FILE_STATE_CODE_RE.test(name)) out.push({ path: p, mtimeMs: st.mtimeMs, size: st.size })
+      }
+    }
+    queue = next
+  }
+}
+
+/** 验证证据落地后调用：给验证命令指认的目录做代码文件状态快照（≤300 文件）。 */
+function bindFileStates(rec, turn, step) {
+  const cmd = typeof rec.lastVerifyCmd === 'string' ? rec.lastVerifyCmd : ''
+  const dirs = []
+  if (typeof rec.lastVerifyWorkdir === 'string' && rec.lastVerifyWorkdir) {
+    const wd = isAbsolute(rec.lastVerifyWorkdir) ? rec.lastVerifyWorkdir
+      : (typeof sessionCwd === 'string' && sessionCwd ? resolvePath(sessionCwd, rec.lastVerifyWorkdir) : null)
+    if (wd && existsSync(wd)) dirs.push(wd)
+  }
+  for (const d of artifactBindingDirs(cmd)) dirs.push(d)
+  // sessionCwd 只当**解析基准**，不做走查根（子代理 cwd=父工作区，走它会把无关项目
+  // 文件收进快照、差分被污染——§6b 的明确设计约束，测试 pg-q2p-cwd 钉住）。
+  const walkDirs = dirs.filter((d) => d !== sessionCwd)
+  const seen = new Set()
+  const files = []
+  const budget = { used: 0, max: FILE_STATE_BINDING_MAX * 4 }
+  for (const d of walkDirs) {
+    const key = d.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    collectFileStates(d, files, budget)
+    if (files.length >= FILE_STATE_BINDING_MAX) break
+  }
+  if (files.length === 0) return null
+  const last = rec.verifyEvidence.length ? rec.verifyEvidence[rec.verifyEvidence.length - 1] : null
+  const binding = {
+    turn: typeof turn === 'number' ? turn : null,
+    step: typeof step === 'number' ? step : null,
+    at: Date.now(),
+    files: files.slice(0, FILE_STATE_BINDING_MAX),
+    failed: Boolean(last && last.failed === true),
+    verifyCmd: cmd.slice(0, 300),
+    served: false,
+  }
+  rec.fileStateBinding = binding
+  return { count: binding.files.length }
+}
+
+/** pre-step 差分：stat 绑定清单里的文件，数 mtime/size 变化的个数（无全量重走查）。 */
+function fileStateChangedCount(binding) {
+  const files = Array.isArray(binding.files) ? binding.files : []
+  let changed = 0
+  for (const f of files) {
+    try {
+      const st = statSync(f.path)
+      if (st.mtimeMs !== f.mtimeMs || st.size !== f.size) changed += 1
+    } catch { /* 被删 = 变了（保守计入） */ changed += 1 }
+  }
+  return changed
+}
+
 
 export const name = 'dsh-trajectory-anchor'
 
@@ -2690,6 +2775,8 @@ function adopt(agent, doAnchor, channel) {
     deliveryArtifactGate: null,
     // Q1' 工件状态绑定门（默认关；每次验证重新绑定=解除）
     artifactBinding: null,
+    // Q2' 文件状态编辑计数（默认关；每次验证重新快照=解除）
+    fileStateBinding: null,
     /** 待发出的拉回原因（工具调用时置位，pre-step 时消费；保证"触发点=说出口的点"）。 */
     pendingPullback: null,
     pullback: {
@@ -2883,6 +2970,12 @@ function feedSessionEvent(session, event) {
         if (CONFIG.deliveryArtifactStateGate === true) {
           const bound = bindDeliveryArtifact(rec, event.data && event.data.turn, event.data && event.data.step)
           if (bound) logAudit(rec, 'artifact-binding', { ...bound })
+        }
+        // Q2' 文件状态快照（process-gate §6b）：同一验证证据路径，给验证命令指认的目录做
+        // 代码文件状态快照——pre-step 差分"自验证以来变了几个文件"（脚本通道写入可见）。
+        if (CONFIG.fileStateHoldEvery > 0) {
+          const snap = bindFileStates(rec, event.data && event.data.turn, event.data && event.data.step)
+          if (snap) logAudit(rec, 'file-state-binding', { count: snap.count })
         }
         // Q2 解除条件：**证据落地**才解除保持态（不是计时器——设计 §3 Q2 的预算恢复语义）。
         if (rec.editHold.holding) {
@@ -3503,6 +3596,7 @@ function summaryOf(rec) {
     editHold: { editsSinceVerify: rec.editHold.editsSinceVerify, holding: rec.editHold.holding === true, violations: rec.editHold.violations, released: rec.editHold.released, served: rec.editHold.served === true },
     deliveryArtifactGate: rec.deliveryArtifactGate ? { served: rec.deliveryArtifactGate.served === true, via: rec.deliveryArtifactGate.via || null, reason: rec.deliveryArtifactGate.reason || null } : null,
     artifactBinding: rec.artifactBinding ? { path: rec.artifactBinding.path || null, boundTurn: rec.artifactBinding.turn ?? null, boundStep: rec.artifactBinding.step ?? null, sha: rec.artifactBinding.sha ? rec.artifactBinding.sha.slice(0, 12) : null, verifyFailed: rec.artifactBinding.failed === true, served: rec.artifactBinding.served === true } : null,
+    fileStateBinding: rec.fileStateBinding ? { boundFiles: rec.fileStateBinding.files ? rec.fileStateBinding.files.length : 0, boundTurn: rec.fileStateBinding.turn ?? null, boundStep: rec.fileStateBinding.step ?? null, served: rec.fileStateBinding.served === true } : null,
     evidence: {
       verifyEvidence: rec.verifyEvidence.length,
       edits: rec.edits.length,
@@ -3677,6 +3771,7 @@ function buildSummary(filter) {
       editHoldEvery: CONFIG.editHoldEvery,
       deliveryArtifactGate: CONFIG.deliveryArtifactGate === true,
       deliveryArtifactStateGate: CONFIG.deliveryArtifactStateGate === true,
+      fileStateHoldEvery: CONFIG.fileStateHoldEvery,
       reanchorEnabled: CONFIG.reanchorEnabled === true,
       reanchorEvidencePath: CONFIG.reanchorEvidencePath || null,
       pullbackOutcomePath: CONFIG.pullbackOutcomePath || null,
@@ -4521,9 +4616,24 @@ export function apply(ctx, config) {
         }
         return { ...decision, messages: [...decision.messages, holdMsg] }
       }
-      // ── Q1' 工件状态绑定门（process-gate §6）：本步边界处，交付工件自最近一次验证后
-      //    被动过/被删 ⇒ 注入"先重验再交付"保持消息（每次绑定期一次；重验刷新绑定=解除）。
-      //    注入点在 pre-step：回合还开着（P1 的"最后一条消息"结构缺陷不在这个位置）。
+      // ── Q2' 文件状态编辑计数（process-gate §6b）：本步边界处，"自最近一次验证以来
+      //    变过的代码文件数 ≥K" ⇒ 注入"不许再改，先重验"保持（每次快照期一次；重验重新快照=解除）。
+      if (CONFIG.fileStateHoldEvery > 0 && rec.fileStateBinding && !rec.fileStateBinding.served && decision && Array.isArray(decision.messages)) {
+        const changed = fileStateChangedCount(rec.fileStateBinding)
+        if (changed >= CONFIG.fileStateHoldEvery) {
+          rec.fileStateBinding.served = true
+          logAudit(rec, 'file-state-hold-injected', { changed, k: CONFIG.fileStateHoldEvery, boundFiles: rec.fileStateBinding.files.length, turn: payload.turn, step: payload.step })
+          const lastGrader = String((rec.fileStateBinding && rec.fileStateBinding.verifyCmd) || '(none)').slice(0, 200)
+          const holdMsg = {
+            source: { kind: 'trajectory-anchor-file-state-hold' },
+            content: [{ type: 'text', text: `[trajectory-anchor] EDIT HOLD: ${changed} code file(s) changed since your last verification. No further edits until you re-run the verification (last seen: ${lastGrader}) and quote its output.` }],
+          }
+          return { ...decision, messages: [...decision.messages, holdMsg] }
+        }
+      }
+      // ── Q1' 工件状态绑定门（process-gate §6）：交付工件自最近一次验证后被动过/被删
+      //    ⇒ 注入"先重验再交付"保持（每次绑定期一次；重验刷新绑定=解除）。注入点在
+      //    pre-step：回合还开着（P1 的"最后一条消息"结构缺陷不在这个位置）。
       if (CONFIG.deliveryArtifactStateGate === true && rec.artifactBinding && !rec.artifactBinding.served && decision && Array.isArray(decision.messages)) {
         const cur = artifactStateNow(rec.artifactBinding.path)
         const facts = artifactStateFacts({ binding: rec.artifactBinding, current: cur })

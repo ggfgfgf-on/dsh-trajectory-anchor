@@ -117,6 +117,32 @@ Q1' replaces the *observation channel*, not the placement principle:
 Audit: `artifact-binding` capture events + `artifact-stale-gate` refusal events; config key
 `deliveryArtifactStateGate` (default off). Q1 (`deliveryArtifactGate`) stays as measured.
 
+## 6b. Q2' — file-state edit counting (the §54 fix for Q2's script-channel blind spot)
+
+What §54 established about Q2 (audit-verified): the tool-channel edit counter armed in
+only 3/8 probe sessions — on this substrate most writes go through script channels
+(pwsh/python), which the counter never sees. Same blind-spot family as Q1's (§48).
+
+Q2' replaces the counter's *data source*, not the hold semantics:
+
+1. **Tree snapshot at verification.** On every grader-run verification, bind a bounded
+   snapshot of the workspace's code files: `{path, mtimeMs, size}` for up to
+   `FILE_STATE_BINDING_MAX` files (default 300) under the same candidate dirs Q1'' uses
+   (verify cd-dirs / absolute artifacts / workdir / session-cwd resolution). Script-channel
+   writes change file state, so they are visible here.
+2. **Diff at the next step boundary.** At each `agent/pre-step`, stat the *bound file list*
+   (no full re-walk — bounded cost) and count files whose mtime/size changed since the
+   binding. `changed ≥ fileStateHoldEvery` ⇒ inject the same hold as Q2 ("no further edits
+   until you re-run `<last grader>` and quote its output"). One hold per binding; every
+   verification re-binds and releases. Files created after the binding are not in the list
+   (documented limit — same fail-open stance).
+3. **Deliberate limits.** Replay measures binding arming only (file states are not in
+   session logs); the live fire rate is probe-only, exactly like Q1'. Q2
+   (`editHoldEvery`) stays as measured.
+
+Audit: `file-state-binding` capture + `file-state-hold-injected` hold events; config key
+`fileStateHoldEvery` (default 0 = off).
+
 ## 7. Measured status (ablation-log §§46–48)
 
 | Item | Result |

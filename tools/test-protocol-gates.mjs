@@ -548,6 +548,80 @@ await boot({ deliveryArtifactStateGate: true })
   const row = await summaryOf('pg-q1p3b')
   check('Q1p3 开：验证调用的 workdir 参数 ⇒ 绑定', row.artifactBinding && row.artifactBinding.path === art, JSON.stringify(row.artifactBinding))
 }
+// ── Q2' 文件状态编辑计数（process-gate §6b）────────────────────────────────
+await boot({ fileStateHoldEvery: 2 })
+{
+  // 脚本通道改动（无工具事件）也会让文件状态变化 ⇒ 差分可见——Q2 盲区的修法。
+  const fix = mkdtempSync(join(tmpdir(), 'pg-q2p-'))
+  const a = join(fix, 'a.py')
+  const b = join(fix, 'b.py')
+  writeFileSync(a, '# a v1\n')
+  writeFileSync(b, '# b v1\n')
+  const { session } = makeAgent('pg-q2p')
+  sessionEvent(session, verifyCall(1, 1, `cd '${fix}'; python -X utf8 evaluator/run_public_tests.py`))
+  sessionEvent(session, verifyResult(1, 1, FAIL_TEXT))
+  const row0 = await summaryOf('pg-q2p')
+  check('Q2p 开：验证落地 ⇒ 代码文件快照绑定（≥2 文件）',
+    row0.fileStateBinding && row0.fileStateBinding.boundFiles >= 2, JSON.stringify(row0.fileStateBinding))
+  // 脚本通道改 1 个文件：1 < K=2 ⇒ 不注
+  writeFileSync(a, '# a v2 changed\n')
+  const out1 = await preStep('pg-q2p', 1, 2)
+  const held1 = (out1 && out1.messages || []).some((m) => m.source && m.source.kind === 'trajectory-anchor-file-state-hold')
+  check('Q2p 反向：改动 1 个 < K=2 ⇒ 不注', held1 === false,
+    JSON.stringify((out1 && out1.messages || []).map((m) => m.source && m.source.kind)))
+  // 再改 1 个：2 ≥ K ⇒ 注保持
+  writeFileSync(b, '# b v2 changed\n')
+  const out2 = await preStep('pg-q2p', 1, 3)
+  const held2 = (out2 && out2.messages || []).some((m) => m.source && m.source.kind === 'trajectory-anchor-file-state-hold')
+  check('Q2p 开：脚本通道改 2 个 ≥ K ⇒ 注入保持（Q2 盲区修法）', held2 === true,
+    JSON.stringify((out2 && out2.messages || []).map((m) => m.source && m.source.kind)))
+  const row1 = await summaryOf('pg-q2p')
+  check('Q2p 开：审计与状态可见（served=true）',
+    row1.fileStateBinding && row1.fileStateBinding.served === true, JSON.stringify(row1.fileStateBinding))
+  const out2b = await preStep('pg-q2p', 1, 4)
+  const held2b = (out2b && out2b.messages || []).some((m) => m.source && m.source.kind === 'trajectory-anchor-file-state-hold')
+  check('Q2p 开：**每次快照期只注一次**', held2b === false,
+    JSON.stringify((out2b && out2b.messages || []).map((m) => m.source && m.source.kind)))
+  // 重验 ⇒ 重新快照 ⇒ 解除；此后改动从零再计。
+  sessionEvent(session, verifyCall(1, 5, `cd '${fix}'; python -X utf8 evaluator/run_public_tests.py`))
+  sessionEvent(session, verifyResult(1, 5, FAIL_TEXT))
+  const row2 = await summaryOf('pg-q2p')
+  check('Q2p 开：重验 ⇒ 重新快照（解除，served=false、绑定步进到 5）',
+    row2.fileStateBinding && row2.fileStateBinding.served === false && row2.fileStateBinding.boundStep === 5,
+    JSON.stringify(row2.fileStateBinding))
+  const out3 = await preStep('pg-q2p', 1, 6)
+  const held3 = (out3 && out3.messages || []).some((m) => m.source && m.source.kind === 'trajectory-anchor-file-state-hold')
+  check('Q2p 反向：重验后未再改 ⇒ 不注', held3 === false,
+    JSON.stringify((out3 && out3.messages || []).map((m) => m.source && m.source.kind)))
+}
+await boot({ fileStateHoldEvery: 0 })
+{
+  const fix = mkdtempSync(join(tmpdir(), 'pg-q2p-off-'))
+  writeFileSync(join(fix, 'a.py'), '# a\n')
+  const { session } = makeAgent('pg-q2p-off')
+  sessionEvent(session, verifyCall(1, 1, `cd '${fix}'; python -X utf8 evaluator/run_public_tests.py`))
+  sessionEvent(session, verifyResult(1, 1, FAIL_TEXT))
+  const row = await summaryOf('pg-q2p-off')
+  check('Q2p 反向：默认关 ⇒ 不绑不注', (!row.fileStateBinding), JSON.stringify(row.fileStateBinding))
+}
+await boot({ fileStateHoldEvery: 1 })
+{
+  // 会话 cwd 不做走查根：绑定只来自验证命令目录（cwd=父工作区会把别的项目文件收进快照）。
+  const fix = mkdtempSync(join(tmpdir(), 'pg-q2p-cwd-'))
+  const other = mkdtempSync(join(tmpdir(), 'pg-q2p-other-'))
+  writeFileSync(join(fix, 'a.py'), '# a\n')
+  writeFileSync(join(other, 'unrelated.py'), '# x\n')
+  const sid = 'pg-q2p-cwd'
+  const agent = { id: sid, session: { id: sid, events: [], header: { cwd: other } }, ctx: { tools: { schemas: () => [], restrict: () => () => {} } } }
+  agentsById.set(sid, agent)
+  dispatch('agent/created', { agent })
+  const session = { id: sid }
+  sessionEvent(session, verifyCall(1, 1, `cd '${fix}'; python -X utf8 evaluator/run_public_tests.py`))
+  sessionEvent(session, verifyResult(1, 1, FAIL_TEXT))
+  const row = await summaryOf(sid)
+  const files = row.fileStateBinding ? row.fileStateBinding.boundFiles : 0
+  check('Q2p 开：快照不含会话 cwd 树（只含验证命令目录）', row.fileStateBinding && files === 1, JSON.stringify(row.fileStateBinding))
+}
 {
   // 纯函数负向对照：状态变化三轴（sha/size/mtime）各自触发、fail-open、删除 vs 读失败。
   const b = { path: '/x/PULL_REQUEST_TEMPLATE.md', sha: 'a'.repeat(64), size: 10, mtimeMs: 1000, turn: 1, step: 1, failed: false, failCount: null, verifyCmd: 'python evaluator/run_public_tests.py' }
