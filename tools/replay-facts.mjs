@@ -59,6 +59,9 @@ await mod.apply(ctx, {
   verifyAfterEditBudget: true,
   verifyBudgetEvery: 3,
   claimFormatContract: true,
+  // criteria 第二波事实也全开
+  unsupportedClaimMirror: true,
+  evidenceContradictionMirror: true,
 })
 const dispatch = (name, ...a) => handlers['internal/dispatch']('x', name, a, null)
 
@@ -141,6 +144,8 @@ for (const f of files) {
     deliveryGate: row.deliveryGate,
     verifyBudget: row.verifyBudget,
     claimFormat: row.claimFormat,
+    unsupportedFire: row.unsupportedClaimMirror,
+    contradictionFire: row.evidenceContradictionMirror,
     auditKinds: row.auditKinds || [],
     fed,
   })
@@ -154,12 +159,14 @@ const p1Fires = rows.filter((r) => r.deliveryGate && r.deliveryGate.served === t
 // 所以开火率看**审计**里的 verify-budget-armed（机器可查的事件，不是终态字段）。
 const p2Armed = rows.filter((r) => (r.auditKinds || []).includes('verify-budget-armed'))
 const p3Fires = rows.filter((r) => r.claimFormat && r.claimFormat.served === true)
+const f6Fires = rows.filter((r) => r.unsupportedFire && r.unsupportedFire.served === true)
+const f7Fires = rows.filter((r) => r.contradictionFire && r.contradictionFire.served === true)
 const withAnchors = rows.filter((r) => r.anchorsParsed)
 const withClaims = rows.filter((r) => (r.evidence?.claims ?? 0) > 0)
 const withVerify = rows.filter((r) => (r.evidence?.verifyEvidence ?? 0) > 0)
 const withEdits = rows.filter((r) => (r.evidence?.edits ?? 0) > 0)
 
-console.log(`\n=== F3/F5/P1/P2/P3 回放（${rows.length} 个会话）===`)
+console.log(`\n=== F3/F5/P1/P2/P3/F6/F7 回放（${rows.length} 个会话）===`)
 console.log(`解析出范围子句的会话        ${withAnchors.length}`)
 console.log(`有过验证运行的会话          ${withVerify.length}`)
 console.log(`有过落地写的会话            ${withEdits.length}`)
@@ -169,6 +176,8 @@ console.log(`F5 过期开火                  ${f5Fires.length} 次（${withClai
 console.log(`P1 交付门拒绝               ${p1Fires.length} 次（${withClaims.length ? (p1Fires.length / withClaims.length * 100).toFixed(1) : 0}% / 有宣告会话）`)
 console.log(`P2 改后必验武装             ${p2Armed.length} 次（${withEdits.length ? (p2Armed.length / withEdits.length * 100).toFixed(1) : 0}% / 有落地写会话）`)
 console.log(`P3 格式要求                 ${p3Fires.length} 次（${withClaims.length ? (p3Fires.length / withClaims.length * 100).toFixed(1) : 0}% / 有宣告会话）`)
+console.log(`F6 无出处断言               ${f6Fires.length} 次（${withClaims.length ? (f6Fires.length / withClaims.length * 100).toFixed(1) : 0}% / 有宣告会话）`)
+console.log(`F7 证据矛盾                 ${f7Fires.length} 次（${withClaims.length ? (f7Fires.length / withClaims.length * 100).toFixed(1) : 0}% / 有宣告会话）`)
 
 if (onlyRe) console.log(`（--only ${onlyRe} 过滤中）`)
 
@@ -204,7 +213,19 @@ for (const r of f5Fires) {
 }
 if (f5Fires.length === 0) console.log('  （无开火）')
 
+console.log('\n--- F6 每次开火的证据（人工复核）---')
+for (const r of f6Fires) {
+  console.log(`  [${r.label}] ${r.sid}  via=${r.unsupportedFire.via} reason=${r.unsupportedFire.reason}`)
+}
+if (f6Fires.length === 0) console.log('  （无开火）')
+
+console.log('\n--- F7 每次开火的证据（人工复核）---')
+for (const r of f7Fires) {
+  console.log(`  [${r.label}] ${r.sid}  via=${r.contradictionFire.via} reason=${r.contradictionFire.reason}`)
+}
+if (f7Fires.length === 0) console.log('  （无开火）')
+
 if (jsonOut) {
-  writeFileSync(jsonOut, JSON.stringify({ at: new Date().toISOString(), sessionsDir, rows, f3Fires: f3Fires.map((r) => r.sid), f5Fires: f5Fires.map((r) => r.sid), p1Fires: p1Fires.map((r) => r.sid), p2Armed: p2Armed.map((r) => r.sid), p3Fires: p3Fires.map((r) => r.sid) }, null, 2))
+  writeFileSync(jsonOut, JSON.stringify({ at: new Date().toISOString(), sessionsDir, rows, f3Fires: f3Fires.map((r) => r.sid), f5Fires: f5Fires.map((r) => r.sid), p1Fires: p1Fires.map((r) => r.sid), p2Armed: p2Armed.map((r) => r.sid), p3Fires: p3Fires.map((r) => r.sid), f6Fires: f6Fires.map((r) => r.sid), f7Fires: f7Fires.map((r) => r.sid) }, null, 2))
   console.log(`\n报告已写：${jsonOut}`)
 }
