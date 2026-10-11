@@ -834,7 +834,15 @@ export function itemizedClaimFacts(input) {
     items.push(l.replace(ITEM_RE, '').trim())
   }
   if (items.length === 0) return { fired: false, reason: 'no-itemized-claim', unsupported: [], supported: [], evidence: null }
-  const PATH_RE = /(?:[A-Za-z]:[\\/][^\s`"'<>|]+|`([^`]+)`)/g
+  // F2-v2 收紧（§59 复核裁决）：工作动词门（灭 FINAL/STEPS 结构化行与事实叙述族）、
+  // 锚点只认代码路径（带扩展名）与 test 名（灭裸 token 族）、build/probe 模型外不判。
+  const WORK_VERB_RE = /(修复|修了|完成|实现|添加|新增|补充|补全|修正|增强|通过|fixed|added|implemented|completed|verified|passed|updated|restored|rewrote)/i
+  // 不加 \b：debug_probe 的下划线是词字符，\bprobe\b 匹配不上（§59 v2 复核抓到的漏网）。
+  const BUILD_PROBE_RE = /(build|espidf|编译|compile|probe)/i
+  // 结构化输出行排除：cf/cp 族的 FINAL/STEPS/NOTES 行不是工作声明（§59 v2 复核残存族）。
+  const STRUCT_LINE_RE = /^(FINAL|STEPS|NOTES|FOLLOWED_NOTE|PRESSURE|Reconciliation)[:：*]/i
+  const CODE_EXT = '(?:py|md|cpp|h|hpp|c|js|mjs|ts|json|yml|yaml|ps1|sh|txt)'
+  const PATH_RE = new RegExp(`(?:[A-Za-z]:[\\\\/][^\\s\`"'<>|]+\\.${CODE_EXT}\\b|\`([^\`]+\\.${CODE_EXT})\`)`, 'g')
   const TEST_RE = /\b(test_[A-Za-z0-9_]+|[A-Za-z0-9_]+_test)\b/g
   const norm = (s) => String(s).replace(/\\/g, '/').toLowerCase()
   const tail2 = (p) => {
@@ -846,17 +854,23 @@ export function itemizedClaimFacts(input) {
   const supported = []
   const unsupported = []
   for (const item of items) {
+    // 行首修饰符（反引号/星号/井号）会挡在 STRUCT 标记前——先剥再看（§59 v2b 复核抓的漏网）。
+    const head = item.replace(/^[\s*`#]+/, '')
+    if (STRUCT_LINE_RE.test(head)) continue            // 结构化输出行（FINAL/STEPS/NOTES 族）
+    const testTokens = item.match(TEST_RE) || []
+    const hasVerb = WORK_VERB_RE.test(item)
+    if (!hasVerb && testTokens.length === 0) continue      // 工作动词门
+    if (BUILD_PROBE_RE.test(item)) continue                // build/probe 声明：证据模型外（§46：build/probe 不算验证），不判不响
     const anchors = []
     let m
     const pr = new RegExp(PATH_RE.source, 'g')
     while ((m = pr.exec(item))) anchors.push((m[1] || m[0]).trim())
-    const tr = new RegExp(TEST_RE.source, 'g')
-    while ((m = tr.exec(item))) anchors.push(m[0])
-    if (anchors.length === 0) continue
+    anchors.push(...testTokens)
+    if (anchors.length === 0) continue                     // 无代码锚点不判（不猜）
     const matched = anchors.some((a) => {
       const na = norm(a)
-      const looksPath = /[\\/.]/.test(a) && !/^test_/.test(a)
-      if (looksPath) {
+      const isTest = /^(test_|.*_test$)/.test(a)
+      if (!isTest) {
         const t = tail2(na)
         if (t && editNorm.some((p) => p === na || p.endsWith('/' + t))) return true
         return verifyNorm.includes(na)
