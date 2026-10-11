@@ -126,4 +126,4 @@ Audit: `artifact-binding` capture events + `artifact-stale-gate` refusal events;
 | Q1 A/B (arm A, n=8, pre-registered §47) | **fires 3/8 < 5/8 ⇒ manipulation failed; scores never compared (barred by §47.3).** Arm B not run. Armed sites fired 3/3, served 3/3 |
 | §47 process outcomes (n=3 armed sessions) | re-grade after refusal 1/5; artifact re-write 2/5; P1's structural flaw (artifact = final message) fixed where armed — m1-1 re-verified after the refusal |
 | Q1 failure-mode autopsy (§48) | arming coverage 3/8: tool-channel-only observation (m1-5 script write invisible), hidden-verify-only predicate (m1-2 public-only never arms), 2 provider-failed sessions |
-| Q1' artifact-state binding | this document §6; implementation + replay → ablation-log §49; live A/B needs its own pre-registration (§50) |
+| Q1' artifact-state binding | implemented (§49); probe #1 (pre-Q1''' build): bindings 4/8, fires 4/8 (§49.6); probe #2 (Q1''+Q1''' build): **bindings 8/8, fires 8/8, zero foreign bindings** (§49.6) — fire-rate gate ≥5/8 now viable; A/B pre-registered as §50 (gate frozen from the measured 8/8) |
