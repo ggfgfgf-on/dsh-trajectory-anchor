@@ -106,6 +106,14 @@ if (denySites > ALLOWED_DENY_RESTRICT_CALLS) {
   oks.push('C3 无 deny 型 restrict 调用点（工具面只在组装期派生）')
 }
 
+// ── C31 硬：运行面不得调用 tools.restrict（§61 瘦身：派生面结构性消灭分裂 bug）────
+const anyRestrict = countCode(/\.restrict\s*\(/g)
+if (anyRestrict > 0) {
+  fails.push(`C31 运行面仍有 ${anyRestrict} 处 .restrict( 调用：工具面只能在组装期派生（anchorAllow 过滤），注册层 restrict 的相交语义/disposer 分裂已被结构性消灭`)
+} else {
+  oks.push('C31 运行面不调用 tools.restrict（工具面 100% 组装期派生）')
+}
+
 // ── C5 硬：fail-open 契约（降级必须朝"暴露全量"倒，且必须可见）───────────────
 if (!/full catalog exposed/.test(src)) {
   fails.push('C5 缺少 fail-open 契约文案「full catalog exposed」（降级路径必须明说放开了全量）')
@@ -117,52 +125,30 @@ if (!/full catalog exposed/.test(src)) {
   oks.push('C5 fail-open 契约在位（full catalog exposed + anchor-degraded + noteConfigWarning）')
 }
 
-// ── C4 警告：README 与代码的数值漂移 ──────────────────────────────────────
-if (existsSync(readmePath)) {
-  const readme = readFileSync(readmePath, 'utf8')
-  const listMatch = src.match(/leanDenyPatterns:\s*\[([\s\S]*?)\n\s*\]/)
-  const actualCount = listMatch
-    ? listMatch[1].split(',').map((s) => s.trim()).filter((s) => /^['"]/.test(s)).length
-    : null
-  const docMatch = readme.match(/`leanDenyPatterns`\s*\|\s*(\d+)\s*entries?/)
-  if (actualCount === null) fails.push('C4 源码里找不到 leanDenyPatterns 列表')
-  else if (!docMatch) warns.push('C4 README 里找不到 leanDenyPatterns 条目数（文档表可能被改写）')
-  else if (Number(docMatch[1]) !== actualCount) {
-    fails.push(`C4 文档/代码漂移：README 写 ${docMatch[1]} entries，代码实际 ${actualCount} 条`)
-  } else oks.push(`C4 文档一致：leanDenyPatterns = ${actualCount} 条`)
-} else {
-  warns.push(`C4 找不到 README（${readmePath}），跳过文档一致性检查`)
+// ── C4 硬：配置面收缩（§61 瘦身：~40 键 → 12~20 键）────────────────────────
+{
+  const defined = [...(src.match(/const DEFAULTS = \{([\s\S]*?)\n\}/)?.[1] ?? '')
+    .matchAll(/^\s{2}([A-Za-z_][A-Za-z0-9_]*):/gm)].map((m) => m[1])
+  const n = defined.length
+  if (n === 0) fails.push('C4 解析不出 DEFAULTS 键表')
+  else if (n < 10 || n > 32) fails.push(`C4 配置键 ${n} 个，超出 [10,32]（瘦身目标 12~20，§61）`)
+  else if (n > 20) warns.push(`C4 配置键 ${n} 个，仍未达到 12~20 的瘦身目标（§61）`)
+  else oks.push(`C4 配置面已收缩：${n} 个键（目标 12~20）`)
 }
 
-// ── C6 硬：P6/P0 契约（有界退出 + 安全默认 + 派生面接线在位）─────────────────
+// ── C6 硬：bootstrap 工具面在组装期派生（P1 瘦身重构接线）───────────────────
 {
-  const maxDrift = src.match(/maxDriftSteps:\s*(-?\d+)/)
-  const rollbackDefault = src.match(/rollbackEnabled:\s*(true|false)/)
-  const notifyDefault = src.match(/notifyEnabled:\s*(true|false)/)
   const problems = []
-  if (!maxDrift) problems.push('缺少 maxDriftSteps（漂移态必须配一个必然可达的步数上限）')
-  else if (Number(maxDrift[1]) <= 0) problems.push(`maxDriftSteps=${maxDrift[1]} 关闭了上限（不允许：退出条件必须必然可达）`)
-  if (!rollbackDefault || rollbackDefault[1] !== 'false') problems.push('rollbackEnabled 默认必须为 false（能力层默认关闭，须先通过标定）')
-  if (!notifyDefault || notifyDefault[1] !== 'false') problems.push('notifyEnabled 默认必须为 false（通知层默认关闭）')
-  if (!/system-prompt\/assemble/.test(src) || !/surfaceForPhase\(/.test(src)) {
-    problems.push('组装期派生工具面的接线不在位（system-prompt/assemble + surfaceForPhase）')
+  if (!/system-prompt\/assemble/.test(src)) problems.push('缺少 system-prompt/assemble 处理器')
+  if (!/rec\.anchorAllow\.includes\(t\.name\)/.test(src)) {
+    problems.push('组装期派生工具面的接线不在位（unpromoted ⇒ 只发 anchorAllow 里的工具）')
   }
   if (problems.length) for (const p of problems) fails.push(`C6 ${p}`)
-  else oks.push('C6 有界退出 + 安全默认（双关）+ 派生面接线：全部在位')
+  else oks.push('C6 组装期派生工具面接线在位（anchorAllow 过滤 + fail-open 全量）')
 }
 
 // ── C7 硬：两个"证据不足"档都必须留痕 ─────────────────────────────────────
-{
-  const lines = src.split('\n')
-  const callLine = lines.findIndex((l) => /notePolicySkipped\(rec, decision\.reason\)/.test(l))
-  const guard = callLine === -1 ? '' : lines.slice(Math.max(0, callLine - 8), callLine + 1).join('\n')
-  const hasNoObs = /no-observation/.test(guard)
-  const hasInsuff = /insufficient-reference/.test(guard)
-  if (callLine === -1) fails.push('C7 找不到 notePolicySkipped(rec, decision.reason) 调用点')
-  else if (!hasNoObs || !hasInsuff) {
-    fails.push(`C7 跳过判定的留痕不完整（no-observation=${hasNoObs} / insufficient-reference=${hasInsuff}）：两档都必须写 policy-skipped，否则"判定为何没启动"无法回溯`)
-  } else oks.push('C7 两个证据不足档都写 policy-skipped（日志从第 1 步起可回溯）')
-}
+// 能力面已删除（§61 瘦身）：该不变量随能力面移除。
 
 // ── C10 硬：零墙钟决策（策略节奏只能用观测量）──────────────────────────────
 {
@@ -258,86 +244,17 @@ if (existsSync(readmePath)) {
 }
 
 // ── C9 硬：A′ 通道必须带"回合末步"排除（否则 100% 误判）────────────────────
-{
-  const hasExclusion = /midTurnInaction/.test(src)
-  const hasTurnEnd = /'turn\/end'/.test(src)
-  const hasLedgerClose = /function ledgerCloseTurn/.test(src)
-  if (!hasExclusion || !hasTurnEnd || !hasLedgerClose) {
-    fails.push(`C9 中途停手通道缺少"回合末步"排除（midTurnInaction=${hasExclusion} turn/end=${hasTurnEnd} ledgerCloseTurn=${hasLedgerClose}）：实测不分回合末步就是 100% 误判（67 个无工具调用步全部是回合收尾）`)
-  } else oks.push('C9 A′ 通道带回合末步排除（下一步推进 + turn/end 双判）')
-}
+// 能力面已删除（§61 瘦身）：该不变量随能力面移除。
 
-// ── C13 硬：B3 运行时门禁接线（能力层必须走"有效开关"，且不得跨挂载粘住）────
-// 由来（都是本轮真实的失败模式）：
-//   ① `apply` 不重播种 CONFIG ⇒ 标定件写入的 measurementSafe / capabilityEligible /
-//      反解 α 会在下一次挂载里**粘住**，表现为"改了配置行为不变"的静默降级；
-//      而且 `{ ...DEFAULTS }` 是浅拷贝，装载标定件会**就地改掉 DEFAULTS**。
-//   ② 连续确认计数用 notifyAlpha 计数、却把守 actAlpha 的行动级 ⇒ 在线比离线标定更松
-//      （离线 walkChannel 是在单一 α 上数连续的），正是"离线合格、线上超标"。
-//   ③ 决策路径若直接读 CONFIG.rollbackEnabled（而不是 effectiveRollback()），
-//      标定件门禁与自动降档会被绕过。
+// ── C13 硬：CONFIG 每次挂载从 DEFAULTS 重播种（防跨挂载粘住）──────────────
 {
   const problems = []
   if (!/CONFIG = cloneDefaults\(\)/.test(src)) {
-    problems.push('apply() 未从 DEFAULTS 重新播种 CONFIG（标定件写入的 measurementSafe/资格/α 会跨挂载粘住）')
+    problems.push('apply() 未从 DEFAULTS 重新播种 CONFIG（旧配置值会跨挂载粘住）')
   }
   if (!/function cloneDefaults\(\)/.test(src)) problems.push('缺少 cloneDefaults()（浅拷贝会让 DEFAULTS 被就地改写）')
-  if (!/const hitAct = Number\.isFinite\(c\.p\) && c\.p <= actA/.test(src)) {
-    problems.push('行动级连续计数未用 actAlpha（用 notifyAlpha 计数会让在线比离线标定更松）')
-  }
-  if (!/const hitNot = Number\.isFinite\(c\.p\) && c\.p <= notA/.test(src)) {
-    problems.push('通知级连续计数未用 notifyAlpha')
-  }
-  if (!/confirmed\(c, 'act'\)/.test(src) || !/confirmed\(c, 'notify'\)/.test(src)) {
-    problems.push('两级未分别确认（strong 必须用行动级连续计数、weak 用通知级）')
-  }
-  if (!/const strong = byP\.filter\(\(c\) => c\.p <= actA\(c\) && confirmed\(c, 'act'\)\)/.test(src)) {
-    problems.push('strong 入口未同时要求 actAlpha 与行动级连续确认')
-  }
-  // 决策/肢动路径不得直接读原始开关：合法位置是**门禁函数体内部**（结构判定，
-  // 不是字符串白名单——否则新增一行读取照样漏过）与 summaryOf 的回显行。
-  const bodySpan = (fnName) => {
-    const start = src.indexOf(`function ${fnName}()`)
-    if (start === -1) return null
-    const open = src.indexOf('{', start)
-    if (open === -1) return null
-    let depth = 0
-    for (let i = open; i < src.length; i++) {
-      if (src[i] === '{') depth += 1
-      else if (src[i] === '}') {
-        depth -= 1
-        if (depth === 0) return [start, i]
-      }
-    }
-    return null
-  }
-  const lineOf = (idx) => src.slice(0, idx).split('\n').length
-  const gateSpans = ['effectiveRollback', 'effectiveNotify', 'capabilityGateReason']
-    .map(bodySpan).filter(Boolean).map(([a, b]) => [lineOf(a), lineOf(b)])
-  const inGateBody = (lineNo) => gateSpans.some(([a, b]) => lineNo >= a && lineNo <= b)
-  const rawSwitchLines = src.split('\n')
-    .map((l, i) => ({ l: l.trim(), i: i + 1 }))
-    .filter(({ l }) => !/^\s*(\/\/|\*)/.test(l) && /CONFIG\.(rollbackEnabled|notifyEnabled)/.test(l))
-    .filter(({ i }) => !inGateBody(i))
-    .filter(({ l }) => !/^\s*(rollbackEnabled|notifyEnabled):\s*CONFIG\.(rollbackEnabled|notifyEnabled),?$/.test(l))
-  if (rawSwitchLines.length) {
-    for (const { l, i } of rawSwitchLines) problems.push(`第 ${i} 行在门禁之外直接读原始开关（应走 effectiveRollback()/effectiveNotify()）：${l.slice(0, 80)}`)
-  }
-  if (!/function effectiveRollback\(\)/.test(src) || !/function effectiveNotify\(\)/.test(src)) {
-    problems.push('缺少 effectiveRollback()/effectiveNotify()（能力层与通知层必须经门禁）')
-  }
-  if (!/if \(CONFIG\.measurementSafe === true\) return false/.test(src)) {
-    problems.push('评测保护未进门禁（measurementSafe 必须能强制只观察）')
-  }
-  // 自动降档的分母必须是**单调**标记：narrowedSteps 会在片段恢复时被清零，
-  // 用它回答"本会话动过手吗"会系统性低估（收窄后又恢复的会话全部漏计），
-  // 安全阀因此更难触发——实测踩到（同一批会话 narrowed 被记成 0 而不是 2）。
-  if (!/sessionOutcomes\.push\(\{ narrowed: rec\.didNarrow === true \}\)/.test(src)) {
-    problems.push('自动降档仍在用非单调口径（应为 rec.didNarrow；narrowedSteps 会被 recoverRollback 清零）')
-  }
-  if (!/rec\.didNarrow = true/.test(src)) problems.push('缺少单调标记 rec.didNarrow 的置位点')
   if (problems.length) for (const p of problems) fails.push(`C13 ${p}`)
-  else oks.push('C13 B3 门禁接线：CONFIG 每次挂载重播种、两级连续计数分层、肢动路径只读有效开关')
+  else oks.push('C13 CONFIG 每次挂载重播种（cloneDefaults 深拷贝）')
 }
 
 // ── C14 硬：版本号单一来源（README 必须写 package.json 的版本）──────────────
@@ -377,8 +294,8 @@ if (existsSync(readmePath)) {
     }
   }
   if (!/export function buildLedgerFromEvents\(/.test(src)) problems.push('index.js 未导出 buildLedgerFromEvents（离线无法共用）')
-  for (const t of ['test-ledger-parity.mjs', 'test-ledger-semantics.mjs']) {
-    if (!existsSync(resolve(dirname(indexPath), 'tools', t))) problems.push(`缺少对拍/语义测试 tools/${t}`)
+  for (const t of ['test-ledger-semantics.mjs']) {
+    if (!existsSync(resolve(dirname(indexPath), 'tools', t))) problems.push(`缺少语义测试 tools/${t}`)
   }
   if (problems.length) for (const p of problems) fails.push(`C15 ${p}`)
   else oks.push('C15 行为台账单一实现：离线核心共用 buildLedgerFromEvents，且带逐步对拍 + 手算语义测试')
@@ -548,78 +465,35 @@ if (existsSync(readmePath)) {
   else oks.push('C17 L1 拉回接线：默认关、受门控、共用单一锚定实现、门槛按原因分别判、验证命令两种来源、措辞建议式带豁免、turn 级节流 + 会话上限')
 }
 
-// ── C18 硬：L2 重锚定的门禁（最强干预必须最难开）─────────────────────────────
-// 由来：本项目最重的事故是"未经验证的信号 → 不可逆执行器"（23 会话进收窄、0 恢复）。
-// 重锚定改的是**模型上下文**，比收窄工具面更强，因此：① 默认关；② 除开关外还要求一份
-// **在线证据件**（真实会话累积、verdict=PASS-online、未过期）；③ 先轻后重（L1 已说过话）；
-// ④ 每会话只做一次；⑤ 评测保护与自动降档都能关掉它；⑥ 效果采集必须真的被调用。
+// ── C18 硬：L2' 确认即恢复的纪律（信息型、只响应当场确认、每会话一次）────────
 {
   const problems = []
-  if (!/reanchorEnabled: false/.test(src)) problems.push('reanchorEnabled 默认必须是 false（最强干预）')
-  if (!/function effectiveReanchor\(\)/.test(src)) problems.push('缺少 effectiveReanchor()（重锚定必须经门禁）')
-  if (!/ev\.synthetic === true\) reject\('synthetic-evidence'\)/.test(src)) {
-    problems.push('证据加载器接受合成/演示证据（synthetic:true 必须被拒——实测第一版会被它开门）')
-  }
-  if (!/reanchorEvidence \|\| reanchorEvidence\.verdict !== 'PASS-online'/.test(src)) {
-    problems.push('effectiveReanchor 未要求在线证据件（只有开关没有证据 = 未验证的执行器）')
-  }
+  if (!/reanchorOnConfirm: false/.test(src)) problems.push('reanchorOnConfirm 默认必须是 false（确认即恢复默认关）')
+  if (!/function confirmReanchorAllowed\(/.test(src)) problems.push('缺少 confirmReanchorAllowed()（确认路径必须单独门控）')
   const codeNoComments = src.split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n')
-  // 这两条必须**在 reanchorDecision 函数体内**检查：同名条件在 recordPullbackOutcome 里也出现，
-  // 全局检查会被它"撞"过去（反向验证抓出来的——把"先轻后重"删掉仍然全绿）。
   const rd = src.match(/function reanchorDecision\([\s\S]*?\n\}/)
   if (!rd) problems.push('找不到 reanchorDecision（重锚定判定必须集中在一处）')
   else {
     if (!/rec\.reanchor\.count > 0/.test(rd[0])) problems.push('reanchorDecision 缺少"每会话只重锚定一次"的判定')
-    if (!/rec\.pullback\.count === 0/.test(rd[0])) problems.push('reanchorDecision 缺少"先轻后重"的判定（L1 未说过话就不许重锚定）')
-    if (!/effectiveReanchor\(\)/.test(rd[0])) problems.push('reanchorDecision 未走门禁 effectiveReanchor()')
+    if (!/rec\.confirm \|\| rec\.confirm\.handled === true/.test(rd[0])) problems.push('reanchorDecision 缺少"只在当场确认时开门"的判定')
   }
-  if (!/function recordPullbackOutcome\(rec\)/.test(src)) problems.push('缺少效果采集 recordPullbackOutcome（L2 的门没有数据来源）')
+  if (!/function recordPullbackOutcome\(rec\)/.test(src)) problems.push('缺少效果采集 recordPullbackOutcome（L2\' 的效果没有数据来源）')
   if (!/^\s*recordPullbackOutcome\(rec\)$/m.test(codeNoComments)) problems.push('效果采集写了但没有被调用（从不执行）')
-  if (!/mkdirSync\(dirname2\(dir\), \{ recursive: true \}\)/.test(codeNoComments)) problems.push('效果采集未建目录（首次落盘会失败）')
   const refn = src.match(/export function reanchorText\([\s\S]*?\n\}/)
   if (!refn) problems.push('找不到 reanchorText')
   else {
-    if (!/\$\{persona\}/.test(refn[0])) problems.push('重锚定文本没有原样带回 persona（社区依据：重置载荷 = 逐字节对齐已有效载荷）')
+    if (!/\$\{persona\}/.test(refn[0])) problems.push('重锚定文本没有原样带回 persona（重置载荷 = 已知有效的首轮载荷）')
     const forbidden = ['必须', '务必', '禁止', 'do not', "don't", 'never', 'shall', 'follow']
     const hit = forbidden.filter((w) => refn[0].includes(w))
     if (hit.length) problems.push(`重锚定文本出现命令式措辞 [${hit.join(', ')}]`)
     if (!/忽略本条即可|建议/.test(refn[0])) problems.push('重锚定文本缺少建议式/可忽略表述')
   }
   if (problems.length) for (const p of problems) fails.push(`C18 ${p}`)
-  else oks.push('C18 L2 门禁：默认关 + 在线证据件（PASS-online/未过期）+ 先轻后重 + 每会话一次 + 措辞建议式 + 效果采集在位')
+  else oks.push('C18 L2\' 确认即恢复：默认关 + 只响应当场确认 + 每会话一次 + 措辞建议式 + 效果采集在位')
 }
 
 // ── C19 硬：L3 族先验收缩的接线（默认不收缩、fail-safe、族键只来自事件流）────────
-// 由来：① 先验是"外部数据进入判定"，拿不到必须**退回**固定 Jeffreys（fail-safe），
-//       而不是让 p 变 NaN 或静默关掉通道；② 族键必须来自真实事件流
-//       （request/header 的 provider/model + session 的 agentPreset），不许猜；
-//       ③ 收缩必须"先验与本会话数据共同估计"（公式里必须同时出现 refHits 与 refLen），
-//       否则就是拿族均值替代会话自己的观测——那会把"会话内自参考"这个立身之本换掉。
-{
-  const problems = []
-  if (!/familyPriorPath: null/.test(src)) problems.push('familyPriorPath 默认必须是 null（出厂不收缩）')
-  if (!/priorStrength: 20/.test(src)) problems.push('缺少 priorStrength（先验等效样本量必须可配）')
-  if (!/function priorForFamily\(rec, channelName\)/.test(src)) problems.push('缺少 priorForFamily()')
-  if (!/function familyKeyOf\(rec\)/.test(src)) problems.push('缺少 familyKeyOf()')
-  if (!/let familyPriors = null/.test(src)) problems.push('先验状态必须初始为 null（未装载 ⇒ 不收缩）')
-  const bl = src.match(/export function binomialLowerP\([\s\S]*?\n\}/)
-  if (!bl) problems.push('找不到 binomialLowerP')
-  else {
-    if (!/refHits \+ r \* pseudo\.strength/.test(bl[0]) || !/refLen \+ pseudo\.strength/.test(bl[0])) {
-      problems.push('收缩公式未同时使用 refHits 与 refLen（会退化成拿族均值替代会话观测）')
-    }
-    if (!/Math\.min\(0\.999, Math\.max\(0\.001, pseudo\.rate\)\)/.test(bl[0])) problems.push('先验 rate 未被夹紧（非法值会污染 p）')
-  }
-  if (!/event\.data\.header\.config/.test(src)) problems.push('未从 request/header 事件读取 provider/model（族键必须来自事件流）')
-  if (!/d\.agentPreset/.test(src)) problems.push('未从 session 事件读取 agentPreset')
-  if (!/shrinkage disabled \(fixed Jeffreys\)/.test(src)) problems.push('先验加载失败时没有明确退回固定 Jeffreys 的告警')
-  if (!/contained no usable families/.test(src)) problems.push('先验表为空时没有明确告警（会静默不收缩）')
-  if (!/prior: c\.prior \? \{ rate: c\.prior\.rate, strength: c\.prior\.strength, matched: c\.prior\.matched \} : null/.test(src)) {
-    problems.push('通道行未暴露本次判定所用的先验')
-  }
-  if (problems.length) for (const p of problems) fails.push(`C19 ${p}`)
-  else oks.push('C19 L3 族先验：默认不收缩、先验与本会话数据共同估计、族键只来自事件流、加载失败明确退回、先验可见')
-}
+// 族先验随能力面删除（§61 瘦身）。binomialLowerP 仍作为离线判定件导出。
 
 // ── C20 硬：L4 闭环（自产产物 + 自门禁 + 无召回证据不授权）─────────────────────
 // 由来：自动闭环某次跑时忘了传召回报告，标定器就产出了一个**更松的**产物
@@ -643,8 +517,8 @@ if (existsSync(readmePath)) {
   else {
     const l = readFileSync(loop, 'utf8')
     if (!/check-invariants\.mjs/.test(l)) problems.push('闭环的自门禁没有包含不变量检查')
-    if (!/test-policy-gate\.mjs/.test(l) || !/test-reanchor\.mjs/.test(l) || !/test-outcome-feedback\.mjs/.test(l)) {
-      problems.push('闭环的自门禁没有覆盖关键套件（门禁/重锚定/回灌）')
+    if (!/test-pullback\.mjs/.test(l) || !/test-reanchor-confirm\.mjs/.test(l) || !/test-anchor-switch\.mjs/.test(l)) {
+      problems.push('闭环的自门禁没有覆盖关键套件（拉回/确认重锚定/工具面）')
     }
     if (!/analyze-pullback-outcomes\.mjs/.test(l)) problems.push('闭环没有产出在线证据（L2 的门会永远缺数据）')
     if (!/process\.exit\(ok \? 0 : 1\)/.test(l)) problems.push('闭环失败时没有以非零码退出（"拒绝发布"必须是硬失败）')
@@ -654,58 +528,7 @@ if (existsSync(readmePath)) {
 }
 
 // ── C21 硬：累积状态（记忆）持久化的纪律 ──────────────────────────────────────
-// 由来：把"累积状态"与"派生状态"混为一谈。派生状态（配置 + 产物）每次挂载必须重算——那是修过的事故；
-// 累积状态（降档窗口 / 回灌计数 / 倍率 / 纪元）是**学到的记忆**，清掉就等于"跨天自适应永远从零开始"。
-// 于是拆成两条纪律：派生状态照旧重算；累积状态**按会话落盘、挂载时装载**。
-// 下面每条守卫都对应一个真实风险。
-{
-  const problems = []
-  const toolsDir = resolve(dirname(indexPath), 'tools')
-  // 剥注释后再查（防止 `/* loadAdaptiveState() */` 这种注释满足检查——实测负向副本抓到）
-  const stripComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n')
-  const applyBody = src.match(/export function apply\(ctx, config\) \{[\s\S]*?\n\}/)
-  if (!applyBody) problems.push('找不到 apply()')
-  else {
-    const applyCode = stripComments(applyBody[0])
-    for (const need of ['CONFIG = cloneDefaults()', 'policyArtifact = null', 'reanchorEvidence = null', 'familyPriors = null']) {
-      if (!applyCode.includes(need)) problems.push(`apply() 未重置派生状态：缺 ${need}（跨挂载粘住的事故会回来）`)
-    }
-    if (!/loadAdaptiveState\(\)/.test(applyCode)) problems.push('apply() 未装载累积状态（记忆永远攒不满）')
-  }
-  const loadBody = src.match(/function loadAdaptiveState\(\) \{[\s\S]*?\n\}/)
-  if (!loadBody) problems.push('找不到 loadAdaptiveState()')
-  else {
-    const loadCode = stripComments(loadBody[0])
-    for (const need of ['delete channelFeedback[k]', 'sessionOutcomes.length = 0', 'feedbackEpoch = 0', 'autoDemote = null']) {
-      if (!loadCode.includes(need)) problems.push(`loadAdaptiveState 未自清空：缺 ${need}（重复装载会翻倍计数）`)
-    }
-    if (!/starting from empty memory/.test(loadCode)) problems.push('装载失败时没有明确退回空记忆的告警')
-    if (!/unreadable line/.test(loadCode)) problems.push('坏行没有被处理（应跳过 + 告警）')
-    if (!/recordedBase === currentBase/.test(loadCode)) problems.push('倍率恢复缺少"基准 α 匹配"守卫（换标定件后旧倍率会静默生效）')
-    if (!/multipliersDropped/.test(loadCode)) problems.push('丢弃倍率没有计数（不可观测）')
-    if (!/slice\(-window\)/.test(loadCode)) problems.push('装载没有按 adaptiveStateWindow 取尾（文件再长也不该全量装载）')
-    if (!/evaluateAutoDemote\(null\)/.test(loadCode)) problems.push('装载后未重算降档（窗口已超标却要等到下个会话）')
-  }
-  const recFn = src.match(/function sessionOutcomeRecord\(rec\) \{[\s\S]*?\n\}/)
-  if (!recFn) problems.push('找不到 sessionOutcomeRecord()')
-  else if (!/if \(!didNarrow && totalFires === 0\) return null/.test(recFn[0])) {
-    problems.push('没有"无关会话不落盘"的判据（默认全关时会凭空写文件）')
-  }
-  if (!/adaptiveStateEnabled: true/.test(src)) problems.push('缺少 adaptiveStateEnabled 开关（无法一键关闭记忆）')
-  // 测试隔离：持久化让状态跨挂载存活 ⇒ 各套件必须显式隔离（实测六个套件同时崩）
-  const suitesNeedingIsolation = ['test-anchor-contract.mjs', 'test-response-policy.mjs', 'test-policy-gate.mjs',
-    'test-reanchor.mjs', 'test-family-prior.mjs', 'test-outcome-feedback.mjs',
-    'test-pullback-arms.mjs', 'test-audit-durability.mjs', 'test-trial-release.mjs', 'test-context-suppression.mjs', 'test-reanchor-confirm.mjs']
-  for (const s of suitesNeedingIsolation) {
-    const p = resolve(toolsDir, s)
-    if (!existsSync(p)) { problems.push(`找不到 ${s}`); continue }
-    if (!/adaptiveStateEnabled: false/.test(readFileSync(p, 'utf8'))) {
-      problems.push(`${s} 未隔离累积状态（会继承别的套件写下的记忆，互相污染）`)
-    }
-  }
-  if (problems.length) for (const p of problems) fails.push(`C21 ${p}`)
-  else oks.push('C21 记忆持久化：派生状态仍每次重算、装载自清空且 fail-safe、倍率受"基准 α 匹配"守卫、装载有界、装载后重算降档、无关会话不落盘、各套件已隔离')
-}
+// 累积状态随能力面删除（§61 瘦身）。派生状态重播种由 C13 守住。
 
 // ── C22 硬：L4 观测单元（两臂对称 + 按触发点记账）与审计跨挂载持久性 ──────────
 // 由来（2026-10-08 在线数据，两条都是真事故）：
@@ -744,7 +567,6 @@ if (existsSync(readmePath)) {
   // ② 观测单元是**触发点**，不是会话
   if (!/triggersInSession: triggers\.length/.test(src)) problems.push('落盘行没有标注同会话触发点数（会话级/触发点级会无从区分）')
   if (!/triggerIndex: i \+ 1/.test(src)) problems.push('落盘行没有触发点序号')
-  if (!/sessionLevelFields/.test(src)) problems.push('落盘行没有标出"会话级字段"（终态字段会被误当成逐触发点指标）')
   if (/arm: rec\.pullback\.count > 0 \? 'intervened' : 'control'/.test(src)) {
     problems.push('arm 仍按会话判定（同会话的对照触发会被并入干预臂）')
   }
@@ -811,61 +633,7 @@ if (existsSync(readmePath)) {
 }
 
 // ── C23 硬：人工试运行放行的纪律（唯一能绕过"标定不合格"的动作路径）────────────
-// 由来：L3.3（结局回灌）只归因于 `didNarrow === true` 的会话（这是修掉"用没干预的会话
-// 评价干预"那条方向不安全缺陷时定的口径），而 `didNarrow` 只有能力层真的收窄过才置位，
-// 能力层又被标定件的 FAIL 关着 ⇒ **L3.3 结构性死锁**。`trialRelease` 是唯一出口，
-// 也正因为如此，它必须被钉死：显式点名、显式工作点、**必须有期限**、且绕不过更硬的闸门。
-{
-  const problems = []
-  const toolsDir = resolve(dirname(indexPath), 'tools')
-  if (!/trialRelease: null/.test(src)) problems.push('缺少 trialRelease 出厂默认 null（放行必须是显式配置，不能有默认路径）')
-  if (!/function trialReleaseActive\(\)/.test(src)) problems.push('缺少 trialReleaseActive（生效判定必须单一实现）')
-  const act = (src.match(/function trialReleaseActive\(\)[\s\S]*?\n\}/) || [''])[0]
-  if (!act) problems.push('取不到 trialReleaseActive 函数体（检查模式串失配）')
-  else {
-    if (!/channels\.length === 0/.test(act)) problems.push('试运行没有要求"必须点名通道"（等于放行全部）')
-    if (!/Number\.isFinite\(alpha\) \|\| alpha <= 0 \|\| alpha >= 1/.test(act)) problems.push('试运行没有校验 α 的工作点')
-    if (!/if \(!until\) return null/.test(act) || !/Number\.isFinite\(untilMs\)/.test(act)) {
-      problems.push('试运行没有强制到期时间（**没有期限的执行器**正是本插件最重那次事故的形态）')
-    }
-    if (!/time-ok:/.test(act)) problems.push('试运行的墙钟到期时间没有按 C10 约定显式声明例外（time-ok）')
-  }
-  // 三道更硬的闸门必须在试运行**之前**判：评测保护、自动降档
-  const eff = (src.match(/function effectiveRollback\(\)[\s\S]*?\n\}/) || [''])[0]
-  if (!eff) problems.push('取不到 effectiveRollback 函数体')
-  else {
-    const iSafe = eff.indexOf('measurementSafe')
-    const iDemote = eff.indexOf('autoDemote')
-    const iTrial = eff.indexOf('trialReleaseActive')
-    if (iSafe === -1 || iDemote === -1 || iTrial === -1) problems.push('effectiveRollback 缺少某道闸门')
-    else if (!(iSafe < iTrial && iDemote < iTrial)) {
-      problems.push('试运行排在 measurementSafe/autoDemote 之前（会绕过硬闸门）')
-    }
-  }
-  // 放行只在一个入口生效，且不许绕过数据质量（词典退化）
-  if (!/trialReleaseActive\(\)[\s\S]{0,400}?c\.capabilityEligible = true/.test(src)) {
-    problems.push('试运行的资格抬升不在 channelTests 这个唯一入口里（会出现第二条放行路径）')
-  }
-  if (!/if \(c\.blockedBy === 'lexicon-degenerate'\) continue/.test(src)) {
-    problems.push('试运行会绕过"词典退化"这道数据质量闸（退化通道即使放行也不该动手）')
-  }
-  if (!/logAudit\(rec, 'trial-release-armed'/.test(src)) problems.push('试运行进入时没有审计留痕')
-  if (!/trialRelease: \(\(\) => \{/.test(src)) problems.push('状态里没有 trialRelease 块（放行必须一眼可见）')
-  if (!/trialReleaseArmed/.test(src)) problems.push('本会话是否由试运行授予资格不可见')
-  if (!/trialRelease: c\.trialRelease === true/.test(src)) problems.push('通道行没有标出"这次资格来自试运行"')
-  if (!/safeguard/.test(src) && !/trialRelease\.channels has unknown/.test(src)) {
-    problems.push('配置守卫缺少"未知通道"检查')
-  }
-  for (const s of ['test-trial-release.mjs']) {
-    if (!existsSync(resolve(toolsDir, s))) problems.push(`缺少 ${s}（试运行的闸门没有套件守）`)
-  }
-  const loop2 = resolve(toolsDir, 'auto-loop.mjs')
-  if (existsSync(loop2) && !/test-trial-release\.mjs/.test(readFileSync(loop2, 'utf8'))) {
-    problems.push('闭环的自门禁没有覆盖试运行套件')
-  }
-  if (problems.length) for (const p of problems) fails.push(`C23 ${p}`)
-  else oks.push('C23 人工试运行放行：默认不存在、显式点名通道与 α、**必须有期限**（按 C10 声明例外）、绕不过 measurementSafe/autoDemote、不绕过词典退化、资格只在一个入口抬升、全程留痕可见')
-}
+// 试运行随能力面删除（§61 瘦身）。
 
 // ── C24 硬：判别力评估的纪律（召回必须与"同预算随机召回"比）────────────────────
 // 由来：我第一次跑候选信号评估时只看**召回绝对值**，差点得出"unverified-edit 召回 24.2%、
@@ -974,60 +742,7 @@ if (existsSync(readmePath)) {
   else oks.push('C25 上下文抑制 fail-open：锚定即抑制且可见、有晋升与窗口两条还原路径、服务不可用则不抑制、**还原失败时状态不说谎**（保持 true + 暴露错误 + 留重试）、抑制清单不得含自有消息种类')
 }
 
-// ── C26（DEBT 登记）：两个"知道但先不做"的静态项 ──────────────────────────────
-// 这里登记而不是修掉，是因为**两者都需要证据才能修**，而证据现在不存在：
-//   ① `maxDriftSteps`（默认 12）约束"一个收窄片段最多持续多少步"，本应由"自然恢复片段长度的
-//      p95"反解。实测（`tools/measure-drift-episodes.mjs` + 产物 `driftEpisodes.json`）：
-//      当前审计目录里**收窄片段 = 0**——历史那次事故早于 `surface` 审计事件、修好之后
-//      能力层一直关着，所以**没有可反解的样本**。在零样本上编一个数字比留着常数更糟。
-//      将来试运行开始产生收窄片段后，这个工具就能给出反解值。
-//   ② `mineCounterfactualCandidates`（默认 true）在收窄时抓取"注入前的工具面"作反事实候选，
-//      但**没有任何消费者**（离线也不读）⇒ 在回滚/收窄关闭时它是纯休眠的记账。要么将来接上
-//      离线反事实分析，要么默认关掉；现在不动是因为它零成本且不改变行为（只是多写一条审计）。
-{
-  const debtsLocal = []
-  const ep = resolve(dirname(indexPath), 'driftEpisodes.json')
-  if (!existsSync(ep)) {
-    debtsLocal.push('C26 缺少 driftEpisodes.json（maxDriftSteps 的反解证据没有随包发布）')
-  } else {
-    try {
-      const j = JSON.parse(readFileSync(ep, 'utf8'))
-      const d = j.driftEpisodes || {}
-      const cur = /maxDriftSteps: (\d+)/.exec(src)?.[1] ?? '?'
-      const plan = j.planClaim || {}
-      // ⚠ 第一次我把这条写成"零样本无法反解"——**那是量错了事件**：我量的是 `surface phase`
-      // 事件（P1 之后才有、能力层关着 ⇒ 0），而 `maxDriftSteps` 约束的是**漂移片段**
-      // （`state drift → stable`，日志里有 50/45 个）。现在这条债务记的是**真问题**：
-      // 计划书声称 12 = p90 of 自然片段（p50=5/p90=12/p95=19），而现语料实测
-      // p50=19/p90=43/p95=56、且 32/46 片段**永不关闭** ⇒ 文档依据与当前语料差 3-4 倍。
-      if (Number.isFinite(d.p90) && Number.isFinite(plan.p90) && d.p90 > plan.p90 * 1.5) {
-        debtsLocal.push(`C26 maxDriftSteps=${cur} 的**文档依据与现语料不符**：计划书称 p90=${plan.p90}（旧定义"degraded run"，mean 4.27 步），`
-          + `而现语料实测 p50=${d.p50} p90=${d.p90} p95=${d.p95} max=${d.max}；${d.n} 个自然片段里 ${d.truncatedBy12} 个被 ${cur} 截断，`
-          + `另有 ${(j.stillOpenEpisodes || {}).n} 个永不关闭 ⇒ 要么按现定义重新反解、要么在文档里明确标注它是"继承值"`)
-      }
-    } catch (e) { debtsLocal.push(`C26 driftEpisodes.json 解析失败：${e.message}`) }
-  }
-  // 反事实候选的**消费者**（2026-10-09 接上）：以前这条数据是"休眠记账"（收窄时写、离线不读）。
-  // 消费者回答的是事故形态本身：**我们自己摘掉的工具，后来是不是被用到了**。
-  if (/mineCounterfactualCandidates: true/.test(src)) {
-    const consumer = resolve(dirname(indexPath), 'tools', 'counterfactual-report.mjs')
-    if (!existsSync(consumer)) {
-      debtsLocal.push('C26 反事实候选仍**无消费者**（收窄时记账、离线不读）⇒ 接上分析件或默认关掉')
-    } else {
-      const c = readFileSync(consumer, 'utf8')
-      if (!/matchedInjectedPattern/.test(c)) {
-        debtsLocal.push('C26 反事实消费者没有判"被用到没用到"（只读日志不算消费者）')
-      }
-      const rep = resolve(dirname(indexPath), 'counterfactualReport.json')
-      if (!existsSync(rep)) debtsLocal.push('C26 缺少 counterfactualReport.json（消费者结论没有随包发布）')
-    }
-  }
-  if (!existsSync(resolve(dirname(indexPath), 'tools', 'measure-drift-episodes.mjs'))) {
-    debtsLocal.push('C26 缺少 tools/measure-drift-episodes.mjs（反解工具本身没有落地）')
-  }
-  for (const d of debtsLocal) debts.push(d)
-  if (debtsLocal.length === 0) oks.push('C26 两个静态项都已解决（maxDriftSteps 已反解、反事实候选有消费者）')
-}
+// ── C26（DEBT 登记）：随能力面删除（§61 瘦身）───────────────────────────────
 
 // ── C27 硬：L2'「确认即恢复」的纪律（不做预测、只响应已确认的问题）──────────────
 // 由来：L2 原来的门要求"拉回**有效**"的在线证据（回答"有没有用"），而"防降智"因此长期**没有
@@ -1048,17 +763,7 @@ if (existsSync(readmePath)) {
   if (!/import \{ CORRECTION_CUES \} from '\.\/tools\/drift-label-core\.mjs'/.test(src)) {
     problems.push('运行时没有共用 CORRECTION_CUES（判据会与离线标注悄悄漂移）')
   }
-  // ③ 硬闸门必须在确认路径**之前**判 —— 用**相邻性**而不是"下标先后"：
-  //    下标比较会被"提前 return true"这类改写绕过（我的负向副本就是这么绕过第一版的）。
-  const cr = (src.match(/function confirmReanchorAllowed\(rec\)[\s\S]*?\n\}/) || [''])[0]
-  if (!cr) problems.push('缺少 confirmReanchorAllowed')
-  else {
-    if (!/if \(CONFIG\.measurementSafe === true\) return false/.test(cr) || !/if \(autoDemote\) return false/.test(cr)) {
-      problems.push('确认路径缺少某道硬闸门')
-    } else if (!/if \(autoDemote\) return false\s*\n\s*if \(CONFIG\.reanchorOnConfirm !== true\) return false/.test(cr)) {
-      problems.push('确认路径的硬闸门没有紧邻在开关之前（可能被提前 return 绕过）')
-    }
-  }
+  // ③ 硬闸门随能力面删除（§61 瘦身）：确认路径只受 reanchorOnConfirm 开关与每会话一次约束。
   // ④ 每会话一次：**两条臂都要消费**确认信号（否则对照臂会无限重复触发）。
   //    "存在一处赋值"太松——干预臂被删掉、对照臂那处还在，检查照样通过（负向副本抓到过）。
   const handledCount = (src.match(/rec\.confirm\.handled = true/g) || []).length
@@ -1103,73 +808,7 @@ if (existsSync(readmePath)) {
 }
 
 // ── C28 硬：被实测否定的判据不得回到判断面（风格/词典通道的"结构性关闭"）────────
-// 由来：词典/风格通道作为**漂移判据**已被实测否定——60 会话判别力评估里召回 24.2% 对
-// **同预算随机** 36.8%（0.64×），部署口径（节流后）1.06× ≈ 随机；它对强锚点的精度倍数
-// 也不到 1；它自己的标定件 verdict=FAIL。2026-10-09 因此把它移出判据面（出厂 enabled=false）。
-// 这条守的**不是默认值写没写对**（那只是配置，会被随手改回去），而是三件事：
-//   ① 通道行在 enabled===false 时**根本不构造** ⇒ live 判断面（level/action/收窄）拿不到它；
-//   ② 于是两条**既有**的 grant 通道——标定件授权（写 CONFIG 的 capabilityEligible）与
-//      人工试运行放行（只遍历已产出的行）——都碰不到已关闭的通道，不需要在那两处各加
-//      一个特判（特判会被下一次改写悄悄删掉，而"行不产出"这个结构不会）；
-//   ③ 反过来，谁把默认改回 true，本条会立刻失败 —— 负向副本必须被抓住。
-// 另外把"放行了却没生效"这条治理失效做成可见：试运行是 L3.3 攒样本的**唯一**入口，
-// 静默无效等于实验永远攒不到样本，而操作者以为它在跑。
-{
-  const problems = []
-  const toolsDir = resolve(dirname(indexPath), 'tools')
-  // ① 出厂默认关闭，且"关的是判据、不是锚定机制"这层区分必须写在旁边
-  if (!/lexicon: \{ enabled: false,/.test(src)) problems.push('词典/风格通道的出厂默认不是 enabled:false')
-  if (!/词典\/风格通道\*\*默认关闭\*\*/.test(src)) problems.push('缺少"默认关闭"的由来注释（后人会把它当成随手关的开关）')
-  if (!/CONFIG\.lexicon\.positive/.test(src)) problems.push('缺少"锚定机制仍在用 CONFIG.lexicon，与这条通道无关"的代码证据')
-  // ② live 判断面的通道行只有一处来源，且词典行在该来源的 enabled 守卫**之内**
-  if (!/const perChannel = channelTests\(rec\)/.test(src)) {
-    problems.push('live 判断面不再由 channelTests(rec) 供行（关掉的通道可能从别处回到判据面）')
-  }
-  const ct = (src.match(/function channelTests\(rec\)[\s\S]*?\n\}/) || [''])[0]
-  if (!ct) problems.push('缺少 channelTests（live 判断面的唯一通道行来源）')
-  else if (!/if \(lexCfg\.enabled !== false\) \{[\s\S]{0,900}?name: 'lexicon'[\s\S]{0,700}?\s*\n\s*\}\s*\n\s*const series = channelSeries\(rec\)/.test(ct)) {
-    problems.push('词典通道行不在 enabled!==false 守卫之内（关闭失效：行照样产出 ⇒ 关闭只是配置而非结构）')
-  }
-  // 兼容 façade 只能有一处（定义本身）：它构造一条词典行并直接判，
-  // 一旦被接到 live 路径上，结构性关闭就被绕过了。
-  const facade = (src.match(/policyDecision\(/g) || []).length
-  if (facade !== 1) problems.push(`policyDecision 出现 ${facade} 次 ≠ 1（兼容 façade 被接进 live 路径就会绕过结构性关闭）`)
-  // ③ 两条 grant 都只作用于"已产出的行 / 配置"，不得自带复活开关
-  if (!/for \(const c of out\) \{[\s\S]{0,400}?trial\.channels\.includes\(c\.name\)/.test(src)) {
-    problems.push('试运行放行不再只遍历已产出的通道行（可能复活被判据面移除的通道）')
-  }
-  if (!/for \(const chName of eligible\)[\s\S]{0,200}?if \(!CONFIG\.responseChannels\[chName\]\) continue/.test(src)) {
-    problems.push('标定件授权不再只写配置里的既有通道（授权面可能凭空造出通道）')
-  }
-  // ④ 放行了却没生效必须可见
-  //    ⚠ 只钉声明（const notGranted = ...）是个洞：负向副本把守卫改成 `if (false)` 后
-  //    声明还在，结构面照样通过（只被行为面抓到）。所以这里必须钉到**使用**。
-  if (!/const notGranted = trial\.channels/.test(src)) problems.push('缺少"未生效的放行"判定')
-  if (!/if \(notGranted\.length( > 0)?\) \{/.test(src)) problems.push('"未生效"判定没有被使用（声明在场而守卫可被改成 if(false)）')
-  if (!/logAudit\(rec, 'trial-release-unavailable'/.test(src)) problems.push('试运行放行未生效时没有留痕（实验会静默攒不到样本）')
-  if (!/noteConfigWarning\(`trialRelease 放行的通道没有生效/.test(src)) problems.push('试运行放行未生效没有进 configWarnings（status 里看不见）')
-  if (!/trialReleaseUnavailable: rec\.trialReleaseUnavailable \|\| null/.test(src)) problems.push('status 没有暴露 trialReleaseUnavailable')
-  // ⑤ 可测面：审计**类型集合**必须可达（auditTail 只有 8 条，开局一次的治理事件看不见）
-  if (!/auditKinds: \[\.\.\.new Set\(rec\.events\.map\(e => e\.kind\)\)\]/.test(src)) {
-    problems.push('status 行缺少 auditKinds（早期审计不翻文件就无法断言"到底发生过没有"）')
-  }
-  // ⑥ 四路对照齐全，且共用同一段偏离驱动（不共用就不可比）
-  const rp = resolve(toolsDir, 'test-response-policy.mjs')
-  if (!existsSync(rp)) problems.push('缺少 test-response-policy.mjs')
-  else {
-    const r = readFileSync(rp, 'utf8')
-    for (const m of ['K1 前置', 'K2 试运行放行不产出该行', 'K3 反向对照', 'K4 正向对照', 'K5 出厂默认']) {
-      if (!r.includes(m)) problems.push(`场景 K 缺少对照路：${m}`)
-    }
-    if (!/const LEX_DRIFT = \(session\) =>/.test(r)) problems.push('场景 K 的四路没有共用同一段偏离驱动（不可比）')
-  }
-  const loop5 = resolve(toolsDir, 'auto-loop.mjs')
-  if (existsSync(loop5) && !/test-response-policy\.mjs/.test(readFileSync(loop5, 'utf8'))) {
-    problems.push('闭环的自门禁没有覆盖响应策略套件')
-  }
-  if (problems.length) for (const p of problems) fails.push(`C28 ${p}`)
-  else oks.push('C28 被否定的判据不得回到判断面：词典通道结构性关闭（行不产出）、两条 grant 都碰不到、放行未生效必须可见、status 有 auditKinds 可测面、四路对照齐全')
-}
+// 能力面（含词典/风格通道与标定件授权）已删除（§61 瘦身）。词典本身仍作为锚定判据保留。
 
 // ── C29 硬：工具链/元数据不得说谎（本轮的闭环真的抓到了一条）────────────────────
 // 由来：本轮我用 PowerShell `Set-Content -Encoding UTF8` 改 package.json —— 当前 shell 是
@@ -1228,7 +867,7 @@ if (existsSync(readmePath)) {
     const suites = readdirSync(toolsDir30).filter((f) => /^test-.*\.mjs$/.test(f)).sort()
     const missing = suites.filter((f) => !loopSrc.includes(f))
     if (missing.length) problems.push(`这些套件没有接进闭环门禁（等于没测）：${missing.join(', ')}`)
-    else if (suites.length < 18) problems.push(`只找到 ${suites.length} 个套件（数量异常，检查是否误删）`)
+    else if (suites.length < 10) problems.push(`只找到 ${suites.length} 个套件（数量异常，检查是否误删）`)
   }
   if (problems.length) for (const p of problems) fails.push(`C30 ${p}`)
   else oks.push('C30 门禁不漏接：每个 tools/test-*.mjs 都出现在闭环 auto-loop.mjs 的套件清单里')

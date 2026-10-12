@@ -42,7 +42,7 @@ try {
     },
     effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {} },
   }
-  await mod.apply(ctx, { adaptiveStateEnabled: false, rollbackEnabled: false, notARealKey: 123 })
+  await mod.apply(ctx, { gateEnabled: false, notARealKey: 123 })
 } finally {
   console.warn = origWarn
 }
@@ -51,19 +51,19 @@ check('apply() 在未知配置键下仍完成挂载（未抛错）', typeof mod.
 check('anchor_status 工具已注册', typeof registeredTools.anchor_status === 'object')
 const summary = await registeredTools.anchor_status.execute({})
 
-check('已知键照常合并：rollbackEnabled=false 生效', summary.config.rollbackEnabled === false, String(summary.config.rollbackEnabled))
+check('已知键照常合并：gateEnabled=false 生效', summary.config.gateEnabled === false, String(summary.config.gateEnabled))
 check('未知键被响亮告警（console.warn 捕获）',
   warnings.some((w) => w.includes('unknown config key "notARealKey"')),
   JSON.stringify(warnings.slice(0, 2)))
 check('告警里列出允许的键名（便于当场改对）',
-  warnings.some((w) => w.includes('rollbackEnabled') && w.includes('allowed:')))
+  warnings.some((w) => w.includes('notARealKey') && w.includes('allowed:')))
 check('未知键出现在 anchor_status.configWarnings 中',
   Array.isArray(summary.configWarnings) && summary.configWarnings.some((w) => w.includes('notARealKey')),
   JSON.stringify(summary.configWarnings))
 check('未装配 agents 服务 → 降级为 listAtApply.error，而不是抛错',
   summary.listAtApply && summary.listAtApply.error === 'agents service unavailable',
   JSON.stringify(summary.listAtApply))
-check('P0 默认值仍在（rollbackEnabled 是 DEFAULTS 成员）', 'rollbackEnabled' in summary.config)
+check('默认值仍在（suppressContextOnBootstrap 是 DEFAULTS 成员且为 true）', summary.config.suppressContextOnBootstrap === true)
 
 // ---- P1：组装期派生工具面（surfaceForPhase 纯函数 + assemble 处理器姿态）----
 const TOOLS = ['pwsh', 'read', 'edit', 'browser_open', 'browser_type', 'vision_crop', 'todo_write'].map((n) => ({ name: n }))
@@ -147,13 +147,13 @@ check('surface: 无 name 的条目不抛错，且按 fail-open 保留（不误�
     const configWarns2 = warns2.filter((w) => /config key|unknown config|invalid .*config/i.test(w))
     check('安装即用: 无配置类告警（bundle patch 不声明任何键）', configWarns2.length === 0, JSON.stringify(configWarns2))
     check('安装即用: configWarnings 为空', Array.isArray(s2.configWarnings) && s2.configWarnings.length === 0, JSON.stringify(s2.configWarnings))
-    check('安装即用: 出厂即安全（双关 + 有界上限 + 锚定默认开）',
-      s2.config.rollbackEnabled === false && s2.config.notifyEnabled === false
-      && s2.config.maxDriftSteps > 0 && s2.config.gateEnabled === true
+    check('安装即用: 出厂即安全（信息型执行器全关 + 锚定默认开）',
+      s2.config.pullbackEnabled === false && s2.config.reanchorOnConfirm === false
+      && s2.config.gateEnabled === true
       && s2.config.suppressContextOnBootstrap === true,
-      JSON.stringify({ r: s2.config.rollbackEnabled, n: s2.config.notifyEnabled, m: s2.config.maxDriftSteps, g: s2.config.gateEnabled }))
-    check('安装即用: 策略键全部有出厂默认',
-      ['refMinSteps', 'testWindow', 'notifyAlpha', 'actAlpha'].every((k) => typeof s2.config[k] === 'number'))
+      JSON.stringify({ p: s2.config.pullbackEnabled, r: s2.config.reanchorOnConfirm, g: s2.config.gateEnabled }))
+    check('安装即用: 观测键全部有出厂默认',
+      ['pullbackMaxPerSession', 'pullbackControlRate', 'reanchorConfirmControlRate'].every((k) => typeof s2.config[k] === 'number'))
   } finally {
     console.warn = orig2
   }

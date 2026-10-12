@@ -161,12 +161,10 @@ await boot({ pullbackEnabled: true, pullbackControlRate: 0.5, pullbackOutcomePat
   check('③ **窗口按触发点算**（触发点 1 之后有验证、触发点 2 之后没有）',
     rows.length === 2 && rows[0].verifiesAfterPullback === 1 && rows[1].verifiesAfterPullback === 0,
     JSON.stringify(rows.map((r) => r.verifiesAfterPullback)))
-  check('③ 会话级字段显式标注且两行一致',
-    rows.length === 2 && Array.isArray(rows[0].sessionLevelFields)
-    && rows[0].sessionLevelFields.includes('claimedUnverifiedAfter')
-    && rows[0].claimedUnverifiedAfter === rows[1].claimedUnverifiedAfter
-    && rows[0].endedNarrowed === rows[1].endedNarrowed,
-    JSON.stringify(rows[0].sessionLevelFields))
+  check('③ 会话级终态字段两行一致（claimedUnverifiedAfter 同值同型）',
+    rows.length === 2 && typeof rows[0].claimedUnverifiedAfter === 'boolean'
+    && rows[0].claimedUnverifiedAfter === rows[1].claimedUnverifiedAfter,
+    JSON.stringify(rows.map((r) => r.claimedUnverifiedAfter)))
   check('③ 关闭前状态里两臂与 mark 都在位（落盘发生在关闭时，故 outcomeRows 仍为 0）',
     row && row.pullback.triggers === 2 && row.pullback.triggersByArm.control === 1 && row.pullback.triggersByArm.intervened === 1
     && row.pullback.verifyMarks === 1 && row.pullback.violationMarks === 2 && row.pullback.outcomeRows === 0,

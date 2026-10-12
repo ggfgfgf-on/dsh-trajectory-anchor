@@ -183,14 +183,14 @@ await boot({ reanchorOnConfirm: true })
   check('③ 反向对照：首条消息（任务陈述）里的"不对"不算确认信号', reAnchors(d).length === 0, `n=${reAnchors(d).length}`)
 }
 
-// ── ④ measurementSafe / autoDemote 优先 ────────────────────────────────────
-await boot({ reanchorOnConfirm: true, measurementSafe: true })
+// ── ④ 开关关了 ⇒ 确认路径不开（measurementSafe/autoDemote 随能力面删除）──────
+await boot({ reanchorOnConfirm: false })
 {
-  const { agent, session } = base('rc-safe')
+  const { agent, session } = base('rc-switch-off')
   sessionEvent(session, userText('不对，重做'))
   const d = await preStep(agent, 3, 1)
-  check('④ 反向对照：measurementSafe ⇒ 确认路径也让位', reAnchors(d).length === 0, `n=${reAnchors(d).length}`)
-  const row = await rowOf('rc-safe')
+  check('④ 反向对照：开关关 ⇒ 有确认信号也不重锚定', reAnchors(d).length === 0, `n=${reAnchors(d).length}`)
+  const row = await rowOf('rc-switch-off')
   check('④ 状态写明 confirmAllowed=false', row.reanchor.confirmAllowed === false, JSON.stringify(row.reanchor.confirmAllowed))
 }
 
@@ -208,21 +208,19 @@ await boot({ reanchorOnConfirm: true })
   check('⑤ 抑制计数写明 alreadyDone', row.reanchor.suppressed.alreadyDone >= 1, JSON.stringify(row.reanchor.suppressed))
 }
 
-// ── ⑥ 原证据路径的严格性不受影响 ───────────────────────────────────────────
-await boot({ reanchorOnConfirm: false, reanchorEnabled: true, reanchorEvidencePath: null })
+// ── ⑥ 确认路径的开关语义不受影响 ───────────────────────────────────────────
+await boot({ reanchorOnConfirm: false })
 {
-  const { agent, session } = base('rc-evidence-strict')
+  const { agent, session } = base('rc-confirm-strict')
   sessionEvent(session, userText('不对，重做'))
   const d = await preStep(agent, 3, 1)
-  check('⑥ 反向对照：**确认路径关着**时，即使有确认信号、开关也开着，缺名义仍不开门（证据路径没被悄悄放宽）',
-    reAnchors(d).length === 0, `n=${reAnchors(d).length}`)
+  check('⑥ 反向对照：确认路径关着 ⇒ 有确认信号也不重锚定', reAnchors(d).length === 0, `n=${reAnchors(d).length}`)
   const s = await statusOf()
-  check('⑥ 门的理由仍写明缺证据', s.reanchorGate === 'no-online-evidence', String(s.reanchorGate))
+  check('⑥ 状态无证据门字段（L2 证据路径已删，只剩确认路径）', s.reanchorGate === undefined, JSON.stringify({ gate: s.reanchorGate, reanchor: s.reanchor }))
 }
 {
-  // 正向对照：同一条会话**确认路径开着**时才开门 ⇒ 差别只来自确认路径的存在
-  await boot({ reanchorOnConfirm: true, reanchorEnabled: true, reanchorEvidencePath: null })
-  const { agent, session } = base('rc-evidence-vs-confirm')
+  await boot({ reanchorOnConfirm: true })
+  const { agent, session } = base('rc-confirm-on')
   sessionEvent(session, userText('不对，重做'))
   const d = await preStep(agent, 3, 1)
   check('⑥ 正向对照：确认路径开着时同一序列才重锚定（差别只来自这条路径）', reAnchors(d).length === 1, `n=${reAnchors(d).length}`)

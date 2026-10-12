@@ -41,7 +41,11 @@ async function boot(config) {
       if (n === 'agents') return { get: (id) => agentsById.get(id), list: () => [...agentsById.values()] }
       return undefined
     },
-    on: (name, fn) => { handlers[name] = fn; return () => {} },
+    on: (name, fn) => {
+      if (name === 'system-prompt/assemble') (handlers[name] = handlers[name] || []).push(fn)
+      else handlers[name] = fn
+      return () => {}
+    },
     effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {} },
   }
   await mod.apply(ctx, { adaptiveStateEnabled: false, ...config })
@@ -49,6 +53,19 @@ async function boot(config) {
 const dispatch = (name, ...args) => handlers['internal/dispatch']('x', name, args, null)
 const sessionEvent = (session, event) => dispatch('session/event', session, event)
 const summaryOf = async (sid) => (await registered.anchor_status.execute({})).rows.find((r) => r.sessionId === sid)
+/** 跑完整 assemble 瀑布链，返回最终组装（瘦身重构后断言**派生工具面**）。 */
+const assembleTools = async (sid, toolNames) => {
+  const list = handlers['system-prompt/assemble'] || []
+  const base = { sections: [], contexts: [], tools: toolNames.map((n) => ({ name: n })), variables: {} }
+  let i = -1
+  const run = (out) => {
+    i += 1
+    if (i >= list.length) return out
+    return list[i](out, { agent: { id: sid } }, async (o) => run(o === undefined ? out : o))
+  }
+  const out = await run(base)
+  return (out && Array.isArray(out.tools) ? out.tools : []).map((t) => t && t.name)
+}
 
 /** One synthetic agent that calls a tool once, i.e. exactly what triggers adoption + anchoring. */
 function makeAgent(sid) {
@@ -72,14 +89,19 @@ await boot({})
   check('默认：会话被锚定（anchored=true）', row.anchored === true, String(row.anchorChannel))
   check('默认：锚定通道就是 adopt 来源（无 anchor-disabled 后缀）',
     typeof row.anchorChannel === 'string' && row.anchorChannel.endsWith('dispatch:agent/created'), String(row.anchorChannel))
-  check('默认：首轮工具面被真的收窄（restrict 被调用）', restricted.length === 1, JSON.stringify(restricted.map((r) => r.deny)))
+  // 瘦身重构（§61）：首轮工具面**组装期派生**——unpromoted 只发 anchorAllow 里的工具
+  // （本 harness 可见面只有 pwsh 一个 bootstrap 工具）。
+  const bootTools = await assembleTools('sw-on', TOOLS.map((t) => t.name))
+  check('默认：首轮工具面派生为 anchorAllow（只有 pwsh）', JSON.stringify(bootTools) === JSON.stringify(['pwsh']), JSON.stringify(bootTools))
   // 上下文抑制在这套 harness 里观察不到（它需要一个本文件没有的 session/context 服务）；
   // 那一条由专门的 tools/test-context-suppression.mjs 覆盖，这里不去重造一个假服务。
   check('默认：晋升门待定（pendingPromote=true）', row.pendingPromote === true, String(row.pendingPromote))
   sessionEvent(session, text('We will inspect the repository first, then we will run the tests.'))
   const after = await summaryOf('sw-on')
-  check('默认：一条 minimal-like 推理后拿到晋升（lifted=true 且工具面恢复）',
+  check('默认：一条 minimal-like 推理后拿到晋升（lifted=true 且上下文恢复）',
     after.lifted === true && after.contextSuppressed === false, `${after.liftReason}/${after.contextSuppressed}`)
+  const fullTools = await assembleTools('sw-on', TOOLS.map((t) => t.name))
+  check('默认：晋升后组装期工具面恢复全量（7 个）', JSON.stringify(fullTools) === JSON.stringify(TOOLS.map((t) => t.name)), JSON.stringify(fullTools))
 }
 
 // ── direction 2: the switch really turns the treatment off (this is the control arm) ─────────────
@@ -94,7 +116,8 @@ await boot({ anchorEnabled: false })
   // 这里因此只断言"没有锚定通道"，并把"原因必须可从某处读到"交给审计面。
   check('关卡：status 行里没有锚定通道（原因串在 adopted 审计里，见上方注释）',
     row.anchorChannel === null, String(row.anchorChannel))
-  check('关卡：工具面没有被收窄（restrict 从未调用）', restricted.length === 0, JSON.stringify(restricted.length))
+  const offTools = await assembleTools('sw-off', TOOLS.map((t) => t.name))
+  check('关卡：工具面派生未收窄（全量 7 个）', JSON.stringify(offTools) === JSON.stringify(TOOLS.map((t) => t.name)), JSON.stringify(offTools))
   check('关卡：上下文没有被抑制（contextSuppressed=false）', row.contextSuppressed === false, String(row.contextSuppressed))
   check('关卡：没有晋升门待定（pendingPromote=false）', row.pendingPromote === false, String(row.pendingPromote))
   // 反向对照里同样重要的一条：控制臂必须是**纯观察者**，不是"插件死了"

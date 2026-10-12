@@ -1,8 +1,8 @@
 {
-  "generatedAtUtc": "2026-10-11T20:44:19.797Z",
+  "generatedAtUtc": "2026-10-11T21:49:22.424Z",
   "corpus": {
-    "sessionsScanned": 345,
-    "sessionsUsed": 238
+    "sessionsScanned": 346,
+    "sessionsUsed": 239
   },
   "axes": {
     "modelFamilies": [
@@ -16,7 +16,7 @@
       },
       {
         "key": "deepseek-official/deepseek-v4-pro",
-        "sessions": 48
+        "sessions": 49
       },
       {
         "key": "vision-toolkit-deepseek-official/deepseek-v4-flash",
@@ -38,7 +38,7 @@
     "presets": [
       {
         "key": "(none)",
-        "sessions": 238
+        "sessions": 239
       }
     ]
   },
@@ -64,13 +64,13 @@
       "model": "deepseek-v4-pro",
       "preset": null,
       "scope": "none",
-      "sessions": 33,
-      "steps": 23828,
-      "meanSteps": 722,
+      "sessions": 34,
+      "steps": 23940,
+      "meanSteps": 704,
       "baseRates": {
         "inaction": 0.0038,
-        "repetition": 0.0537,
-        "failure": 0.0443
+        "repetition": 0.0534,
+        "failure": 0.0442
       }
     },
     {
@@ -110,12 +110,12 @@
       "preset": null,
       "scope": "none",
       "sessions": 10,
-      "steps": 5632,
-      "meanSteps": 563,
+      "steps": 5782,
+      "meanSteps": 578,
       "baseRates": {
         "inaction": 0.0002,
-        "repetition": 0.036,
-        "failure": 0.0376
+        "repetition": 0.0355,
+        "failure": 0.0396
       }
     },
     {
@@ -1340,6 +1340,7 @@
     "15f131f6-75c": "deepseek-official/deepseek-v4-flash @ no-preset @ p2-f1",
     "16d98f19-93c": "huoshan/ark-code-latest @ no-preset @ workspace",
     "178fd3ce-ecc": "deepseek-official/deepseek-v4-pro @ no-preset @ workspace",
+    "17cedef1-5f5": "deepseek-official/deepseek-v4-pro @ no-preset @ none",
     "19d40eaa-f43": "huoshan/ark-code-latest @ no-preset @ p2-m1-6",
     "19d59805-99a": "huoshan/ark-code-latest @ no-preset @ workspace",
     "1f372c56-b96": "huoshan/ark-code-latest @ no-preset @ workspace",
@@ -1564,26 +1565,26 @@
     {
       "channel": "repetition",
       "alpha": 0.01,
-      "sessions": 238,
-      "sessionsWithFamilyPrior": 238,
-      "noPrior": 0.14705882352941177,
-      "familyPrior": 0.1638655462184874
+      "sessions": 239,
+      "sessionsWithFamilyPrior": 239,
+      "noPrior": 0.14644351464435146,
+      "familyPrior": 0.16317991631799164
     },
     {
       "channel": "failure",
       "alpha": 0.01,
-      "sessions": 238,
-      "sessionsWithFamilyPrior": 238,
-      "noPrior": 0.16806722689075632,
-      "familyPrior": 0.1722689075630252
+      "sessions": 239,
+      "sessionsWithFamilyPrior": 239,
+      "noPrior": 0.16736401673640167,
+      "familyPrior": 0.17154811715481172
     },
     {
       "channel": "inaction",
       "alpha": 0.01,
-      "sessions": 238,
-      "sessionsWithFamilyPrior": 238,
-      "noPrior": 0.046218487394957986,
-      "familyPrior": 0.046218487394957986
+      "sessions": 239,
+      "sessionsWithFamilyPrior": 239,
+      "noPrior": 0.04602510460251046,
+      "familyPrior": 0.04602510460251046
     }
   ]
 }

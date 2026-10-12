@@ -5,22 +5,16 @@
 # cordis itself.
 #
 # ── What you get on install, with zero configuration ──────────────────────────
-#   · first-round anchoring (the performance lever):
-#       bootstrap tool surface = bash / str_replace_editor / pwsh (intersected
-#       with what the agent can actually see), Minimal persona, runtime-context
-#       + skill-catalog suppression, promotion gate with maxBootstrapSteps
-#       fallback and an explicit post-promotion maxTokens strip.
-#   · per-step trajectory scoring + append-only audit log:
+#   · first-round anchoring (three-piece): bootstrap tool allow-list
+#     (bash / str_replace_editor / pwsh) derived at assembly time (no
+#     tools.restrict), Minimal persona, runtime-context + skill-catalog
+#     suppression, promotion gate with step-cap fallback.
+#   · per-step trajectory scoring + append-only chunked audit log:
 #       <workspaceRoot>/.dsh-trajectory-logs/anchor-<agentId>.jsonl
+#   · two informational behavioral reminders, both OFF by default:
+#       L1 pullback (scope violation / edits after last verification) and
+#       L2' confirm-reanchor (in-turn confirmation only).
 #   · `anchor_status` — read-only live audit tool.
-#
-# ── What is OFF by default (intentionally) ────────────────────────────────────
-#   · drift response (`rollbackEnabled: false`, `notifyEnabled: false`).
-#     The tool surface is only ever narrowed through an assembly-time *derived*
-#     filter (never a registry mutation), and only when a calibration artifact
-#     passes the false-trigger budget; both switches stay off until then.
-#     See README → "Response policy (P1–P7)" for the measured numbers behind
-#     this default.
 #
 # `config:` is deliberately omitted: a fresh install should inherit the code
 # defaults, so this file cannot drift out of sync with them. Any key you add is

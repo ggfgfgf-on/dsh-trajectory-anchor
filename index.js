@@ -44,453 +44,69 @@ import { isAbsolute, resolve as resolvePath, dirname as dirname2 } from 'node:pa
 // （台账定稿 51 倍偏差、两级连续计数混层），所以本轮一律共用一份实现。
 import {
   parseTaskAnchors, inScope, isIgnorablePath, changeInvalidatesVerification, pathsFromCallStrict, isWriteTool, isReadTool,
-  verifyCommandKind, claimsFromFinalMessage, commandPaths, verifyStaleness, deliveryGate, claimFormatOk, unsupportedClaim, evidenceContradiction, artifactDeliveryFacts, artifactStateFacts, itemizedClaimFacts,
+  verifyCommandKind, claimsFromFinalMessage, commandPaths,
 } from './tools/task-anchor-core.mjs'
 // 纠偏线索**共用离线标注那一份**（`drift-label-core` 零依赖、只读）：避免"标注用的判据"
 // 与"运行时触发的判据"各写一份、然后悄悄漂移（本项目在台账与形态识别上各栽过一次）。
 import { CORRECTION_CUES } from './tools/drift-label-core.mjs'
 
+// 瘦身重构（§61）：以下内部参数不再暴露为配置键——历史默认值固化为常量。
+const TRAJECTORY_WINDOW = 3
+const EWMA_ALPHA = 0.4
+const RATIO_WEIGHTS = { alpha: 2, beta: 0.5, gamma: 1.5, epsilon: 1 }
+const SPEC_MAX = 0.2
+const REACT_MIN = 0.5
+const HISTORY_CAP = 200
+const REWARD_ANNOTATOR = 'default'
+
 const DEFAULTS = {
   anchorEnabled: true,
-  // 契约重锚定（只读版，信息型）：代理**宣告完成**时，把首轮任务陈述摘要重新注入近因位置，
-  // 供它在交付前自检"有没有偏离原契约"。由来：dil2 台实测"后续指令与首轮契约冲突"时，
-  // 代理行为完全由"哪条指令最新"驱动，而插件全程沉默（ablation-log 第二十三条）。
-  // 默认关（与其他执行器同一纪律：先有验收证据再默认开）。
-  contractReanchor: false,
-  // 交付缺口回放（只读版，信息型）：代理宣告完成时，把它**自己最后一次验证输出里的失败**
-  // 回放到它眼前（"你宣布完成，但你自己刚跑的结果还有 N 个失败：…"）。由来：ark×Project2
-  // 五跑实测的失败形态是"早停 + 声明与证据脱节"（ablation-log §26/§28），L1 响"改完没验证"
-  // （它一直在验证，几乎不响）、L2' 回放 persona（对"还剩 21 个失败"零信息量）——都不对症。
-  doneGapMirror: false,
-  // 越界回放（只读版，信息型）：写操作落在首条指令声明的范围之外时，把"越界路径清单 +
-  // 原始范围条款"回放到它眼前（F3 事实，证据=它自己的工具调用轨迹）。默认关（同一纪律：
-  // 先有验收证据再默认开）。
-  scopeBreachMirror: false,
-  // 验证过期回放（只读版，信息型）：宣告完成时，若它最后一次验证**之后**又改过验证覆盖的
-  // 同一文件，把"验证命令 + 事后编辑"回放出来（F5 事实，"你的验证早于这次改动"）。默认关（同上）。
-  verifyStalenessMirror: false,
-  // ── phase 2：协议/预算型约束（docs/design-intervention-upgrade.md，默认关）────────
-  // 与信息型镜像的区别：**拒绝接收**交付声明（P1）/ 强制插入重验步骤（P2）/ 要求交付格式
-  // （P3），而不是"给证据让你自己决定"。触发仍用事实层；全部一次性/带预算，只加提示文本。
-  deliveryGate: false,             // P1 交付门：最后一次隐藏评测带失败或早于最近编辑 ⇒ 拒绝接收
-  verifyAfterEditBudget: false,    // P2 改后必验：每 verifyBudgetEvery 次落地代码改动注入一次强制重验
-  verifyBudgetEvery: 3,
-  claimFormatContract: false,      // P3 交付格式契约：声明过 PASS=n/m 格式就必须按格式交付
-  // ── F6/F7 事实镜像（criteria 设计第二波；默认关）────────────────────────────
-  unsupportedClaimMirror: false,   // F6：交付声称结局但全会话零验证证据 ⇒ 回放"你的断言没有出处"
-  evidenceContradictionMirror: false, // F7：声称全过但最后一次验证仍带失败 ⇒ 回放矛盾证据
-  itemizedClaimMirror: false,      // F2：清单式声明逐项对证（edits+验证证据），缺证据条目 ⇒ 回放清单
-  // ── process-front-loaded（docs/design-process-gate.md，默认关）────────────────
-  editBudgetCap: 0,               // Q4 会话内编辑预算：落地代码改动上限；0=关。耗尽后注入"现在评分并交付"
-  editHoldEvery: 0,               // Q2 带保持的编辑预算：每 K 次落地代码改动且无验证 ⇒ 进入保持态，
-                                  // 下一次 pre-step 注入"不许再改，先重验"；只有验证证据落地才解除。0=关。
-  deliveryArtifactGate: false,    // Q1 交付工件门：写交付工件（PR 模板）时隐藏评测带失败/早于最近编辑
-                                  // ⇒ 拒绝接收该工件（回合还开着的位置，P1 重跑率 0/7 的结构性修法）
-  deliveryArtifactStateGate: false, // Q1' 工件状态绑定门（process-gate §6）：验证时绑定工件文件状态
-                                  // （mtime/size/sha），pre-step 比对"最近验证后被动过/被删"⇒ 注入重验保持。
-                                  // 文件状态观测 ⇒ 脚本通道写入可见；任意 grader 验证都能绑定（Q1 的两个盲区）。
-  fileStateHoldEvery: 0,          // Q2' 文件状态编辑计数（process-gate §6b）：验证时给工作区代码文件做
-                                  // 状态快照（≤300 文件），pre-step 数"自验证以来变过的文件"≥K ⇒ 注入保持。
-                                  // 脚本通道写入也可见（Q2 的盲区修法）。0=关。
   bootstrapTools: ['bash', 'str_replace_editor', 'pwsh'],
   bootstrapMaxTokens: null,
   bootstrapPersona: 'You are a helpful software engineer assistant.',
-  trajectoryWindowSize: 3,
-  ewmaAlpha: 0.4,
-  maxBootstrapSteps: 5,
-  promoteAfterFirstResponse: true,
   gateEnabled: true,
+  maxBootstrapSteps: 5,
   suppressContextOnBootstrap: true,
   suppressSkillCatalog: true,
   suppressedSources: ['skill-catalog'],
-  // 能力层与通知层的总开关。默认**都关**（只观察、只审计）——这是按标定结论定下的
-  // 安全默认：tools/calibrate-response-policy.mjs 在 44 个历史会话上测得当前词表
-  // 信号的会话级误触发率 15.9%（α=0.001）/ 43.2%（α=0.01），远高于 5% 预算，
-  // 即"信号不足以支撑能力层干预"。开之前必须先让标定通过（或换 P5 行为轴信号）。
-  rollbackEnabled: false,
-  notifyEnabled: false,
   lexicon: {
     positive: { we: 2, "let's": 1.5, "we'll": 1.2, 'we need': 1.2, our: 0.8 },
     negative: { 'let me': 3 },
     neutral: { 'i will': 1, "i'll": 1, 'i need': 0.8, check: 0.4, verify: 0.4 },
   },
-  ratioWeights: { alpha: 2, beta: 0.5, gamma: 1.5, epsilon: 1 },
   lexiconPath: null,
-  specMax: 0.2,
-  reactMin: 0.5,
-  // ── P3 响应策略：会话内自参考偏离检验（取代旧的"单步 percentile<25"）──────
-  // 为什么换掉旧的：percentile 是**定义性秩**——取最低四分位就恒有 ~25% 的步落在
-  // 里面，它的边际率由阈值本身决定，不是模型行为；实测该信号在 25 个会话上的
-  // 会话间空转率是 4.3%–92.1%（差 21 倍），自相关 0.65、平均游程 4.27 步，
-  // 因此"根据全局语料解一对 (K,k)"在该信号上无解（K 拉到 32 仍有 8% 误进）。
-  // 新做法：拿**本会话自己的历史**当零假设，检验当前窗是否异常偏低（分布无关的
-  // 秩检验），预算直接落在会话内；离线语料只用来回答"该信号有没有判别力"。
-  refMinSteps: 12,      // 参考段最少步数（全局默认；每通道可在 responseChannels 覆盖）
-  testWindow: 4,        // 检验窗长度（全局默认；每通道可覆盖）
-  notifyAlpha: 0.05,    // 通知预算（全局默认；每通道可覆盖）
-  actAlpha: 0.01,       // 能力层预算（全局默认；每通道可覆盖）
-  // ── B3 运行时门禁 ────────────────────────────────────────────────────────
-  // 标定件路径（responsePolicy.json）。给了就按它决定"哪些通道有资格动能力面"；
-  // 没给 / 过期 / 不匹配 / verdict≠PASS → **一律只观察**（fail-safe，绝不默认放开）。
-  // 环境变量 TRAJECTORY_ANCHOR_POLICY_PATH 可作为等价来源（与词典的 env 一致）。
-  responsePolicyPath: null,
-  // 评测保护：true ⇒ 强制只观察（能力层与通知层都关），用于"分数归因不被插件污染"。
-  // 可由标定件的 measurementSafe 或配置直接置位。
-  // 人工试运行放行（默认 null = 这条路径根本不存在）：
-  //   { channels: ['inaction'], alpha: 0.01, until: '2026-10-16T00:00:00Z', note: '为什么放行' }
-  // 它是**唯一**能绕过"标定件不合格"的动作路径，所以三重约束缺一不可：
-  //   · 必须显式列出通道（不许"放行全部"）；
-  //   · 必须显式给 α（试运行的工作点，不许默默沿用一个说不清的默认）；
-  //   · 必须给到期时间（**没有期限的执行器就是事故**——本插件最重那次事故的形态）。
-  // measurementSafe 与 autoDemote 仍然优先：试运行绕不过它们（见 effectiveRollback）。
-  trialRelease: null,
-  measurementSafe: false,
-  // 在线自动降档：最近 autoDemoteWindow 个已结束会话里，出现过收窄的比例超过
-  // autoDemoteBudget ⇒ 自动降为只观察并留审计（防止"离线合格、线上超标"）。
-  autoDemoteWindow: 20,
-  autoDemoteBudget: 0.05,
-  // ── 行为通道（B1）────────────────────────────────────────────────────────
-  // 为什么加：词表信号实测无判别力（会话级误触发 15.9%–43.2%，预算 5%）；行为通道
-  //   的空转侧在**全语料**（77 会话 / 41584 步）上实测如下（tools/calibrate-channels.mjs）：
-  //     α=0.01, k=1 → A′ 14.3%、C 31.2%、B 41.6%（远超 5% 预算）
-  //     按预算反解 → A′ k=1, α=0.001 → 2.6%；C k=1, α=1e-5 → 0.0%；B 只允许通知
-  //   根因：α 是**单次检验**的误报率，而预算是**每会话**的（会话几百步，族错误率
-  //   1−(1−α)^N 会放大几十倍）。
-  //   ⚠ 这组数在 2026-10 被**重算过**：此前离线核心自带一套台账定稿规则，与运行时不一致
-  //     （把"回合末步=合法收尾"也记成 A′ 命中），128 会话里 123 个序列不同、A′ 命中率
-  //     0.16% 对 8.10%（差 51 倍），因此那时的 α 是给一条**运行时不存在**的通道算的。
-  //     现在台账只有一份实现（本文件导出的 buildLedgerFromEvents），由
-  //     tools/test-ledger-parity.mjs（逐步对拍）+ tools/test-ledger-semantics.mjs（手算真值）守着。
-  // 这里的 actAlpha=1e-5 是**比标定值更严的默认**：通道默认无资格（capabilityEligible=false），
-  //   资格只能由标定件授予，而标定件会带来它自己反解出来的 α/k（装载器会覆盖这两个键）。
-  //   若有人手写 capabilityEligible: true 又不给标定件，得到的是一套保守参数——这是有意的方向。
-  // A′ 的定义**必须**带"回合未结束"硬条件：实测 67 个"无工具调用"步 100% 是回合末步
-  //   （代理干完活回答了），不分回合末步就是 100% 误判（G3 反向对照门常驻验证）。
-  // capabilityEligible 默认全 false：由标定件按预算翻转。
-  responseChannels: {
-    inaction: { enabled: true, refMinSteps: 20, testWindow: 3, actAlpha: 1e-5, notifyAlpha: 1e-4, consecutive: 1, capabilityEligible: false },
-    repetition: { enabled: true, refMinSteps: 20, testWindow: 3, window: 5, minRepeats: 2, actAlpha: 1e-5, notifyAlpha: 1e-4, consecutive: 1, capabilityEligible: false },
-    failure: { enabled: true, refMinSteps: 20, testWindow: 3, actAlpha: 1e-5, notifyAlpha: 1e-4, consecutive: 1, capabilityEligible: false },
-    // 词表通道：α **必须各自标定**——行为通道反解出的 1e-5 不能套到它头上（两者标度不同）。
-    // 它的会话级空转率实测 15.9%（α=1e-3）～43.2%（α=0.01），按 5% 预算同样需要 ~1e-5；
-    // 但它的能力层资格本就是 false（标定 FAIL），所以这里保留历史值 0.01/0.05，
-    // 万一被显式打开，装载器仍会按各自的反解值覆盖。
-    // ⚠ 词典/风格通道**默认关闭**（2026-10-09，实测否定后移除判据面）：
-    // 它作为**漂移判据**已被实测否定——在真实语料上 α=0.05 时召回 4.3%、精确率 6.2%
-    // （低于 20% 的随机基线）；对强锚点的精度倍数也不到 1；60 会话判别力实测
-    // 召回 24.2% 对**同预算随机** 36.8%（0.64×），部署口径（节流后）1.06× ≈ 随机。
-    // 留着它只会扩大噪音面（多一条可能误触发的通道、多一列要解释的状态）。
-    // **关闭是结构性关闭**：channelTests 在 enabled===false 时**根本不构造这一行**
-    // （index.js 的 `if (lexCfg.enabled !== false)`），所以它既不会被标定件授权、
-    // 也不会被试运行放行重新拉回判断面——这条由 C28 不变量 + 反向对照守着。
-    // **但它作为"锚定机制的判据"仍在用**：首轮 persona/工具面/上下文抑制三件套与晋升门
-    // （`anchor-gate:minimal-like` = 最近推理窗有 we、无 let me）依赖的是 `CONFIG.lexicon`
-    // 与逐分块的 `updateWindow`，**不是这条通道**——所以关掉它不影响锚定本身。
-    // 离线测量件（evaluate-signals / test-ledger-parity 等）要复现历史口径时显式传
-    // `responseChannels: { lexicon: { enabled: true } }` 即可。
-    lexicon: { enabled: false, refMinSteps: 12, testWindow: 4, actAlpha: 0.01, notifyAlpha: 0.05, consecutive: 1, capabilityEligible: false },
-  },
-  // ── L1 任务锚定拉回（信息型，默认关）──────────────────────────────────────────
-  // 它是**第一个把话直接说给模型听**的动作。机制已验证（注入漂移必须触发、措辞/节流/豁免合规），
-  // 但**效果**只能靠在线对照或真实长会话积累——离线语料里"可客观标注的漂移"实测为 0
-  // （tools/measure-task-signal.mjs：42 个可解析会话里越界写 0、未验证声明 0；
-  //   曾经报出的 8 条经人工审计全为假阳）。所以先关、先审计。
+  // L1 pullback (informational): on a scope/verification gap, inject a reminder
+  // into the prompt. Throttled to at most pullbackMaxPerSession per session.
   pullbackEnabled: false,
-  // 每会话最多说几次（节流见 allostasis 的 admitPerTurn：同一 turn 至多一次）。
   pullbackMaxPerSession: 3,
-  // **对照组比例**（L4 在线对照）：触发时以该概率"故意不说"，从而拿到"说了 vs 没说"的配对。
-  // 默认 0 = 不抑制（不在未授权时改变行为）；做效果测量时才调大（如 0.3）。
-  // 为什么必须有对照组：没有它就只剩"说过之后的行为"这一侧观测，无法区分"起了作用"与"本来就会这样"。
+  // Control-group rate for L4 online effect measurement; 0 = never suppress.
   pullbackControlRate: 0,
-  // ── L2 重锚定（最强干预：把首轮 Minimal 载荷重新灌回近因位置）────────────────
-  // 默认关，且**不与 L1 共用同一道门**：它额外要求一份**在线证据件**（reanchorEvidencePath），
-  // 该证据件由真实会话累积的结果生成（见 recordPullbackOutcome），且必须 verdict=PASS-online、未过期。
-  // 依据：本项目最重的一次事故就是"未经验证的信号 → 不可逆执行器"（23 个会话进收窄、0 个恢复），
-  // 所以凡是要动**上下文内容**的动作，一律先要在线证据。
-  reanchorEnabled: false,
-  reanchorEvidencePath: null,
-  // L2'（**确认即恢复**）：不要求"拉回有效"的在线效果件，只在**当场确认出问题**时重锚定一次。
-  // 为什么它可以在没有效果证据时存在：载荷是**信息型**的——把首轮 Minimal 载荷放回近因位置，
-  // 不改工具面、不改系统基线、不删任何信息 —— 与 L1 同一风险类别；而它的前提不是"预测未来"，
-  // 是**当场确认**（用户纠正 / 工具不存在 / 验证未通过）。仍然：measurementSafe 与 autoDemote
-  // 优先、每会话一次、全程留痕；并用同一套随机化对照（reanchorConfirmControlRate）
-  // ⇒ 它的**效果**照样能被估出来（落盘行 action='reanchor'），而不是靠相信它有用。
+  // L2' confirm-reanchor: on in-turn confirmation (user correction / missing tool
+  // / failed verification), re-inject the first-round Minimal payload once.
+  // Randomized control rate for effect measurement.
   reanchorOnConfirm: false,
   reanchorConfirmControlRate: 0,
-  // 拉回效果采集：会话结束时把"说过之后行为有没有变"写成一行 JSONL（默认在 baseDir 下）。
   pullbackOutcomePath: null,
-  // ── 累积状态（记忆）的持久化 ─────────────────────────────────────────────────
-  // 与"派生状态每次重算"互补：降档窗口 / 通道回灌计数 / 倍率 是**学到的**，重启不该清零，
-  // 否则"最近 N 个会话"永远攒不满、跨天自适应永远从零开始（这是本轮修正的设计缺口）。
-  // 只有"与自适应有关的会话"（动过手或有通道触发）才落盘 ⇒ 默认全关时不产生任何文件。
-  adaptiveStateEnabled: true,
-  adaptiveStatePath: null,          // 默认 <baseDir>/.dsh-trajectory-logs/adaptive-state.jsonl
-  adaptiveStateWindow: 200,         // 装载上限（有界，文件再长也不拖慢挂载）
-  // ── L3 第二层：provider/model 族先验的收缩 ──────────────────────────────────
-  // `familyPriorPath` 指向 tools/family-priors.mjs 的产物（各族各通道的**每步基频**）。
-  // 给了就按族做收缩（同一步偏离在不同基频的族里得到不同 p）；没给/坏了/族未知 ⇒ 退回
-  // 固定的 Jeffreys 伪计数（即今天的行为）——fail-safe 而不是 fail-open。
-  familyPriorPath: null,
-  // 先验的等效样本量（步）：S 越小越"信会话自己"，越大越"信族"。20 步 ≈ 默认 refMinSteps，
-  // 于是"参考段刚够长时先验与数据各占一半"。
-  priorStrength: 20,
-  // ── L3 第三层：结局回灌（按通道把"动了之后的结果"回灌到门限上）────────────────
-  // 默认关：它是**门限执行器**，按项目纪律这类东西必须先在真实会话里攒够样本。
-  // 打开后是**非对称**的：不产出就收紧（安全方向）、放宽需要更多样本且更高产出率、
-  // 产出极差则撤销**该通道**的资格（比全局 autoDemote 精确得多）。
-  outcomeFeedbackEnabled: false,
-  feedbackMinSessions: 5,
-  feedbackMinProductiveRate: 0.6,
-  feedbackRevokeEligibilityRate: 0.2,
-  feedbackAlphaFloorDivisor: 64,
-  // 探索步：长期无变化就周期性回升一档（防"收紧到不再触发 ⇒ 证据断流 ⇒ 永久锁死"的单向棘轮）。
-  feedbackExploreAfterSessions: 30,
-  // P6 不变量：收窄态的步数硬上限（退出条件必然可达）。0 = 关闭该上限（不推荐）。
-  // 到顶后本漂移片段内禁止再次收窄，直到检验不再触发（片段结束）才复位。
-  // 取值来源（不是拍脑袋）：2026-10-11 按**现定义**（`state drift → stable` 自然片段，
-  //   tools/measure-drift-episodes.mjs → driftEpisodes.json）在 235 个会话上重反解：
-  //   自然恢复片段 n=24：p50=9  p75=34  p90=43  p95=43  max=122；仍有 32 个片段在日志
-  //   结束时未恢复（正是上界要兜住的形态）。旧值 12（旧定义"degraded run"的 p90）会
-  //   截断 45.8% 的自然片段——上限的意义是给自然恢复留足时间，截断自然恢复就本末倒置。
-  //   → 43 = 现定义自然片段长度的 p95（上界至少要覆盖 95% 的自然片段）。
-  // 角色分工：本上限是**安全界**（必须存在、必须可达）；真正的预算杠杆是**误触发率**
-  //   （由 tools/calibrate-response-policy.mjs 的 G1 门禁管）。标定件
-  //   （responsePolicy.json）可按同一分位法重算该值并覆盖此默认。
-  maxDriftSteps: 43,
-  historyCap: 200,
-  leanDenyPatterns: [
-    'vision_*', 'browser_*', 'sandbox_*', 'desktop_*',
-    'web_search', 'workflow', 'ralph',
-    'session_log_scan', 'session_log_repair',
-    'model_knobs', 'model_balance',
-    'subagent', 'subagent_fork', 'send_message', 'interrupt_agent', 'list_agents',
-    'todo_write', 'plot_function', 'lean_check',
-    'cordis_define', 'cordis_run', 'cordis_update_tool', 'cordis_inspect_query',
-    'cordis_inspect_list', 'cordis_inspect_self', 'cordis_stop', 'cordis_undefine',
-    'anchor_status',
-  ],
-  mineCounterfactualCandidates: true,
   exportTrajectoryLogs: true,
   logDir: '.dsh-trajectory-logs',
-  // 分块落盘：达到条数阈值或字节预算即把当前缓冲写成不可变块文件
-  // anchor-<id>.jsonl.<n>。没有任何事件被裁剪——400 是缓冲阈值而非数据丢失上限。
   auditChunkEvents: 400,
   auditChunkBytes: 262144,
-  rewardAnnotator: 'default',
 }
 
 const CONFIG_KEYS = new Set(Object.keys(DEFAULTS))
 
-// ── Q1' 工件状态绑定门（process-gate §6）的绑定/快照助手 ──────────────────────
-const DELIVERY_ARTIFACT_NAMES = ['PULL_REQUEST_TEMPLATE.md', 'PULL_REQUEST_TEMPLATE.txt', 'PULL_REQUEST_TEMPLATE']
-// Windows 文件名大小写不敏感：匹配一律走小写（Q1 用 /pull_request_template/i 也是这个口径）。
-const DELIVERY_ARTIFACT_NAMES_LOWER = new Set(DELIVERY_ARTIFACT_NAMES.map((n) => n.toLowerCase()))
-// Q1'' 递归搜索边界（§49.5 探针前置的自查修法）：历史验证命令常从**运行根**跑 grader
-// （模板埋在 workspace\project2_task 下两层），naive 只看候选目录本身 ⇒ 绑定覆盖只有
-// 4/8。BFS 向下最多 ARTIFACT_SEARCH_DEPTH 层、总条目预算、跳过重型目录——每次验证只搜
-// 一次，成本有界；最浅命中优先，顺序确定。
-const ARTIFACT_SEARCH_DEPTH = 4
-const ARTIFACT_SEARCH_BUDGET = 400
-const ARTIFACT_SKIP_DIRS = new Set(['.git', 'node_modules', '__pycache__', '.venv', 'venv', 'dist', '.dsh'])
-
-/** 从 rootDir 向下 BFS 找交付工件文件；找到返回绝对路径，超预算/超深返回 null（fail-open 不猜）。 */
-function findDeliveryArtifact(rootDir) {
-  let queue = [rootDir]
-  let entries = 0
-  for (let depth = 0; depth <= ARTIFACT_SEARCH_DEPTH && queue.length > 0; depth++) {
-    const next = []
-    for (const dir of queue) {
-      let names
-      try { names = readdirSync(dir) } catch { continue }
-      for (const name of names) {
-        if (entries++ > ARTIFACT_SEARCH_BUDGET) return null
-        const p = resolvePath(dir, name)
-        if (DELIVERY_ARTIFACT_NAMES_LOWER.has(name.toLowerCase())) {
-          try { if (statSync(p).isFile()) return p } catch { /* 读不到继续找 */ }
-        }
-        if (ARTIFACT_SKIP_DIRS.has(name)) continue
-        try { if (statSync(p).isDirectory()) next.push(p) } catch { /* 读不到跳过 */ }
-      }
-    }
-    queue = next
-  }
-  return null
-}
-
-/** 绑定目录候选：验证命令里所有的 `cd '...'` + 命令路径里存在的目录/文件（父与祖父）
- *  + 会话 cwd。相对路径一律用会话 cwd 解析（Q1'''：探针实测相对路径命令是常态，
- *  §49.5 探针结论——4/8 会话的验证命令 artifacts 为空就是因为纯相对路径）。 */
-function artifactBindingDirs(cmd) {
-  const dirs = []
-  const absOrNull = (p) => {
-    if (!p) return null
-    if (isAbsolute(p)) return p
-    return typeof sessionCwd === 'string' && sessionCwd ? resolvePath(sessionCwd, p) : null
-  }
-  const cdRe = /(?:^|[;&\n])\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/gi
-  let m
-  while ((m = cdRe.exec(cmd || ''))) {
-    const d = m[1] || m[2] || m[3]
-    const abs = absOrNull(d)
-    if (abs && existsSync(abs)) dirs.push(abs)
-  }
-  for (const p of commandPaths(cmd || '').slice(0, 12)) {
-    const abs = absOrNull(p)
-    if (!abs) continue
-    try {
-      const st = statSync(abs)
-      if (st.isDirectory()) dirs.push(abs)
-      else if (st.isFile()) {
-        // 文件 artifact：把父目录（evaluator\）与祖父目录（运行根）都作为候选——
-        // Q1 实测里 Test-Path/直接跑 grader 脚本的验证命令都只有文件路径。
-        const parent = dirname2(abs)
-        if (existsSync(parent)) dirs.push(parent)
-        const grand = dirname2(parent)
-        if (grand !== parent && existsSync(grand)) dirs.push(grand)
-      }
-    } catch { /* 读不到就跳过 */ }
-  }
-  if (typeof sessionCwd === 'string' && sessionCwd) dirs.push(sessionCwd)
-  return dirs
-}
-
-/** 验证证据落地后调用：递归找到交付工件文件就绑定 {path, mtimeMs, size, sha, failed...}。 */
-function bindDeliveryArtifact(rec, turn, step) {
-  const cmd = typeof rec.lastVerifyCmd === 'string' ? rec.lastVerifyCmd : ''
-  const dirs = []
-  // Q1'''：验证调用自己的 workdir（pwsh 参数）是最精确的定位线索，放最前。
-  if (typeof rec.lastVerifyWorkdir === 'string' && rec.lastVerifyWorkdir) {
-    const wd = isAbsolute(rec.lastVerifyWorkdir) ? rec.lastVerifyWorkdir
-      : (typeof sessionCwd === 'string' && sessionCwd ? resolvePath(sessionCwd, rec.lastVerifyWorkdir) : null)
-    if (wd && existsSync(wd)) dirs.push(wd)
-  }
-  for (const d of artifactBindingDirs(cmd)) dirs.push(d)
-  const seen = new Set()
-  for (const d of dirs) {
-    const key = d.toLowerCase()
-    if (seen.has(key)) continue
-    seen.add(key)
-    const f = findDeliveryArtifact(d)
-    if (!f) continue
-    try {
-      const st = statSync(f)
-      const sha = createHash('sha256').update(readFileSync(f)).digest('hex')
-      const last = rec.verifyEvidence.length ? rec.verifyEvidence[rec.verifyEvidence.length - 1] : null
-      const binding = {
-        turn: typeof turn === 'number' ? turn : null,
-        step: typeof step === 'number' ? step : null,
-        at: Date.now(),
-        path: f,
-        mtimeMs: st.mtimeMs,
-        size: st.size,
-        sha,
-        failed: Boolean(last && last.failed === true),
-        failCount: last && typeof last.failCount === 'number' ? last.failCount : null,
-        verifyCmd: cmd.slice(0, 300),
-        served: false,
-      }
-      rec.artifactBinding = binding
-      return { turn: binding.turn, step: binding.step, path: binding.path, size: binding.size, failed: binding.failed, failCount: binding.failCount }
-    } catch { /* 继续找下一个候选 */ }
-  }
-  return null
-}
-
-/** pre-step 用的当前状态快照（读不到 ⇒ exists:false；ENOENT=被删，其余=读失败，谓词区分两者）。 */
-function artifactStateNow(path) {
-  try {
-    const st = statSync(path)
-    if (!st.isFile()) return { exists: false, missing: false }
-    const sha = createHash('sha256').update(readFileSync(path)).digest('hex')
-    return { exists: true, mtimeMs: st.mtimeMs, size: st.size, sha }
-  } catch (e) {
-    return { exists: false, missing: Boolean(e && e.code === 'ENOENT') }
-  }
-}
-
-// ── Q2' 文件状态编辑计数（process-gate §6b）的绑定/差分助手 ─────────────────
-// 为什么不用 sessionCwd 当走查根（与 Q1' 的关键区别）：子代理 session.header.cwd =
-// 父工作区（D:\DSHwork），走它会把**别的项目/会话**的文件收进快照，差分会被无关
-// 写入污染（§50 重跑实测过 Q1' 的越界绑定风险）。Q2' 只用验证命令自身的定位源。
-const FILE_STATE_CODE_RE = /\.(py|md|cpp|h|hpp|c|js|mjs|ts|json|yml|yaml|ps1|sh|txt)$/i
-const FILE_STATE_BINDING_MAX = 300
-
-/** 有界 BFS 收集代码文件状态（跳过重目录；条目预算 = 绑定上限的 4 倍，防病态走查）。 */
-function collectFileStates(rootDir, out, budget) {
-  let queue = [rootDir]
-  for (let depth = 0; depth <= ARTIFACT_SEARCH_DEPTH && queue.length > 0; depth++) {
-    const next = []
-    for (const dir of queue) {
-      let names
-      try { names = readdirSync(dir) } catch { continue }
-      for (const name of names) {
-        if (budget.used > budget.max) return
-        budget.used += 1
-        if (ARTIFACT_SKIP_DIRS.has(name)) continue
-        const p = resolvePath(dir, name)
-        let st
-        try { st = statSync(p) } catch { continue }
-        if (st.isDirectory()) next.push(p)
-        else if (st.isFile() && FILE_STATE_CODE_RE.test(name)) out.push({ path: p, mtimeMs: st.mtimeMs, size: st.size })
-      }
-    }
-    queue = next
-  }
-}
-
-/** 验证证据落地后调用：给验证命令指认的目录做代码文件状态快照（≤300 文件）。 */
-function bindFileStates(rec, turn, step) {
-  const cmd = typeof rec.lastVerifyCmd === 'string' ? rec.lastVerifyCmd : ''
-  const dirs = []
-  if (typeof rec.lastVerifyWorkdir === 'string' && rec.lastVerifyWorkdir) {
-    const wd = isAbsolute(rec.lastVerifyWorkdir) ? rec.lastVerifyWorkdir
-      : (typeof sessionCwd === 'string' && sessionCwd ? resolvePath(sessionCwd, rec.lastVerifyWorkdir) : null)
-    if (wd && existsSync(wd)) dirs.push(wd)
-  }
-  for (const d of artifactBindingDirs(cmd)) dirs.push(d)
-  // sessionCwd 只当**解析基准**，不做走查根（子代理 cwd=父工作区，走它会把无关项目
-  // 文件收进快照、差分被污染——§6b 的明确设计约束，测试 pg-q2p-cwd 钉住）。
-  const walkDirs = dirs.filter((d) => d !== sessionCwd)
-  const seen = new Set()
-  const files = []
-  const budget = { used: 0, max: FILE_STATE_BINDING_MAX * 4 }
-  for (const d of walkDirs) {
-    const key = d.toLowerCase()
-    if (seen.has(key)) continue
-    seen.add(key)
-    collectFileStates(d, files, budget)
-    if (files.length >= FILE_STATE_BINDING_MAX) break
-  }
-  if (files.length === 0) return null
-  const last = rec.verifyEvidence.length ? rec.verifyEvidence[rec.verifyEvidence.length - 1] : null
-  const binding = {
-    turn: typeof turn === 'number' ? turn : null,
-    step: typeof step === 'number' ? step : null,
-    at: Date.now(),
-    files: files.slice(0, FILE_STATE_BINDING_MAX),
-    failed: Boolean(last && last.failed === true),
-    verifyCmd: cmd.slice(0, 300),
-    served: false,
-  }
-  rec.fileStateBinding = binding
-  return { count: binding.files.length }
-}
-
-/** pre-step 差分：stat 绑定清单里的文件，数 mtime/size 变化的个数（无全量重走查）。 */
-function fileStateChangedCount(binding) {
-  const files = Array.isArray(binding.files) ? binding.files : []
-  let changed = 0
-  for (const f of files) {
-    try {
-      const st = statSync(f.path)
-      if (st.mtimeMs !== f.mtimeMs || st.size !== f.size) changed += 1
-    } catch { /* 被删 = 变了（保守计入） */ changed += 1 }
-  }
-  return changed
-}
-
-
 export const name = 'dsh-trajectory-anchor'
+
+/** 0.2.0 renamed the session event read: `session.events` property -> `session.snapshotEvents()` method. */
+function sessionEventList(session) {
+  if (!session) return []
+  if (typeof session.snapshotEvents === 'function') return session.snapshotEvents()
+  const legacy = session.events
+  if (legacy === undefined || legacy === null) return []
+  return Array.isArray(legacy) ? legacy : Array.from(legacy)
+}
+// Belt-and-braces: also expose globally in case a bundling boundary splits scope.
+if (typeof globalThis !== 'undefined') globalThis.sessionEventList = sessionEventList
 
 /** `tools` is declared so the row waits for the registry before registering
  * the anchor_status audit tool (a no-inject row applied before the tools row
@@ -514,7 +130,6 @@ let agentsSvc = null
 let fsSvc = null
 let spSvc = null
 let baseDir = null
-let sessionCwd = null
 let auditToolDispose = null
 const disposers = []
 const dispatchStats = { total: 0, names: {} }
@@ -550,138 +165,6 @@ const configWarnings = []
 function noteConfigWarning(message) {
   if (!configWarnings.includes(message)) configWarnings.push(message)
   warnOnce(message)
-}
-
-// ---------- B3：运行时门禁状态（标定件 / 自动降档 / 评测保护）----------
-/** 已装载的标定件摘要（null = 未提供）。 */
-let policyArtifact = null
-/** 在线自动降档状态（一旦置位即保持，直到进程重启或人工清空）。 */
-let autoDemote = null
-/** 最近已结束会话的"是否收窄过"记录（在线超预算自动降档用）。 */
-const sessionOutcomes = []
-/** L2：已装载的在线证据件摘要（null = 未提供）。 */
-let reanchorEvidence = null
-/** L3：已装载的族先验（null = 未提供/不可用 ⇒ 退回固定 Jeffreys）。 */
-let familyPriors = null
-
-/**
- * 取本次会话所属族的先验（L3 第二层）。
- * 族键 = `${provider}/${model}`，可选再带 scope（任务族）。族不存在或未装载 ⇒ null（不收缩）。
- * @returns {{rate:number, strength:number, key:string, matched:string}|null}
- */
-function priorForFamily(rec, channelName) {
-  if (!familyPriors || !familyPriors.byKey) return null
-  const key = familyKeyOf(rec)
-  if (!key) return null
-  for (const candidate of [key.full, key.modelOnly]) {
-    const fam = familyPriors.byKey[candidate]
-    if (fam && fam.baseRates && Number.isFinite(fam.baseRates[channelName])) {
-      return { rate: fam.baseRates[channelName], strength: CONFIG.priorStrength, key: key.full, matched: candidate }
-    }
-  }
-  return null
-}
-
-/** 会话的族键：模型来自 request/header 事件，任务范围来自首条人类消息。 */
-function familyKeyOf(rec) {
-  const provider = rec.family && rec.family.provider ? rec.family.provider : 'unknown'
-  const model = rec.family && rec.family.model ? rec.family.model : 'unknown'
-  const preset = rec.family && rec.family.preset ? rec.family.preset : 'no-preset'
-  const anchors = rec.taskAnchors
-  let scope = 'none'
-  if (anchors && anchors.parsed) {
-    scope = (anchors.scopeNames && anchors.scopeNames[0])
-      || ((anchors.scopeDirs && anchors.scopeDirs[0]) ? String(anchors.scopeDirs[0]).split('/').filter(Boolean).pop() : null)
-      || 'scope'
-  }
-  const modelOnly = `${provider}/${model}`
-  return { full: `${modelOnly} @ ${preset} @ ${scope}`, modelOnly }
-}
-
-/**
- * 能力层**有效**开关（决策路径必须用这个，而不是直接读 CONFIG.rollbackEnabled）：
- * 配置开关 ∧ 标定件允许 ∧ 未被自动降档 ∧ 不在评测保护下。
- * 任何一项不满足 → 只观察。这是"默认安全"的最后一道闸门。
- */
-/**
- * 人工试运行放行是否**生效**（默认 null ⇒ 这条路径永不存在）。
- * 归一路径（任何一项不合规 ⇒ null，回到只观察，并且从不静默）：
- *   · 形状不对 / 通道表为空 / α 不在 (0,1) / **没有到期时间** / **已过期**。
- * 它**不**绕过 measurementSafe 与 autoDemote —— 那是两道独立的更硬的闸门（见 effectiveRollback）。
- * 为什么不给"放行全部"：一次只准放行你点名的通道，这样爆炸半径是写得出来的。
- */
-function trialReleaseActive() {
-  const t = CONFIG.trialRelease
-  if (!t || typeof t !== 'object' || Array.isArray(t)) return null
-  const channels = Array.isArray(t.channels) ? t.channels.filter((c) => typeof c === 'string' && c.length > 0) : []
-  if (channels.length === 0) return null
-  const alpha = Number(t.alpha)
-  if (!Number.isFinite(alpha) || alpha <= 0 || alpha >= 1) return null
-  const until = typeof t.until === 'string' ? t.until : null
-  if (!until) return null
-  const untilMs = Date.parse(until)
-  if (!Number.isFinite(untilMs)) return null
-  // 人工试运行的**治理到期时间**：操作者设的硬期限，到点自动回到只观察。
-  // 这不是漂移判定（C10 禁的是"用墙钟判漂移"），而是"不许有无期限的执行器"这条纪律的实现：
-  // 期限的意义正是**逼一次重新决策**，所以它该与人的日历对齐，而不是与观测单元对齐。
-  if (untilMs <= Date.now()) return null    // time-ok: 治理期限（操作者设置，非漂移判定）
-  return { channels, alpha, until, untilMs, note: typeof t.note === 'string' ? t.note : null }
-}
-
-/** 通道是否在人工试运行放行名单里（拿不到生效的放行 ⇒ null）。 */
-function trialGrant(name) {
-  const t = trialReleaseActive()
-  if (!t) return null
-  return t.channels.includes(name) ? t : null
-}
-
-function effectiveRollback() {
-  if (CONFIG.measurementSafe === true) return false
-  if (autoDemote) return false
-  const trial = trialReleaseActive()
-  if (policyArtifact && policyArtifact.verdict !== 'PASS' && policyArtifact.verdict !== 'PARTIAL-PASS') {
-    // 标定件不合格（或没有标定件）⇒ 正常路径关闭；**人工试运行是唯一例外**
-    return trial !== null
-  }
-  return CONFIG.rollbackEnabled === true || trial !== null
-}
-/** 通知层的有效开关：同样受评测保护与自动降档约束（降档后连通知也停，只留审计）。 */
-function effectiveNotify() {
-  if (CONFIG.measurementSafe === true) return false
-  if (autoDemote) return false
-  return CONFIG.notifyEnabled === true
-}
-/** 卡口为何关闭（可观测：让人一眼知道"为什么没动手"）。 */
-function capabilityGateReason() {
-  if (CONFIG.measurementSafe === true) return 'measurement-safe'
-  if (autoDemote) return `auto-demoted:${autoDemote.reason}`
-  const trial = trialReleaseActive()
-  // 试运行只在**它真的在为开门负责**时才被报出来（标定件已通过、或开关已开时，
-  // 说"是试运行开的门"就是误导）——但一旦它负责，就必须一眼看出来"这不是标定授权"。
-  const normalClosedByPolicy = Boolean(policyArtifact && policyArtifact.verdict !== 'PASS' && policyArtifact.verdict !== 'PARTIAL-PASS')
-  if (normalClosedByPolicy) return trial ? `trial-release:${trial.channels.join('+')}` : `policy-${policyArtifact.verdict}`
-  if (CONFIG.rollbackEnabled !== true) return trial ? `trial-release:${trial.channels.join('+')}` : 'switch-off'
-  return null
-}
-
-/**
- * L2 重锚定的**有效**开关：配置开关 ∧ 在线证据件通过 ∧ 未被自动降档 ∧ 不在评测保护下。
- * 与能力层分开判（各自的证据门槛不同：能力层要"空转+召回"两关，重锚定要"在线效果"证据）。
- */
-function effectiveReanchor() {
-  if (CONFIG.measurementSafe === true) return false
-  if (autoDemote) return false
-  if (!reanchorEvidence || reanchorEvidence.verdict !== 'PASS-online') return false
-  return CONFIG.reanchorEnabled === true
-}
-/** 重锚定为何关闭（同 capabilityGateReason 的可观测原则）。 */
-function reanchorGateReason() {
-  if (CONFIG.measurementSafe === true) return 'measurement-safe'
-  if (autoDemote) return 'auto-demoted'
-  if (!reanchorEvidence) return CONFIG.reanchorEnabled === true ? 'no-online-evidence' : 'switch-off'
-  if (reanchorEvidence.verdict !== 'PASS-online') return `evidence-${reanchorEvidence.verdict}`
-  if (CONFIG.reanchorEnabled !== true) return 'switch-off'
-  return null
 }
 
 function round2(n) {
@@ -941,7 +424,7 @@ function flagsOf(texts) {
 }
 
 function weightedRatio(agg) {
-  const w = CONFIG.ratioWeights
+  const w = RATIO_WEIGHTS
   return (w.alpha * agg.positive + w.beta * agg.neutral) / (w.gamma * agg.negative + w.epsilon)
 }
 
@@ -951,8 +434,8 @@ function personaRatio(agg) {
 }
 
 function bandOf(ratio) {
-  if (ratio < CONFIG.specMax) return 'spec'
-  if (ratio < CONFIG.reactMin) return 'mixed'
+  if (ratio < SPEC_MAX) return 'spec'
+  if (ratio < REACT_MIN) return 'mixed'
   return 'react'
 }
 
@@ -981,12 +464,12 @@ function recompute(rec, agent) {
   const pr = personaRatio(agg)
   const band = bandOf(pr)
   rec.ratioHistory.push(ratio)
-  if (rec.ratioHistory.length > CONFIG.historyCap) rec.ratioHistory.shift()
+  if (rec.ratioHistory.length > HISTORY_CAP) rec.ratioHistory.shift()
   // band / personaRatio / percentile：**仅供审计与离线标定**——标定工具
   // （calibrate-lexicon-v2、calibrate-response-policy）都从轨迹日志读这些字段。
   // 决策路径一律不得读它们（断言 C11 守护）；漂移判定已改为会话内自参考检验。
   rec.bandHistory.push(band)
-  if (rec.bandHistory.length > CONFIG.historyCap) rec.bandHistory.shift()
+  if (rec.bandHistory.length > HISTORY_CAP) rec.bandHistory.shift()
   const percentile = percentileRank(ratio, rec.ratioHistory)
   rec.weightedRatio = ratio
   rec.personaRatio = pr
@@ -996,7 +479,7 @@ function recompute(rec, agent) {
   rec.stepsScored += 1
   if (agg.positiveWords > 0) rec.positiveHitSteps += 1
   if (agg.negativeWords > 0) rec.negativeHitSteps += 1
-  const degen = lexiconDegenerate(rec.positiveHitSteps, rec.stepsScored, CONFIG.refMinSteps)
+  const degen = lexiconDegenerate(rec.positiveHitSteps, rec.stepsScored, 12)
   if (degen && rec.lexiconDegenerate !== degen) {
     rec.lexiconDegenerate = degen
     logAudit(rec, 'lexicon-degenerate', {
@@ -1009,7 +492,7 @@ function recompute(rec, agent) {
     warnOnce(`lexicon degenerate for ${rec.sessionId}: positive bucket never hit in ${rec.stepsScored} steps — capability actions disabled (notify-only)`)
   }
   if (rec.ewmaCount === 0) rec.ewma = ratio
-  else rec.ewma = CONFIG.ewmaAlpha * ratio + (1 - CONFIG.ewmaAlpha) * rec.ewma
+  else rec.ewma = EWMA_ALPHA * ratio + (1 - EWMA_ALPHA) * rec.ewma
   rec.ewmaCount += 1
   rec.lastState = band
   logAudit(rec, 'score', {
@@ -1022,20 +505,19 @@ function recompute(rec, agent) {
     neg: round2(agg.negative),
     neu: round2(agg.neutral),
   })
-  if (agent !== undefined) stateMachine(rec, agent)
 }
 
 function updateWindow(rec, texts, agent) {
   if (texts.length > 0) {
     rec.lastMessages.push({ flags: flagsOf(texts) })
-    while (rec.lastMessages.length > CONFIG.trajectoryWindowSize) rec.lastMessages.shift()
+    while (rec.lastMessages.length > TRAJECTORY_WINDOW) rec.lastMessages.shift()
   }
   recompute(rec, agent)
 }
 
 function backfill(rec, agent) {
   try {
-    const events = agent && agent.session ? agent.session.events : undefined
+    const events = agent && agent.session ? sessionEventList(agent.session) : undefined
     if (!events) return
     const list = Array.isArray(events) ? events : Array.from(events)
     let assistantCount = 0
@@ -1045,7 +527,7 @@ function backfill(rec, agent) {
         const texts = reasoningBlocks(ev)
         if (texts.length > 0) {
           rec.lastMessages.push({ flags: flagsOf(texts) })
-          while (rec.lastMessages.length > CONFIG.trajectoryWindowSize) rec.lastMessages.shift()
+          while (rec.lastMessages.length > TRAJECTORY_WINDOW) rec.lastMessages.shift()
         }
       }
     }
@@ -1068,27 +550,6 @@ function matchPatterns(name, patterns) {
     }
   }
   return false
-}
-
-function restrictWithCull(scopedTools, filter) {
-  const mode = filter.allow !== undefined ? 'allow' : 'deny'
-  let names = (mode === 'allow' ? filter.allow : filter.deny).slice()
-  let lastError = null
-  while (names.length > 0) {
-    try {
-      const lift = scopedTools.restrict(mode === 'allow' ? { allow: names.slice() } : { deny: names.slice() })
-      return { lift, applied: names.slice() }
-    } catch (e) {
-      lastError = msg(e)
-      const m = lastError.match(/known global tools: ([^\n]*)$/)
-      if (!m) return { error: lastError }
-      const known = m[1].split(',').map(s => s.trim().replace(/\.$/, '')).filter(s => s.length > 0 && s !== '(none)')
-      const next = names.filter(n => known.includes(n))
-      if (next.length === names.length) return { error: lastError }
-      names = next
-    }
-  }
-  return { error: lastError || 'empty restriction' }
 }
 
 /**
@@ -1317,218 +778,6 @@ export function lexiconDegenerate(positiveHitSteps, stepsScored, minSteps) {
   return positiveHitSteps === 0 ? 'positive-bucket-never-hit' : false
 }
 
-function applyRollback(rec, via, p) {
-  if (!effectiveRollback()) return
-  if (!rec.anchored || !rec.lifted) return
-  if (rec.surfacePhase === 'narrowed') return
-  if (CONFIG.leanDenyPatterns.length === 0) {
-    logAudit(rec, 'rollback-skipped', { reason: 'no deny patterns configured', via })
-    return
-  }
-  // P1：只改阶段，可见面在下次组装时派生；不再调用 tools.restrict 的 deny 模式。
-  rec.surfacePhase = 'narrowed'
-  rec.surfaceNarrowedAt = Date.now()
-  rec.narrowedSteps = 0
-  rec.rollbackDeny = CONFIG.leanDenyPatterns.slice()
-  if (CONFIG.mineCounterfactualCandidates) {
-    rec.counterfactual = {
-      startedAt: Date.now(),
-      decisionPoint: 'deviation-test',
-      injected: CONFIG.leanDenyPatterns.slice(),
-      requests: rec.requests,
-      turn: rec.lastTurn,
-      step: rec.lastStep,
-      restored: null,
-    }
-  }
-  logAudit(rec, 'surface', { phase: 'narrowed', denied: CONFIG.leanDenyPatterns.slice(), via, p: round2(p), ratio: round2(rec.weightedRatio), trialRelease: (trialReleaseActive() || {}).channels || null })
-}
-
-function enterDrift(rec, via, p) {
-  rec.machineState = 'drift'
-  rec.driftSteps = 0
-  rec.driftEnteredAt = Date.now()
-  logAudit(rec, 'state', { state: 'drift', via, p: round2(p), band: rec.band })
-  applyRollback(rec, via, p)
-}
-
-function recoverRollback(rec, reason) {
-  rec.machineState = 'stable'
-  rec.driftSteps = 0
-  rec.narrowedSteps = 0
-  // 注意：capabilityBudgetExhausted 属于**漂移片段**的状态，只在片段真正结束
-  // （决策回到 stable）时复位。若在这里复位，会形成"耗尽→恢复→立刻再收窄"的
-  // 无限循环——那正是我们要消灭的那类不可达/不可终止的形态。
-  if (rec.surfacePhase === 'narrowed') {
-    // 派生面：只需把阶段改回去——下一次组装自然恢复全量，没有任何"归还"调用。
-    rec.surfacePhase = 'stable'
-    rec.surfaceRestoredAt = Date.now()
-    logAudit(rec, 'surface', { phase: 'stable', via: reason, denied: [] })
-  }
-  if (CONFIG.mineCounterfactualCandidates && rec.counterfactual) {
-    rec.counterfactual.restored = {
-      at: Date.now(),
-      reason,
-      requests: rec.requests,
-      ratio: round2(rec.weightedRatio),
-    }
-    logAudit(rec, 'counterfactual', {
-      startedAt: rec.counterfactual.startedAt,
-      injected: rec.counterfactual.injected,
-      restored: rec.counterfactual.restored,
-    })
-    rec.counterfactual = null
-  }
-  logAudit(rec, 'state', { state: 'stable', via: reason, band: rec.band })
-}
-
-function notePolicySkipped(rec, reason) {
-  if (rec.lastPolicySkip === reason) return
-  rec.lastPolicySkip = reason
-  logAudit(rec, 'policy-skipped', { reason, history: rec.ratioHistory.length, refMinSteps: CONFIG.refMinSteps })
-}
-
-/**
- * 状态机（P3）：判定 = 会话内自参考偏离检验，而非"单步落在最低四分位"。
- * 进入收窄的每一次都带 (p, refLen)；退出有两条**必然可达**的路：
- *   ① 检验不再触发（片段结束）；
- *   ② 收窄满 maxDriftSteps → 能力预算耗尽（本片段内不再收窄，只通知）。
- */
-function stateMachine(rec, agent) {
-  // 多通道：词表（曼-惠特尼，会话内自参考）+ 行为（中途停手 / 重复 / 失败，二值精确二项）。
-  // 入口是 OR——任一通道成立即可；不做跨通道"与"（"与"会继承每个通道的盲区）。
-  const perChannel = channelTests(rec)
-  // 连续确认计数（每通道独立）：p 命中则该通道 run+1，否则清零。
-  // 与离线核心 behaviour-channel-core.mjs 的 walkChannel 同语义，否则"离线标定"
-  // 与"在线判定"会对不上。
-  if (!rec.fireRuns || typeof rec.fireRuns !== 'object') rec.fireRuns = {}
-  for (const c of perChannel) {
-    // 连续确认计数**按层级各自维护**，且必须与门限同层：
-    //   行动级连续计数用 actAlpha，通知级用 notifyAlpha。
-    // 为什么不能让"通知级命中"去凑行动级的 k：离线标定（calibrate-channels.mjs →
-    // behaviour-channel-core.mjs 的 walkChannel(alpha)）是在**单一 α** 上数连续的，
-    // 标定件反解出的 (α=1e-5, k) 语义就是"连续 k 次 p≤1e-5"。若在线改用 1e-4 计数，
-    // 在线判定会比标定**更松**（1e-4 档的命中被算进连续），结果就是"离线合格、线上
-    // 超标"——正是 B3 门禁要防的静默失效。（这条差异由门禁用例 ⑩ 守住。）
-    // L3 第三层：行动级门限按**结局回灌**调整（默认关 ⇒ 与标定值逐位相同）。
-    // 放在这里而不是改 CONFIG：回灌只影响"这一通道的有效门限"，不改配置本体（可审计、可解释）。
-    const baseAct = Number.isFinite(c.actAlpha) ? c.actAlpha : CONFIG.actAlpha
-    const effAct = effectiveActAlpha(c.name, baseAct)
-    const actA = Number.isFinite(effAct) ? effAct : -Infinity      // revoked ⇒ -Infinity ⇒ 永不命中
-    const notA = Number.isFinite(c.notifyAlpha) ? c.notifyAlpha : CONFIG.notifyAlpha
-    const hitAct = Number.isFinite(c.p) && c.p <= actA
-    const hitNot = Number.isFinite(c.p) && c.p <= notA
-    if (hitAct) rec.channelActFires[c.name] = (rec.channelActFires[c.name] || 0) + 1
-    c.actAlphaEffective = Number.isFinite(effAct) ? effAct : null
-    const prev = rec.fireRuns[c.name]
-    const slot = prev && typeof prev === 'object'
-      ? prev
-      : { act: Number.isFinite(prev) ? prev : 0, notify: Number.isFinite(prev) ? prev : 0 }
-    slot.act = hitAct ? slot.act + 1 : 0
-    slot.notify = hitNot ? slot.notify + 1 : 0
-    rec.fireRuns[c.name] = slot
-    c.fireRun = slot.act
-    c.fireRunNotify = slot.notify
-  }
-  const decision = evaluateChannels({
-    perChannel,
-    refMinSteps: CONFIG.refMinSteps,
-    notifyAlpha: CONFIG.notifyAlpha,
-    actAlpha: CONFIG.actAlpha,
-    budgetExhausted: Boolean(rec.capabilityBudgetExhausted),
-    // 决策路径一律用**有效开关**（含标定件门禁 / 自动降档 / 评测保护）
-    rollbackEnabled: effectiveRollback(),
-    notifyEnabled: effectiveNotify(),
-  })
-  rec.channels = perChannel.map((c) => ({
-    name: c.name,
-    p: roundP(c.p),
-    // 注意：短参考/被关闭的通道没有 observed/window/refHits —— 必须落成 null，
-    // 不能留 undefined。DSH 的工具输出校验要求无损 JSON，undefined 会让
-    // anchor_status 直接报 "value is not lossless JSON"（本轮踩过）。
-    observed: c.observed ?? null,
-    window: c.window ?? null,
-    refLen: c.refLen ?? null,
-    refHits: c.refHits ?? null,
-    eligible: c.capabilityEligible === true,
-    blockedBy: c.blockedBy ?? null,
-    // 生效门限（含标定件反解值）必须可见：否则"为什么没动手"无法从审计里回答——
-    // 同一形状的偏离在 α=0.01 下动手、在 α=1e-5 下不动手，差别只能从这里看出来。
-    actAlpha: Number.isFinite(c.actAlpha) ? c.actAlpha : null,
-    notifyAlpha: Number.isFinite(c.notifyAlpha) ? c.notifyAlpha : null,
-    consecutive: c.consecutive ?? 1,
-    fireRun: c.fireRun ?? 0,
-    notifyRun: c.fireRunNotify ?? 0,
-    // L3 第二层：该通道本次判定所用的族先验（null = 未收缩，退回固定 Jeffreys）
-    prior: c.prior ? { rate: c.prior.rate, strength: c.prior.strength, matched: c.prior.matched } : null,
-    // L3 第三层：实际生效的行动级门限（回灌后；null = 资格被撤销或不可用）
-    actAlphaEffective: Number.isFinite(c.actAlphaEffective) ? c.actAlphaEffective : null,
-    // 该通道的资格是不是**人工试运行**给的（不是标定件给的）——两者必须能分辨
-    trialRelease: c.trialRelease === true,
-  }))
-  rec.lastPolicy = decision.level
-  rec.lastPolicyAction = decision.action
-  rec.lastPolicyP = decision.p === null || decision.p === undefined ? null : roundP(decision.p)
-  rec.lastPolicyReason = decision.reason
-  rec.lastPolicyChannel = decision.channel || null
-  // 两个"证据不足"档都留痕（A 方案）：
-  //   no-observation         —— 连检验窗都没有（会话最开始的 testWindow 步）
-  //   insufficient-reference —— 检验窗有了，但参考段还不够长
-  // 两档的 level/action 相同（stable/none，不动能力面），差别只在**分档语义**；
-  // 但都必须能被日志看见，否则"判定为何没启动"在轨迹里无法回溯。
-  if (decision.reason === 'insufficient-reference' || decision.reason === 'no-observation') {
-    notePolicySkipped(rec, decision.reason)
-  } else {
-    rec.lastPolicySkip = null
-  }
-  if (decision.level === 'stable') {
-    // 片段结束 = 证据回到参考内。这才是能力预算的复位点（见 recoverRollback 说明）。
-    if (rec.capabilityBudgetExhausted) {
-      rec.capabilityBudgetExhausted = false
-      logAudit(rec, 'capability-budget-reset', { via: 'episode-ended' })
-    }
-    if (rec.machineState !== 'stable') {
-      rec.episodesEndedNaturally += 1
-      recoverRollback(rec, decision.reason)
-    }
-    return
-  }
-  if (decision.action === 'narrow') {
-    if (rec.machineState !== 'drift') enterDrift(rec, `${decision.reason}:${decision.channel}`, decision.p)
-  } else {
-    // 偏离存在但不动能力面（弱偏离 / 闸门拦截）：保留状态语义，只写审计
-    if (rec.machineState === 'stable') {
-      rec.machineState = 'watch'
-      logAudit(rec, 'state', { state: 'watch', via: decision.reason, p: rec.lastPolicyP })
-    }
-    if (decision.action === 'notice' && rec.lastNoticeReason !== decision.reason) {
-      rec.lastNoticeReason = decision.reason
-      logAudit(rec, 'policy-notice', { reason: decision.reason, p: rec.lastPolicyP, effect: 'no capability change' })
-    }
-  }
-  // P6 不变量：收窄态必须有界——按"**面处于收窄态的步数**"计时，与本步动作无关
-  // （否则被闸门降级成 notice 的步数会漏计，实测就出现过 15 步 > maxDriftSteps=12）。
-  if (rec.surfacePhase === 'narrowed') {
-    rec.narrowedSteps += 1
-    rec.driftSteps = rec.narrowedSteps
-    // **单调**的"本会话动过手"标记：与 narrowedSteps 分开记，后者会在片段结束时被清零。
-    // 实测教训：recordSessionOutcome 原先用 `narrowedSteps > 0` 判断"动过手"，而
-    // recoverRollback 会把 narrowedSteps 归零 ⇒ **收窄后又恢复的会话全不被计入**，
-    // "最近 N 个会话里动过手的比例"被系统性低估 ⇒ 自动降档更难触发（方向不安全，
-    // 而且注释里写的"只记录真的动过的会话"与实现不一致）。
-    rec.didNarrow = true
-    if (CONFIG.maxDriftSteps > 0 && rec.narrowedSteps >= CONFIG.maxDriftSteps) {
-      rec.capabilityBudgetExhausted = true
-      logAudit(rec, 'capability-budget-exhausted', {
-        steps: rec.narrowedSteps,
-        maxDriftSteps: CONFIG.maxDriftSteps,
-        note: '本漂移片段内不再收窄；片段结束（回到参考内）后复位',
-      })
-      recoverRollback(rec, 'capability-budget-exhausted')
-    }
-  }
-}
-
 // ---------- 行为通道台账（B1）----------
 // 每步一格，记录该步是否"有工具调用 / 有失败 / 有重复调用"，并在**证据确定后**才定稿：
 //   · 出现同回合更大的 step  ⇒ 上一格定稿为"中途停手 = 无工具调用"
@@ -1571,72 +820,6 @@ function toolResultText(event) {
 function normalizeArgs(args) {
   const s = typeof args === 'string' ? args : JSON.stringify(args ?? '')
   return s.replace(/\s+/g, ' ').replace(/\\/g, '/').trim().slice(0, 300)
-}
-
-function ledgerCell(rec, turn, step) {
-  if (typeof turn !== 'number' || typeof step !== 'number') return null
-  let cell = rec.ledger.find((c) => c.turn === turn && c.step === step)
-  if (!cell) {
-    cell = { turn, step, tools: 0, failures: 0, repeated: false, finalized: false, midTurnInaction: null }
-    rec.ledger.push(cell)
-    if (rec.ledger.length > CONFIG.historyCap) rec.ledger.shift()
-  }
-  return cell
-}
-
-function ledgerNoteToolCall(rec, turn, step, name, args) {
-  const cell = ledgerCell(rec, turn, step)
-  if (!cell) return
-  cell.tools += 1
-  if (typeof name !== 'string' || name.length === 0) return
-  const sig = `${name}\u0000${normalizeArgs(args)}`
-  rec.recentCalls.push({ sig, turn, step })
-  if (rec.recentCalls.length > 40) rec.recentCalls.shift()
-  const window = (CONFIG.responseChannels.repetition && CONFIG.responseChannels.repetition.window) || 5
-  const minRepeats = (CONFIG.responseChannels.repetition && CONFIG.responseChannels.repetition.minRepeats) || 2
-  const distinct = []
-  let hits = 0
-  for (let i = rec.recentCalls.length - 1; i >= 0; i--) {
-    const c = rec.recentCalls[i]
-    if (c.turn === turn && c.step === step && c.sig === sig && distinct.length > 0) { hits += 1; continue }
-    const key = `${c.turn}#${c.step}`
-    if (!distinct.includes(key)) {
-      if (distinct.length >= window) break
-      distinct.push(key)
-    }
-    if (c.sig === sig) hits += 1
-  }
-  if (hits >= minRepeats) cell.repeated = true
-}
-
-function ledgerNoteToolResult(rec, turn, step, text) {
-  const cell = ledgerCell(rec, turn, step)
-  if (!cell || typeof text !== 'string' || text.length === 0) return
-  if (FAILURE_MARKERS.some((re) => re.test(text))) cell.failures += 1
-}
-
-function ledgerFinalize(rec, cell, midTurnInaction) {
-  if (!cell || cell.finalized) return
-  cell.finalized = true
-  cell.midTurnInaction = midTurnInaction
-}
-
-/** 新步到来：把同回合、更早且未定稿的格定稿（它们后面还有步 ⇒ 不是回合末步）。 */
-function ledgerAdvanceStep(rec, turn, step) {
-  if (typeof turn !== 'number' || typeof step !== 'number') return
-  for (const c of rec.ledger) {
-    if (c.finalized) continue
-    if (c.turn === turn && c.step < step) ledgerFinalize(rec, c, c.tools === 0)
-    else if (c.turn < turn) ledgerFinalize(rec, c, false)   // 跨回合的旧格：按合法收尾处理
-  }
-}
-
-/** 回合结束：该回合最后一格定稿为"合法收尾"（永不判为中途停手）。 */
-function ledgerCloseTurn(rec, turn) {
-  if (typeof turn !== 'number') return
-  for (const c of rec.ledger) {
-    if (!c.finalized && c.turn === turn) ledgerFinalize(rec, c, false)
-  }
 }
 
 /**
@@ -1812,125 +995,6 @@ export function buildLedgerFromEvents(events, opts = {}) {
   }
 }
 
-/** 通道序列：只取已定稿的格（未定稿的步不参与判定）。 */
-function channelSeries(rec) {
-  const done = rec.ledger.filter((c) => c.finalized)
-  return {
-    inaction: done.map((c) => (c.midTurnInaction === true ? 1 : 0)),
-    repetition: done.map((c) => (c.repeated ? 1 : 0)),
-    failure: done.map((c) => (c.failures > 0 ? 1 : 0)),
-  }
-}
-
-/** 单通道的二值检验输入。`prior`（可选）是 L3 的族先验，用不上就退回 Jeffreys。 */
-function channelTest(name, series, prior = null) {
-  const cfg = (CONFIG.responseChannels && CONFIG.responseChannels[name]) || {}
-  const base = {
-    name,
-    refMinSteps: cfg.refMinSteps || CONFIG.refMinSteps,
-    actAlpha: Number.isFinite(cfg.actAlpha) ? cfg.actAlpha : CONFIG.actAlpha,
-    notifyAlpha: Number.isFinite(cfg.notifyAlpha) ? cfg.notifyAlpha : CONFIG.notifyAlpha,
-    consecutive: Math.max(1, cfg.consecutive ?? 1),
-    prior: prior ? { rate: prior.rate, strength: prior.strength, matched: prior.matched } : null,
-  }
-  if (cfg.enabled === false) return { ...base, p: null, refLen: 0, capabilityEligible: false, blockedBy: 'channel-disabled' }
-  const m = cfg.testWindow || CONFIG.testWindow
-  const refLen = series.length - m
-  if (refLen < 1) {
-    return { ...base, p: null, refLen, capabilityEligible: cfg.capabilityEligible === true }
-  }
-  const test = series.slice(series.length - m)
-  const reference = series.slice(0, series.length - m)
-  const observed = test.reduce((a, b) => a + b, 0)
-  const refHits = reference.reduce((a, b) => a + b, 0)
-  const p = binomialLowerP(observed, m, refHits, reference.length, prior ? { rate: prior.rate, strength: prior.strength } : 0.5)
-  return {
-    ...base,
-    p,
-    refLen: reference.length,
-    capabilityEligible: cfg.capabilityEligible === true,
-    observed,
-    window: m,
-    refHits,
-  }
-}
-
-/** 全部通道的检验输入（词表通道沿用曼-惠特尼，行为通道用二项）。 */
-function channelTests(rec) {
-  const out = []
-  const lexCfg = (CONFIG.responseChannels && CONFIG.responseChannels.lexicon) || {}
-  if (lexCfg.enabled !== false) {
-    const hist = rec.ratioHistory
-    const m = lexCfg.testWindow || CONFIG.testWindow
-    const refLen = hist.length - m
-    let p = null
-    if (refLen >= 1) p = mannWhitneyLowerP(hist.slice(hist.length - m), hist.slice(0, hist.length - m))
-    out.push({
-      name: 'lexicon',
-      p,
-      refLen,
-      refMinSteps: lexCfg.refMinSteps || CONFIG.refMinSteps,
-      actAlpha: Number.isFinite(lexCfg.actAlpha) ? lexCfg.actAlpha : CONFIG.actAlpha,
-      notifyAlpha: Number.isFinite(lexCfg.notifyAlpha) ? lexCfg.notifyAlpha : CONFIG.notifyAlpha,
-      consecutive: Math.max(1, lexCfg.consecutive ?? 1),
-      // 词典退化 → 该通道失去能力层资格（不是全局闸门：行为通道不受影响）
-      capabilityEligible: lexCfg.capabilityEligible === true && !rec.lexiconDegenerate,
-      blockedBy: rec.lexiconDegenerate ? 'lexicon-degenerate' : undefined,
-    })
-  }
-  const series = channelSeries(rec)
-  for (const name of ['inaction', 'repetition', 'failure']) out.push(channelTest(name, series[name] || [], priorForFamily(rec, name)))
-  // 人工试运行放行（**唯一**入口，且默认不存在）：把名单里的通道的资格与工作点显式抬起来。
-  // 三条纪律：
-  //   · 试运行**只**绕"标定件给不给资格"，不绕数据质量（lexicon-degenerate 依然挡住该通道）；
-  //   · 动手**不是静默的**——这里留一次 trial-release-armed 审计，status 里也能看到 α 与到期时间；
-  //   · 放行了却没生效也**不是静默的**（trial-release-unavailable，见下）。
-  const trial = trialReleaseActive()
-  if (trial) {
-    const granted = []
-    for (const c of out) {
-      if (!trial.channels.includes(c.name)) continue
-      if (c.blockedBy === 'lexicon-degenerate') continue
-      c.capabilityEligible = true
-      c.actAlpha = trial.alpha          // 试运行的工作点（显式给的，不沿用任何默认）
-      c.trialRelease = true
-      granted.push(c.name)
-    }
-    if (granted.length > 0 && rec.trialReleaseArmed !== granted.join('+')) {
-      rec.trialReleaseArmed = granted.join('+')
-      logAudit(rec, 'trial-release-armed', {
-        channels: granted, alpha: trial.alpha, until: trial.until, note: trial.note,
-        why: '标定件未授权，按人工放行进入试运行（会写 didNarrow，供 L3.3 结局回灌积累样本）',
-      })
-    }
-    // 第三条纪律：**放行了却没生效必须可见**。
-    // 试运行是 L3.3 攒样本的唯一入口，而它只作用于"已经产出的通道行"——名单里写了一条
-    // 出厂关闭的通道（如 lexicon）、写错名字、或该通道正被 lexicon-degenerate 挡着时，
-    // 放行会**静静地什么都不做**：操作者以为试运行在跑，实际样本永远是 0。
-    // 这正是"失败不得静默"这一条在治理配置上的落点（此前只能靠人对着 status 猜）。
-    const notGranted = trial.channels
-      .filter((n) => !granted.includes(n))
-      .map((n) => {
-        if (!CONFIG.responseChannels || !CONFIG.responseChannels[n]) return `${n}:unknown-channel`
-        const row = out.find((c) => c.name === n)
-        return row ? `${n}:${row.blockedBy || 'not-granted'}` : `${n}:channel-disabled`
-      })
-    if (notGranted.length > 0) {
-      const sig = notGranted.join('+')
-      if (rec.trialReleaseUnavailable !== sig) {
-        rec.trialReleaseUnavailable = sig
-        logAudit(rec, 'trial-release-unavailable', {
-          channels: notGranted, configured: trial.channels.slice(), available: out.map((c) => c.name),
-          why: '试运行名单里这些通道没有生效：既不会动手，也不会为 L3.3 积累任何样本',
-        })
-        noteConfigWarning(`trialRelease 放行的通道没有生效（不会积累样本）：${sig}`)
-      }
-    }
-  }
-  return out
-}
-
-
 // ---------- anchoring / lifting / gate / suppression ----------
 
 function probeFor(agent) {
@@ -2029,24 +1093,17 @@ function anchorAgent(agent, rec, channel) {
     degrade(`no bootstrap tool visible to agent (visible ${probe.visible.length})`)
     return
   }
-  const scopedTools = agent.ctx && agent.ctx.tools
-  if (!scopedTools || typeof scopedTools.restrict !== 'function') {
-    degrade('agent.ctx.tools.restrict unavailable')
-    return
-  }
-  const outcome = restrictWithCull(scopedTools, { allow: candidates })
-  if (outcome.error) {
-    degrade(outcome.error)
-    return
-  }
-  rec.restrictLift = outcome.lift
+  // 瘦身重构（§61）：首轮工具面**不再调用注册层 restrict**——组装期派生
+  // （unpromoted ⇒ 只发 anchorAllow 里的工具）。restrict 的相交语义 + disposer
+  // 单引用曾造成"上下文恢复、工具面回不来"的分裂（18 会话永久停在 23 的旧账 +
+  // 用户实报症状），派生面无 disposer、无相交、无归还——分裂被结构性消灭。
   rec.anchored = true
   rec.anchorChannel = channel
-  rec.anchorAllow = outcome.applied.slice()
+  rec.anchorAllow = candidates.slice()
   const capNote = CONFIG.bootstrapMaxTokens === null || CONFIG.bootstrapMaxTokens === undefined
     ? 'no cap (opt-in per issue #85)'
     : CONFIG.bootstrapMaxTokens
-  logAudit(rec, 'anchored', { allow: outcome.applied.slice(), maxTokens: capNote, channel })
+  logAudit(rec, 'anchored', { allow: rec.anchorAllow.slice(), maxTokens: capNote, channel })
   suppressBootstrapContext(rec, agent)
 }
 
@@ -2055,15 +1112,7 @@ function lift(rec, reason) {
   rec.lifted = true
   rec.liftReason = reason
   rec.liftedAt = Date.now()
-  if (typeof rec.restrictLift === 'function') {
-    try {
-      rec.restrictLift()
-      rec.restrictLift = null
-    } catch (e) {
-      rec.liftError = msg(e)
-      logAudit(rec, 'lift-error', { error: rec.liftError })
-    }
-  }
+  // 派生面：没有任何 disposer 要调——阶段一翻，下一次组装自然恢复全量。
   restoreBootstrapContext(rec)
   logAudit(rec, 'lift', { reason, requests: rec.requests, toolCalls: rec.toolCalls, band: rec.band })
 }
@@ -2093,334 +1142,14 @@ function defaultRewardAnnotator(rec) {
 REWARD_ANNOTATORS.default = defaultRewardAnnotator
 
 function annotateReward(rec) {
-  const annotator = REWARD_ANNOTATORS[CONFIG.rewardAnnotator] || REWARD_ANNOTATORS.default
+  const annotator = REWARD_ANNOTATORS[REWARD_ANNOTATOR] || REWARD_ANNOTATORS.default
   try {
     rec.reward = annotator(rec)
     logAudit(rec, 'reward', rec.reward)
   } catch (e) {
-    rec.reward = { planner: CONFIG.rewardAnnotator, error: msg(e) }
+    rec.reward = { planner: REWARD_ANNOTATOR, error: msg(e) }
     logAudit(rec, 'reward-error', { error: msg(e) })
   }
-}
-
-/**
- * 在线自动降档（B3）：会话结束时记录"本会话是否收窄过"，并在最近
- * autoDemoteWindow 个会话里计算实际比例；超过 autoDemoteBudget 即降档。
- *
- * 为什么需要：离线标定合格 ≠ 线上合格（语料会漂、模型会换、任务族会变）。
- * 这条让插件**自己发现自己超标**，而不是等人去看日志。
- * 只记录"真的动过"的会话（单调标记 rec.didNarrow），不收窄的会话算分母。
- *
- * ⚠ 状态分两类（这一条是本轮修正的设计缺口）：
- *   · **派生状态**（CONFIG / policyArtifact / familyPriors / reanchorEvidence）——每次挂载重算，
- *     必须清空（否则出现"标定件状态跨挂载粘住"，那是修过的事故）；
- *   · **累积状态**（sessionOutcomes / channelFeedback / autoDemote / feedbackEpoch）——这是**记忆**，
- *     清掉就等于"跨天自适应永远从零开始"：每次重启都把"最近 N 个会话"抹平，回灌与降档永远攒不满。
- *   所以累积状态要**按会话落盘、挂载时装载**（见 adaptiveStateFor / loadAdaptiveState）。
- */
-function recordSessionOutcome(rec) {
-  try {
-    if (!(CONFIG.autoDemoteWindow > 0)) return
-    sessionOutcomes.push({ narrowed: rec.didNarrow === true })
-    while (sessionOutcomes.length > CONFIG.autoDemoteWindow) sessionOutcomes.shift()
-    evaluateAutoDemote(rec)
-  } catch (e) {
-    // 观测侧永不抛
-  }
-}
-
-/** 按当前窗口重算是否需要降档（挂载时装载历史后也会调它一次）。 */
-function evaluateAutoDemote(rec) {
-  if (autoDemote) return
-  if (sessionOutcomes.length < CONFIG.autoDemoteWindow) return
-  const rate = sessionOutcomes.filter((o) => o.narrowed).length / sessionOutcomes.length
-  if (rate > CONFIG.autoDemoteBudget) {
-    autoDemote = { reason: 'session-rate-over-budget', rate: round2(rate), budget: CONFIG.autoDemoteBudget, window: sessionOutcomes.length, at: Date.now(), restored: rec ? false : true }
-    warnOnce(`auto-demoted to observe-only: ${(rate * 100).toFixed(1)}% of the last ${sessionOutcomes.length} sessions narrowed (budget ${(CONFIG.autoDemoteBudget * 100).toFixed(1)}%)`)
-    if (rec) logAudit(rec, 'auto-demote', { ...autoDemote, note: '能力层与通知层即刻关闭，只保留审计' })
-  }
-}
-
-/** 每通道的结局回灌状态（L3 第三层）：只有真的触发过才记账。 */
-const channelFeedback = {}
-/** 回灌纪元：每结束一个会话 +1（用于"多久没有变化 ⇒ 该探索一次"）。 */
-let feedbackEpoch = 0
-/** 累积状态的装载摘要（供 anchor_status 说明"这些记忆从哪来"）。 */
-let adaptiveState = null
-
-/**
- * 本会话要落盘的那条"记忆"（**单一来源**：降档用它、回灌用它、持久化也用它，
- * 避免三处各算一遍导致口径漂移）。
- * 只记**与自适应有关**的会话（动过手 或 有通道触发过）；默认全关时不会写任何东西。
- */
-function sessionOutcomeRecord(rec) {
-  const fires = {}
-  let totalFires = 0
-  for (const [name, n] of Object.entries(rec.channelActFires || {})) {
-    if (n > 0) { fires[name] = n; totalFires += n }
-  }
-  const didNarrow = rec.didNarrow === true
-  if (!didNarrow && totalFires === 0) return null
-  const endedNarrowed = rec.surfacePhase === 'narrowed' || rec.machineState === 'drift'
-  const productive = !endedNarrowed && rec.sawUnknownTool !== true && rec.episodesEndedNaturally > 0
-  // 每通道的**当前基准 α**：装载时用它判断"这份倍率是在哪个工作点上学的"，
-  // 工作点变了就作废倍率（只保留计数）——否则换标定件后旧倍率会静默生效。
-  const baseAlpha = {}
-  for (const name of Object.keys(fires)) {
-    const cfg = (CONFIG.responseChannels && CONFIG.responseChannels[name]) || {}
-    baseAlpha[name] = Number.isFinite(cfg.actAlpha) ? cfg.actAlpha : CONFIG.actAlpha
-  }
-  return {
-    storeVersion: 1,
-    at: Date.now(),
-    sessionId: rec.sessionId,
-    didNarrow,
-    fires,
-    productive,
-    // 学到的倍率/撤销/探索次数（按**本会话触发过的通道**记）：装载时只在与基准 α 匹配时恢复。
-    multiplier: Number.isFinite(fbMultiplierOf(fires)) ? fbMultiplierOf(fires) : 1,
-    revoked: Object.keys(fires).some((n) => channelFeedback[n] && channelFeedback[n].revoked === true),
-    explores: Object.keys(fires).reduce((a, n) => a + ((channelFeedback[n] && channelFeedback[n].explores) || 0), 0),
-    family: rec.family ? familyKeyOf(rec).full : null,
-    baseAlpha,
-    pluginVersion: PLUGIN_VERSION,
-  }
-}
-
-/** 本会话触发过的通道里，"学到的倍率"取最小值（保守：宁可记更严的那个）。 */
-function fbMultiplierOf(fires) {
-  const names = Object.keys(fires || {})
-  if (names.length === 0) return 1
-  return names.reduce((a, n) => Math.min(a, (channelFeedback[n] && channelFeedback[n].multiplier) || 1), 1)
-}
-
-/** 累积状态文件路径（默认放在审计目录旁；可用 adaptiveStatePath 显式指定）。 */
-function adaptiveStateFile() {
-  if (typeof CONFIG.adaptiveStatePath === 'string' && CONFIG.adaptiveStatePath) {
-    return isAbsolute(CONFIG.adaptiveStatePath) ? CONFIG.adaptiveStatePath : resolvePath(baseDir || process.cwd(), CONFIG.adaptiveStatePath)
-  }
-  return resolvePath(baseDir || process.cwd(), '.dsh-trajectory-logs', 'adaptive-state.jsonl')
-}
-
-/** 追加一条记忆（fail-safe：写失败只告警，绝不影响会话）。 */
-function persistAdaptiveState(record) {
-  try {
-    if (CONFIG.adaptiveStateEnabled !== true) return
-    if (!record) return
-    const file = adaptiveStateFile()
-    mkdirSync(dirname2(file), { recursive: true })
-    appendFileSync(file, `${JSON.stringify(record)}\n`, 'utf8')
-  } catch (e) {
-    warnOnce(`adaptive state persist failed (ignored): ${msg(e)}`)
-  }
-}
-
-/**
- * 挂载时装载累积状态（**记忆**；与"派生状态每次重算"互补）。
- *
- * 装载纪律（每条都对应一个真实风险）：
- *   · 失败/坏行/缺文件 ⇒ 空状态 + 响亮告警（fail-safe，绝不阻断挂载）；
- *   · 只取最后 adaptiveStateWindow 条（**有界**，文件再长也不会拖慢挂载）；
- *   · **倍率与撤销只在"基准 α 未变"时恢复**：工作点变了 ⇒ 丢弃倍率（保留计数），
- *     否则换了标定件后上一份倍率会静默生效——那正是"跨挂载粘住"的翻版；
- *   · 装载后**重算一次自动降档**：窗口内若已超标，挂载即降档（而不是等下一个会话）。
- */
-function loadAdaptiveState() {
-  // **自清空**：装载前先归零，消除对调用顺序的依赖。
-  // 实测教训：原先靠调用方清空，结果挂载路径解析前后各装一次 ⇒ 计数翻倍（sessions 10 变 20）。
-  // 装载必须是幂等的，这样"多装一次"最多是白做 I/O，不会悄悄把样本数算两遍。
-  for (const k of Object.keys(channelFeedback)) delete channelFeedback[k]
-  sessionOutcomes.length = 0
-  autoDemote = null
-  feedbackEpoch = 0
-  adaptiveState = { source: null, records: 0, channels: 0, multipliersKept: 0, multipliersDropped: 0, autoDemoteRecomputed: false, error: null }
-  if (CONFIG.adaptiveStateEnabled !== true) { adaptiveState.disabled = true; return }
-  const file = adaptiveStateFile()
-  adaptiveState.source = file
-  let text
-  try {
-    if (!existsSync(file)) return
-    text = readFileSync(file, 'utf8')
-  } catch (e) {
-    adaptiveState.error = msg(e)
-    warnOnce(`adaptive state unreadable (${msg(e)}); starting from empty memory`)
-    return
-  }
-  const lines = text.split('\n').filter((l) => l.trim())
-  const window = Math.max(1, CONFIG.adaptiveStateWindow)
-  const tail = lines.slice(-window)
-  const records = []
-  let badLines = 0
-  for (const line of tail) {
-    try {
-      const o = JSON.parse(line)
-      if (o && typeof o === 'object' && typeof o.didNarrow === 'boolean') records.push(o)
-      else badLines += 1
-    } catch (e) { badLines += 1 }
-  }
-  if (badLines > 0) warnOnce(`adaptive state had ${badLines} unreadable line(s) in the last ${tail.length}; ignored`)
-  adaptiveState.records = records.length
-  adaptiveState.badLines = badLines
-  if (records.length === 0) return
-
-  // ① 降档窗口：最近 autoDemoteWindow 个会话的"动过手"
-  // ① 降档窗口：最近 autoDemoteWindow 个会话的"动过手"。
-  //    关闭降档（window=0）时**不填**——与 recordSessionOutcome 的早退一致，
-  //    否则会出现"降档关了却仍有一个 1 条的窗口"这种自相矛盾的状态（实测踩到）。
-  if (CONFIG.autoDemoteWindow > 0) {
-    for (const r of records.slice(-CONFIG.autoDemoteWindow)) sessionOutcomes.push({ narrowed: r.didNarrow === true })
-  }
-  // ② 逐通道回灌计数：**只计入"真的干预过"的会话**（与 recordChannelFeedback 同口径）。
-  //    载荷侧若把"没干预"的会话算进来，恢复出来的 productive 率必然偏低 ⇒ 一挂载就越收越紧。
-  for (const r of records) {
-    if (r.didNarrow !== true) continue
-    for (const [name, n] of Object.entries(r.fires || {})) {
-      const fb = feedbackFor(name)
-      fb.sessions += 1
-      fb.fires += Number.isFinite(n) ? n : 0
-      if (r.productive === true) fb.productive += 1
-      fb.lastAt = typeof r.at === 'number' ? r.at : fb.lastAt
-      fb.lastRate = round2(fb.productive / fb.sessions)
-    }
-  }
-  adaptiveState.channels = Object.keys(channelFeedback).length
-  // ③ 倍率/撤销：只认"基准 α 未变"的那份（取最新一条该通道的记录）
-  for (const name of Object.keys(channelFeedback)) {
-    let keep = null
-    for (let i = records.length - 1; i >= 0; i--) {
-      const r = records[i]
-      if (r.fires && r.fires[name] > 0) { keep = r; break }
-    }
-    const cfg = (CONFIG.responseChannels && CONFIG.responseChannels[name]) || {}
-    const currentBase = Number.isFinite(cfg.actAlpha) ? cfg.actAlpha : CONFIG.actAlpha
-    const recordedBase = keep && keep.baseAlpha && Number.isFinite(keep.baseAlpha[name]) ? keep.baseAlpha[name] : null
-    if (keep && ((keep.multiplier != null && Number.isFinite(keep.multiplier)) || keep.revoked === true)) {
-      if (recordedBase !== null && recordedBase === currentBase) {
-        const fb = channelFeedback[name]
-        if (Number.isFinite(keep.multiplier)) fb.multiplier = keep.multiplier
-        if (keep.revoked === true) fb.revoked = true
-        if (Number.isFinite(keep.explores)) fb.explores = keep.explores
-        adaptiveState.multipliersKept += 1
-      } else {
-        adaptiveState.multipliersDropped += 1
-      }
-    }
-  }
-  if (adaptiveState.multipliersDropped > 0) {
-    warnOnce(`adaptive state: dropped ${adaptiveState.multipliersDropped} learned multiplier(s) because the operating point changed (base alpha differs); counts kept`)
-  }
-  // ④ 纪元 + 装载后立即重算降档
-  feedbackEpoch = records.length
-  const before = autoDemote
-  evaluateAutoDemote(null)
-  adaptiveState.autoDemoteRecomputed = Boolean(autoDemote && autoDemote !== before)
-  console.log(`[${name}] adaptive state loaded: ${records.length} session records, ${adaptiveState.channels} channel(s), multipliers kept ${adaptiveState.multipliersKept} / dropped ${adaptiveState.multipliersDropped}`)
-}
-function feedbackFor(name) {
-  if (!channelFeedback[name]) {
-    channelFeedback[name] = {
-      sessions: 0, fires: 0, productive: 0, multiplier: 1, revoked: false,
-      lastAt: null, lastRate: null, lastChangeEpoch: 0, explores: 0,
-    }
-  }
-  return channelFeedback[name]
-}
-
-/**
- * L3 第三层：**结局回灌**——把"动了之后有没有好结果"回灌到该通道的门限上。
- *
- * 为什么需要（比现在的二值 autoDemote 强在哪）：现在的 autoDemote 是**全局**一刀切
- * （超过预算就把能力层与通知层一起关掉），既粗糙又不可逆——而"哪一条通道在惹事"其实是可以分开算的。
- *
- * 结局代理（可观测、不需要人工标签）：
- *   productive = 会话结束时**没有**停留在收窄态 && 本会话**没有**出现 unknown tool
- *                && 至少有一个收窄片段是自然结束的（不是撞上 maxDriftSteps 才停）
- * 为什么用这三项：`unknown tool` 正是本插件历史上最严重那次事故的可见症状（收窄把工具从注册表里摘掉，
- * 之后的调用就变成 unknown tool），所以它是"越干预越糟"的直接证据；"结束时仍在收窄态"同理。
- *
- * **非对称**（这是安全性的关键）：
- *   · 不产出 ⇒ 收紧（multiplier × 0.5，下限 base/64）——收紧只会让干预更少，永远是安全方向；
- *   · 放宽（× 1.25，上限 1.0 = 标定件给的值）只在样本足够多（minSessions×4）且产出率很高（≥0.8）时；
- *   · 产出率低于 feedbackRevokeEligibilityRate ⇒ **撤销该通道的能力层资格**（比全局降档精确得多）。
- */
-function recordChannelFeedback(rec, outcomeRecord = null) {
-  try {
-    if (CONFIG.outcomeFeedbackEnabled !== true) return
-    // 纪元是**时钟**：每个结束的会话都走一格——探索步（长期无变化 ⇒ 回升一档）依赖它。
-    // 别把它也限制成"只对干预过的会话"：那样门限一旦收紧到不再触发，时钟就停了，
-    // 探索永远不来，单向棘轮又回来（实测：探索用例三条全红）。
-    feedbackEpoch += 1
-    const per = rec.channelActFires || null
-    const names = per ? Object.keys(per).filter((n) => per[n] > 0) : []
-    // ① 有触发的通道：**且本会话真的干预过**才记账。
-    //   为什么：回灌度量的是"我的干预有没有帮助"；能力层关着时（出厂默认）通道即便触发
-    //   也什么都没发生，那些会话的 productive 必然 false ⇒ 会把门限无故一路收紧并撤销通道。
-    //   这是"用没有干预的会话去评价干预"的错配（自查发现，不是测试抓的）。
-    if (names.length > 0 && rec.didNarrow === true) {
-      // productive 优先取**同一条记录**里的判定（单一来源）；没有记录时才现算。
-      const productive = outcomeRecord
-        ? outcomeRecord.productive === true
-        : (!(rec.surfacePhase === 'narrowed' || rec.machineState === 'drift') && rec.sawUnknownTool !== true && rec.episodesEndedNaturally > 0)
-      for (const name of names) {
-        const fb = feedbackFor(name)
-        fb.sessions += 1
-        fb.fires += per[name]
-        if (productive) fb.productive += 1
-        fb.lastAt = Date.now()
-        const rate = fb.productive / fb.sessions
-        fb.lastRate = round2(rate)
-        if (rate < CONFIG.feedbackRevokeEligibilityRate && fb.sessions >= CONFIG.feedbackMinSessions && !fb.revoked) {
-          fb.revoked = true
-          fb.lastChangeEpoch = feedbackEpoch
-          warnOnce(`channel "${name}" lost capability eligibility: productive rate ${(rate * 100).toFixed(1)}% over ${fb.sessions} sessions (floor ${(CONFIG.feedbackRevokeEligibilityRate * 100).toFixed(0)}%)`)
-          logAudit(rec, 'feedback-revoke', { channel: name, sessions: fb.sessions, fires: fb.fires, rate: fb.lastRate, floor: CONFIG.feedbackRevokeEligibilityRate })
-          continue
-        }
-        const floor = 1 / Math.max(2, CONFIG.feedbackAlphaFloorDivisor)
-        if (rate < CONFIG.feedbackMinProductiveRate && fb.sessions >= CONFIG.feedbackMinSessions && fb.multiplier > floor) {
-          const before = fb.multiplier
-          fb.multiplier = Math.max(floor, fb.multiplier * 0.5)
-          fb.lastChangeEpoch = feedbackEpoch
-          logAudit(rec, 'feedback-tighten', { channel: name, sessions: fb.sessions, rate: fb.lastRate, from: before, to: fb.multiplier })
-          warnOnce(`channel "${name}" threshold tightened ×${fb.multiplier} (productive ${(rate * 100).toFixed(1)}% < ${(CONFIG.feedbackMinProductiveRate * 100).toFixed(0)}% over ${fb.sessions} sessions)`)
-        } else if (rate >= 0.8 && fb.sessions >= CONFIG.feedbackMinSessions * 4 && fb.multiplier < 1) {
-          const before = fb.multiplier
-          fb.multiplier = Math.min(1, fb.multiplier * 1.25)
-          fb.lastChangeEpoch = feedbackEpoch
-          logAudit(rec, 'feedback-relax', { channel: name, sessions: fb.sessions, rate: fb.lastRate, from: before, to: fb.multiplier })
-        }
-      }
-    }
-    // ② 探索步（**这条是测试逼出来的**）：收紧到"不再触发"之后，证据也就断了——
-    // 没有触发就没有结局数据，于是永远无法放宽。那是**单向棘轮**：门限会被锁死在一个
-    // 可能过严的点上，而且外面看起来"很安全"（从不触发）。
-    // 所以：长期没有任何变化 ⇒ 周期性把门限回升一档（仍受标定值为上限）。
-    // 代价是重新引入一些误报，所以周期长（默认 30 个会话）且每次只回升 ×1.25。
-    if (CONFIG.feedbackExploreAfterSessions > 0) {
-      for (const name of Object.keys(channelFeedback)) {
-        const fb = channelFeedback[name]
-        if (fb.revoked || fb.multiplier >= 1) continue
-        if (feedbackEpoch - fb.lastChangeEpoch < CONFIG.feedbackExploreAfterSessions) continue
-        const before = fb.multiplier
-        fb.multiplier = Math.min(1, fb.multiplier * 1.25)
-        fb.lastChangeEpoch = feedbackEpoch
-        fb.explores += 1
-        logAudit(rec, 'feedback-explore', { channel: name, from: before, to: fb.multiplier, epoch: feedbackEpoch, note: '长期无变化 ⇒ 回升一档，避免单向棘轮把门限锁死' })
-      }
-    }
-  } catch (e) {
-    warnOnce(`channel feedback failed (ignored): ${msg(e)}`)
-  }
-}
-
-/** 该通道的**有效** actAlpha：标定值 × 回灌倍数（撤销资格时返回 Infinity ⇒ 永不触发）。 */
-function effectiveActAlpha(name, base) {
-  if (CONFIG.outcomeFeedbackEnabled !== true) return base
-  const fb = channelFeedback[name]
-  if (!fb) return base
-  if (fb.revoked) return Number.POSITIVE_INFINITY
-  const v = Number.isFinite(base) ? base * fb.multiplier : base
-  return Math.max(v, (Number.isFinite(base) ? base : 0.01) / Math.max(2, CONFIG.feedbackAlphaFloorDivisor))
 }
 
 /**
@@ -2433,13 +1162,10 @@ function effectiveActAlpha(name, base) {
  */
 export function reanchorText(persona, info, count) {
   const CONFIRM_LABEL = { 'user-correction': '人类指出不对', 'unknown-tool': '调用了不存在的工具', 'verify-failed': '验证命令未通过' }
-  const whyConfirm = info && info.confirm ? `（本节确认信号：${CONFIRM_LABEL[info.confirm] || info.confirm}）` : ''
-  const why = whyConfirm || (info && info.path ? `（上次提醒针对 ${info.path}）` : '')
-  return `[trajectory-anchor] 重锚定${count > 1 ? `（第 ${count} 次）` : ''}：前面的提醒之后轨迹仍未回到任务骨架${why}，`
-    + '这里把首轮的工作方式原样带回来：'
+  const why = info && info.confirm ? `（确认信号：${CONFIRM_LABEL[info.confirm] || info.confirm}）` : ''
+  return `[trajectory-anchor] 已确认出问题${why}，回到首轮任务骨架：`
     + `\n\n${persona}`
-    + '\n\n说明：这是把**已知有效**的首轮载荷重新放回近因位置（不改写系统基线）。'
-    + '若你已经在按这个方式工作，忽略本条即可。'
+    + '\n\n（信息型提醒：把已知有效的首轮载荷放回近因位置；如已按此工作，忽略本条即可。）'
 }
 
 /** 助手消息的**文本**（用于"是否宣告完成"判定；reasoning 块不算——计划里说"接下来做完"不是宣告）。 */
@@ -2465,31 +1191,18 @@ function noteConfirmation(rec, reason, turn, step, detail) {
   return true
 }
 
-/** L2'（确认即恢复）是否被允许：**先判两道硬闸门**，再看装配开关。
- *  顺序与 trialRelease 一致（都由 C27 的"次序断言"守着）：硬闸门必须排在开关之前，
- *  否则将来一次改动就可能让开关绕过硬闸门。 */
+/** L2'（确认即恢复）是否被允许：装配开关开、且本会话还没消费过确认。 */
 function confirmReanchorAllowed(rec) {
-  if (CONFIG.measurementSafe === true) return false
-  if (autoDemote) return false
   if (CONFIG.reanchorOnConfirm !== true) return false
   return true
 }
 
 /**
- * L2 重锚定决策：**两条路径，判据不同**（混在一起会让人以为门被放宽了）。
- *   ① 证据路径（原样）：`reanchorEnabled` ∧ 在线效果件 PASS-online ∧ L1 已说过 ∧ 有新证据
- *      —— 回答"拉回**有没有用**"；
- *   ② 确认路径（L2'）：`reanchorOnConfirm` ∧ **当场确认过**（user-correction / unknown-tool /
- *      verify-failed）—— 回答"**已经确认出问题了**，把已知有效的首轮载荷放回去"。
- * 两条都保持：每会话一次、measurementSafe/autoDemote 优先、全程留痕。
+ * L2' 重锚定决策（唯一路径=当场确认）：`reanchorOnConfirm` ∧ **当场确认过**
+ * （user-correction / unknown-tool / verify-failed）——把已知有效的首轮载荷放回近因位置。
+ * 每会话一次、全程留痕。
  */
 function reanchorDecision(rec, turn) {
-  if (effectiveReanchor()) {
-    if (rec.reanchor.count > 0) { rec.reanchor.suppressed.alreadyDone += 1; return null }
-    if (rec.pullback.count === 0) { rec.reanchor.suppressed.noPriorPullback += 1; return null }
-    if (rec.reanchor.lastPullbackCount === rec.pullback.count) { rec.reanchor.suppressed.noNewEvidence += 1; return null }
-    return { info: rec.pullback.lastInfo || null, reason: 'reanchor', via: 'evidence' }
-  }
   if (confirmReanchorAllowed(rec)) {
     if (rec.reanchor.count > 0) { rec.reanchor.suppressed.alreadyDone += 1; return null }
     if (!rec.confirm || rec.confirm.handled === true) { rec.reanchor.suppressed.noConfirmation = (rec.reanchor.suppressed.noConfirmation || 0) + 1; return null }
@@ -2510,9 +1223,6 @@ function reanchorDecision(rec, turn) {
  *   ① **对称**：窗口计数与"说不说"无关。对照臂若不计窗口，它恒为"未改善"，
  *      于是比较变成"有窗口 vs 没窗口"——那是**测量口径**造出来的假阳性。
  *   ② **按触发点一行**：会话级一行会把同会话的多次触发与两条臂揉在一起。
- * 终态字段（claimedUnverifiedAfter / endedNarrowed / sawUnknownTool / finalState）是
- * **会话级**事实，同会话各行共用，行里以 sessionLevelFields 显式标注，
- * 免得被下游当成逐触发点指标。
  */
 function markObs(rec, kind, turn, step) {
   const n = (rec.pullback.obsN = (rec.pullback.obsN || 0) + 1)
@@ -2547,8 +1257,6 @@ function windowAfter(rec, trig) {  return {
   }
 }
 
-const SESSION_LEVEL_FIELDS = ['claimedUnverifiedAfter', 'endedNarrowed', 'sawUnknownTool', 'finalState']
-
 function recordPullbackOutcome(rec) {
   try {
     // 落盘的判据是"**有没有信息型执行器在工作**"，而不是"L1 开没开"：
@@ -2560,7 +1268,6 @@ function recordPullbackOutcome(rec) {
     // 揉成一条的旧口径）。
     if (triggers.length === 0) return
     const claimedUnverifiedAtClose = rec.codeEditsAfterVerify.length > 0 && rec.lastVerifyAt !== null
-    const endedNarrowed = rec.surfacePhase === 'narrowed' || rec.machineState === 'drift'
     const dir = CONFIG.pullbackOutcomePath
       ? (isAbsolute(CONFIG.pullbackOutcomePath) ? CONFIG.pullbackOutcomePath : resolvePath(baseDir || process.cwd(), CONFIG.pullbackOutcomePath))
       : resolvePath(baseDir || process.cwd(), '.dsh-trajectory-logs', 'pullback-outcomes.jsonl')
@@ -2587,11 +1294,6 @@ function recordPullbackOutcome(rec) {
         controls: rec.pullback.controls,             // 会话累计，仅作背景
         ...windowAfter(rec, t),
         claimedUnverifiedAfter: claimedUnverifiedAtClose,
-        family: rec.family ? familyKeyOf(rec).full : null,
-        endedNarrowed,
-        sawUnknownTool: rec.sawUnknownTool === true,
-        finalState: { machineState: rec.machineState, surfacePhase: rec.surfacePhase, anchored: rec.anchored, lifted: rec.lifted },
-        sessionLevelFields: SESSION_LEVEL_FIELDS,
       }
       rows.push(row)
       appendFileSync(dir, `${JSON.stringify(row)}\n`, 'utf8')
@@ -2607,30 +1309,11 @@ function recordPullbackOutcome(rec) {
 function closeRec(rec, reason) {
   if (rec.closed) return
   if (rec.anchored && !rec.lifted) lift(rec, 'close:' + reason)
-  if (CONFIG.mineCounterfactualCandidates && rec.counterfactual) {
-    logAudit(rec, 'counterfactual', {
-      startedAt: rec.counterfactual.startedAt,
-      injected: rec.counterfactual.injected,
-      restored: { at: Date.now(), reason: 'agent-closed-unresolved', requests: rec.requests, ratio: round2(rec.weightedRatio) },
-    })
-    rec.counterfactual = null
-  }
   annotateReward(rec)
   rec.closed = true
-  // L1 效果采集：按触发点结算观测窗口并落盘（L2 门的唯一数据来源）。
-  // 终态代理（claimedUnverifiedAfter）在 recordPullbackOutcome 里从会话状态现算，
-  // 不再往 rec.pullback 上写一份状态——避免"两处各算一遍"（本项目栽过两次）。
+  // L1 效果采集：按触发点结算观测窗口并落盘。
   recordPullbackOutcome(rec)
-  // 累积状态（记忆）：**算一次，三处共用**——落盘、回灌、降档都用同一条记录，
-  // 避免三处各算一遍导致口径漂移（本项目已经栽过两次"两套规则各说各话"）。
-  const outcomeRecord = sessionOutcomeRecord(rec)
-  if (outcomeRecord) {
-    persistAdaptiveState(outcomeRecord)
-    rec.adaptiveRecord = { didNarrow: outcomeRecord.didNarrow, fires: Object.keys(outcomeRecord.fires || {}), productive: outcomeRecord.productive }
-  }
-  recordChannelFeedback(rec, outcomeRecord)
   logAudit(rec, 'closed', { reason })
-  recordSessionOutcome(rec)
   recs.delete(rec.sessionId)
   if (finished.length >= 50) finished.shift()
   finished.push(rec)
@@ -2647,7 +1330,7 @@ function sessionHasWork(agent) {
   try {
     const session = agent && agent.session
     if (!session) return false
-    const events = session.events
+    const events = sessionEventList(session)
     if (!events) return false
     const list = Array.isArray(events) ? events : Array.from(events)
     const firstLive = typeof session.firstLiveSeq === 'number' ? session.firstLiveSeq : null
@@ -2670,12 +1353,6 @@ function sessionHasWork(agent) {
 function adopt(agent, doAnchor, channel) {
   bump(channel)
   if (!agent || typeof agent.id !== 'string' || agent.id.length === 0) return null
-  // Q1'''：捕获会话级工作目录（exec.agent.session.header.cwd——内置 read/write 工具用的
-  // 同一个源，dsh_notes §7）。探针实测：子代理的相对路径验证/编辑都落在会话 cwd 下，
-  // 而插件此前从未捕获它 ⇒ 相对路径验证命令的工件绑定永远为空（§49.5 探针结论）。
-  if (!sessionCwd && agent.session && agent.session.header && typeof agent.session.header.cwd === 'string' && agent.session.header.cwd) {
-    sessionCwd = agent.session.header.cwd
-  }
   const existing = recs.get(agent.id)
   if (existing) return existing
   if (doAnchor && sessionHasWork(agent)) {
@@ -2714,33 +1391,11 @@ function adopt(agent, doAnchor, channel) {
     ewma: 0,
     ewmaCount: 0,
     lastState: 'stable',
-    machineState: 'stable',
-    driftSteps: 0,
-    // P1：模型可见工具面 = 由该阶段在组装期派生（不再突变注册层）。
-    surfacePhase: 'stable',
-    surfaceNarrowedAt: null,
-    surfaceRestoredAt: null,
-    surfaceDeniedCount: 0,
     // P3：会话内自参考偏离检验的输入与结论。
     stepsScored: 0,
     positiveHitSteps: 0,
     negativeHitSteps: 0,
     lexiconDegenerate: null,
-    narrowedSteps: 0,
-    didNarrow: false,        // 单调：本会话是否动过手（用于自动降档的正确分母）
-    capabilityBudgetExhausted: false,
-    lastPolicy: null,
-    lastPolicyAction: null,
-    lastPolicyP: null,
-    lastPolicyChannel: null,
-    lastNoticeReason: null,
-    lastPolicyReason: null,
-    lastPolicySkip: null,
-    // B1 行为通道台账：每步一格（定稿后才参与判定）+ 近期调用指纹（重复检测）
-    ledger: [],
-    recentCalls: [],
-    fireRuns: {},
-    channels: null,
     // ── L1 任务锚定拉回（默认关）────────────────────────────────────────────
     // anchors 从**首条人类消息**解析（读不出就 parsed:false，绝不猜）；下列状态全部为审计可见。
     taskAnchors: null,
@@ -2748,35 +1403,12 @@ function adopt(agent, doAnchor, channel) {
     lastVerifyAt: null,
     codeEditsAfterVerify: [],
     scopeViolations: [],
-    // ── 证据捕获（criteria 层重构 phase 1：把统计通道换成"可自证事实"的原料）──────
-    // 全部 append-only、有界、只存叶子字段；F3（越界）/F5（验证过期）的事实谓词吃这些料。
+    // ── 证据捕获：全部 append-only、有界、只存叶子字段 ──────
     verifyEvidence: [],   // 每次验证运行一条：{turn,step,at,kind,cmd,artifacts,failed,failCount,outputTail}
     edits: [],            // 每次**落地**的写：{turn,step,tool,path,invalidates,at}
     claims: [],           // 每次完成/通过声明：{turn,step,text,claimedDone,claimedPass,claimedTotal}
     lastVerifyCmd: null,  // 最近一次验证命令（结果回来时补全证据记录）
     lastVerifyKind: null,
-    lastVerifyWorkdir: null,  // Q1'''：最近一次验证调用的 workdir（相对路径命令的工件定位线索，§49.5 探针结论）
-    // F3/F5 事实的镜像干预标记（served 一次性语义与 done-gap 一致）
-    scopeBreachMirror: null,
-    verifyStalenessMirror: null,
-    // phase-2 协议约束状态（默认关）
-    deliveryGate: null,        // { served, via, reason, evidence }
-    verifyBudget: { count: 0, armed: false },   // P2：落地代码改动计数；count≥K ⇒ armed，注入后清零
-    claimFormat: null,         // { served, via }
-    // F6/F7 事实镜像状态（默认关）
-    unsupportedClaimMirror: null,      // { served, via, reason }
-    evidenceContradictionMirror: null, // { served, via, reason, evidence }
-    itemizedClaimMirror: null,         // F2 { served, via, reason, unsupported[] }
-    // Q4 会话内编辑预算（0=关）
-    editBudget: { count: 0, exhausted: false, served: false },
-    // Q2 带保持的编辑预算（0=关）
-    editHold: { editsSinceVerify: 0, holding: false, violations: 0, released: 0, served: false },
-    // Q1 交付工件门（默认关；每次工件重写可重新武装）
-    deliveryArtifactGate: null,
-    // Q1' 工件状态绑定门（默认关；每次验证重新绑定=解除）
-    artifactBinding: null,
-    // Q2' 文件状态编辑计数（默认关；每次验证重新快照=解除）
-    fileStateBinding: null,
     /** 待发出的拉回原因（工具调用时置位，pre-step 时消费；保证"触发点=说出口的点"）。 */
     pendingPullback: null,
     pullback: {
@@ -2801,16 +1433,10 @@ function adopt(agent, doAnchor, channel) {
     },
     // L2 重锚定状态（每会话只做一次）
     reanchor: { count: 0, lastTurn: null, lastPullbackCount: null, lastAt: null, suppressed: { alreadyDone: 0, noPriorPullback: 0, noNewEvidence: 0, noConfirmation: 0 } },
-    // L3 第三层：本会话各通道的行动级触发次数 + 结局代理
-    channelActFires: {},
     sawUnknownTool: false,
     verifyKinds: {},           // 本会话实际跑过的验证命令形态（L1"未验证"信号的第二种来源）
-    episodesEndedNaturally: 0,
     pullbackOutcome: null,
     bandHistory: [],        // 审计用：personaRatio 导出的波段序列（离线回放读日志）
-    driftEnteredAt: null,
-    rollbackDeny: [],
-    counterfactual: null,
     lastTurn: null,
     lastStep: null,
     skillCatalogSeen: false,
@@ -2831,7 +1457,6 @@ function adopt(agent, doAnchor, channel) {
   if (initiatorSessionId !== null && agent.id === initiatorSessionId) rec.adoptedSelf = true
   recs.set(rec.sessionId, rec)
   logAudit(rec, 'adopted', { channel, anchor: doAnchor, self: rec.adoptedSelf })
-  if (sessionCwd) logAudit(rec, 'session-cwd-captured', { cwd: sessionCwd })
   backfill(rec, agent)
   if (doAnchor) anchorAgent(agent, rec, channel)
   return rec
@@ -2870,7 +1495,6 @@ function feedSessionEvent(session, event) {
       rec.toolNames.push(name)
       if (rec.toolNames.length > 50) rec.toolNames.shift()
     }
-    ledgerNoteToolCall(rec, event.data && event.data.turn, event.data && event.data.step, name, event.data && event.data.arguments)
     logAudit(rec, 'tool-call', { name, turn: event.data && event.data.turn, step: event.data && event.data.step })
     noteTaskSignal(rec, event)
     if (rec.anchored && !rec.lifted) {
@@ -2898,11 +1522,8 @@ function feedSessionEvent(session, event) {
       } catch (e) { /* 观测侧永不抛 */ }
     }
   } else if (event.type === 'request/header') {
-    noteRequestHeader(rec, event)
   } else if (event.type === 'session') {
-    noteSessionEvent(rec, event)
   } else if (event.type === 'tool/result') {
-    ledgerNoteToolResult(rec, event.data && event.data.turn, event.data && event.data.step, toolResultText(event))
     // L1 成功门：工具**没落地**就撤回它刚贡献的信号（见 retractArm 的长注释）。
     // 注意**验证运行不设这道门**：命令跑过就是跑过，即使报错/非零退出也算"验证过了"
     // （本项目早已定下的口径：报错的测试同样携带信息；要撤的是"根本没发生的事"）。
@@ -2930,12 +1551,8 @@ function feedSessionEvent(session, event) {
         const failed = Boolean(txt && FAILURE_MARKERS.some((re) => re.test(txt)))
         let failCount = null
         if (failed) {
-          // 交付缺口回放的**证据源**：无论说没说完成，都把"这次验证仍有失败"的证据记下来
-          // （失败条数与原文尾段）——宣告完成时拿它做"缺口回放"。
-          rec.lastVerifyFailureTail = txt.slice(-600)
           const m = txt.match(/failed=(\d+)/) || txt.match(/(\d+) failed/)
           failCount = m ? Number(m[1]) : null
-          rec.lastVerifyFailCount = failCount
           if (rec.claimedDoneAt) {
             noteConfirmation(rec, 'verify-failed', event.data && event.data.turn, event.data && event.data.step,
               `claimed@${rec.claimedDoneAt.turn}#${rec.claimedDoneAt.step} | ${txt.slice(-120)}`)
@@ -2964,56 +1581,14 @@ function feedSessionEvent(session, event) {
           failed, failCount,
           artifacts: rec.verifyEvidence[rec.verifyEvidence.length - 1].artifacts,
         })
-        // Q1' 工件状态绑定（process-gate §6）：验证证据落地 ⇒ 把交付工件的文件状态绑定进记录
-        // （mtime/size/sha）。绑定只看文件状态 ⇒ 脚本通道写入可见（Q1 盲区修法）；
-        // 任意 grader 验证都会走到这里 ⇒ 不再只认 hidden（Q1 的第二个盲区）。
-        if (CONFIG.deliveryArtifactStateGate === true) {
-          const bound = bindDeliveryArtifact(rec, event.data && event.data.turn, event.data && event.data.step)
-          if (bound) logAudit(rec, 'artifact-binding', { ...bound })
-        }
-        // Q2' 文件状态快照（process-gate §6b）：同一验证证据路径，给验证命令指认的目录做
-        // 代码文件状态快照——pre-step 差分"自验证以来变了几个文件"（脚本通道写入可见）。
-        if (CONFIG.fileStateHoldEvery > 0) {
-          const snap = bindFileStates(rec, event.data && event.data.turn, event.data && event.data.step)
-          if (snap) logAudit(rec, 'file-state-binding', { count: snap.count })
-        }
-        // Q2 解除条件：**证据落地**才解除保持态（不是计时器——设计 §3 Q2 的预算恢复语义）。
-        if (rec.editHold.holding) {
-          rec.editHold.holding = false
-          rec.editHold.editsSinceVerify = 0
-          rec.editHold.released += 1
-          logAudit(rec, 'edit-hold-released', { released: rec.editHold.released, via: 'verify-evidence' })
-        }
         rec.lastVerifyCallKey = null
       }
     }
   } else if (event.type === 'turn/end') {
-    // A′ 的关键排除：回合到此结束 ⇒ 最后一格"无工具调用"是合法收尾，不是停手。
-    ledgerCloseTurn(rec, event.data && event.data.turn)
-    // done-gap 的**边界触发**：代理常常不按"语言宣告"格式报告完成（实测交付报告是
-    // "HIDDEN: failed=… passed=…"，claim 正则匹配不上 ⇒ 镜像一次都不开火，见 §29）。
-    // 回合结束就是天然交付边界：最近一次验证仍带失败就回放缺口。
-    // 与宣告路径共用 served 标记 ⇒ 两条路径都只注入一次。
-    if (CONFIG.doneGapMirror === true && !rec.doneGapMirror
-      && typeof rec.lastVerifyFailureTail === 'string' && rec.lastVerifyFailureTail.trim()) {
-      rec.doneGapMirror = { atTurn: (event.data && event.data.turn) ?? null, atStep: null, served: false, failCount: rec.lastVerifyFailCount }
-      logAudit(rec, 'done-gap-mirror', { via: 'turn-end', atTurn: rec.doneGapMirror.atTurn, failCount: rec.lastVerifyFailCount })
-    }
-    // F3 越界事实的**边界触发**：回合结束时还有**落地**的越界写（失败的在 tool/result
-    // 已被成功门撤回）⇒ 挂标记，组装期回放一次。与 done-gap 共用"先挂标记、组装期注入"。
-    if (CONFIG.scopeBreachMirror === true && !rec.scopeBreachMirror && rec.scopeViolations.length > 0) {
-      rec.scopeBreachMirror = { served: false, via: 'turn-end', paths: rec.scopeViolations.slice(-10).map((v) => v.path) }
-      logAudit(rec, 'scope-breach-mirror', { via: 'turn-end', paths: rec.scopeBreachMirror.paths })
-    }
   } else if (event.type === 'assistant/message') {
     rec.messages += 1
     const turn = event.data && event.data.turn
     const step = event.data && event.data.step
-    // 先为**本步**建格（纯文本步没有工具调用，若不在建格就永远无法被计为"中途停手"），
-    // 再推进：新的一步出现 ⇒ 上一步"没有工具调用"就是回合中途停手。
-    // （若上一步是回合末步，会先被 turn/end 关掉，不会走到这里。这是 A′ 双判的第一判。）
-    ledgerCell(rec, turn, step)
-    ledgerAdvanceStep(rec, turn, step)
     if (typeof turn === 'number') rec.lastTurn = turn
     if (typeof step === 'number') rec.lastStep = step
     const texts = reasoningBlocks(event)
@@ -3025,82 +1600,14 @@ function feedSessionEvent(session, event) {
       if (claimText) {
         const c = claimsFromFinalMessage(claimText)
         if (c && (c.claimedDone === true || c.claimedPass !== null)) {
-          const first = rec.claimedDoneAt == null
           rec.claimedDoneAt = { turn: turn ?? null, step: step ?? null }
-          // 证据捕获（F2/F5 原料）：每次完成/通过声明都记一条（含原文，有界）。
-          // F2 要逐项对证清单式声明，300 字符会截断多条目清单 ⇒ 提到 2000（20 条上限，可控）。
+          // 观测台账：每次完成/通过声明都记一条（含原文，有界）。
           rec.claims.push({
             turn: turn ?? null, step: step ?? null,
             text: claimText.slice(0, 2000),
             claimedDone: c.claimedDone === true, claimedPass: c.claimedPass, claimedTotal: c.claimedTotal,
           })
           if (rec.claims.length > 20) rec.claims.shift()
-          // F5 验证过期事实：宣告完成，但其**最后一次验证之后**又改过同一工件 ⇒ 挂标记，
-          // 组装期回放"验证命令 + 事后编辑"。纯函数在 tools/task-anchor-core.mjs（单一实现）。
-          if (!rec.verifyStalenessMirror && CONFIG.verifyStalenessMirror === true) {
-            const stale = verifyStaleness({
-              claim: { turn: turn ?? null, step: step ?? null, claimedDone: c.claimedDone === true, claimedPass: c.claimedPass },
-              verifyEvidence: rec.verifyEvidence,
-              edits: rec.edits,
-              scopeDirs: (rec.taskAnchors && rec.taskAnchors.scopeDirs) || [],
-            })
-            if (stale.stale === true) {
-              rec.verifyStalenessMirror = { ...stale.evidence, served: false, via: 'claim', atTurn: turn ?? null, atStep: step ?? null }
-              logAudit(rec, 'verify-staleness-mirror', { via: 'claim', ...stale.evidence })
-            }
-          }
-          // P1 交付门（phase 2）：宣告交付，但最后一次**隐藏评测**带失败或早于最近编辑 ⇒
-          // 拒绝接收（组装期注入"交付不被接受"的门消息）。纯函数在 task-anchor-core。
-          if (!rec.deliveryGate && CONFIG.deliveryGate === true) {
-            const g = deliveryGate({
-              claim: { turn: turn ?? null, step: step ?? null, claimedDone: c.claimedDone === true, claimedPass: c.claimedPass },
-              verifyEvidence: rec.verifyEvidence,
-              edits: rec.edits,
-            })
-            if (g.refuse === true) {
-              rec.deliveryGate = { served: false, via: 'claim', reason: g.reason, evidence: g.evidence }
-              logAudit(rec, 'delivery-gate', { via: 'claim', reason: g.reason, ...g.evidence })
-            }
-          }
-          // P3 交付格式契约（phase 2）：提示声明过 PASS=n/m 格式，交付却没带同分母行 ⇒ 要求补上。
-          if (!rec.claimFormat && CONFIG.claimFormatContract === true
-            && rec.taskAnchors && rec.taskAnchors.reportFormat
-            && !claimFormatOk(claimText, rec.taskAnchors.reportFormat)) {
-            rec.claimFormat = { served: false, via: 'claim' }
-            logAudit(rec, 'claim-format', { via: 'claim', total: rec.taskAnchors.reportFormat.total })
-          }
-          // F6 无出处结果断言（criteria 第二波）：交付声称结局但全会话零验证证据 ⇒ 挂标记。
-          if (!rec.unsupportedClaimMirror && CONFIG.unsupportedClaimMirror === true) {
-            const u = unsupportedClaim({
-              claim: { turn: turn ?? null, step: step ?? null, claimedDone: c.claimedDone === true, claimedPass: c.claimedPass },
-              verifyEvidence: rec.verifyEvidence,
-            })
-            if (u.unsupported === true) {
-              rec.unsupportedClaimMirror = { served: false, via: 'claim', reason: u.reason }
-              logAudit(rec, 'unsupported-claim', { via: 'claim', reason: u.reason })
-            }
-          }
-          // F7 证据矛盾（criteria 第二波）：声称全过但最后一次验证仍带失败 ⇒ 挂标记。
-          if (!rec.evidenceContradictionMirror && CONFIG.evidenceContradictionMirror === true) {
-            const x = evidenceContradiction({
-              claim: { turn: turn ?? null, step: step ?? null, claimedDone: c.claimedDone === true, claimedPass: c.claimedPass, claimedTotal: c.claimedTotal, text: claimText.slice(0, 300) },
-              verifyEvidence: rec.verifyEvidence,
-            })
-            if (x.contradiction === true) {
-              rec.evidenceContradictionMirror = { served: false, via: 'claim', reason: x.reason, evidence: x.evidence }
-              logAudit(rec, 'evidence-contradiction', { via: 'claim', reason: x.reason, ...x.evidence })
-            }
-          }
-          // 契约重锚定（只读、一次性）：**第一次**宣告完成时挂标记，组装期注入一次摘要。
-          if (first && CONFIG.contractReanchor === true && typeof rec.anchorsFromMessage === 'string' && rec.anchorsFromMessage.trim()) {
-            rec.contractReanchor = { atTurn: rec.claimedDoneAt.turn, atStep: rec.claimedDoneAt.step, served: false }
-            logAudit(rec, 'contract-reanchor', { atTurn: rec.claimedDoneAt.turn, atStep: rec.claimedDoneAt.step })
-          }
-          // 交付缺口回放：宣告完成，但它自己的最近一次验证**仍带失败** ⇒ 把缺口回放给它。
-          if (first && CONFIG.doneGapMirror === true && typeof rec.lastVerifyFailureTail === 'string' && rec.lastVerifyFailureTail.trim()) {
-            rec.doneGapMirror = { atTurn: rec.claimedDoneAt.turn, atStep: rec.claimedDoneAt.step, served: false, failCount: rec.lastVerifyFailCount }
-            logAudit(rec, 'done-gap-mirror', { atTurn: rec.claimedDoneAt.turn, atStep: rec.claimedDoneAt.step, failCount: rec.lastVerifyFailCount })
-          }
         }
       }
     } catch (e) { /* 观测侧永不抛 */ }
@@ -3134,37 +1641,6 @@ function safeGet(service, id) {
 }
 
 // ---------- status tool ----------
-
-/** L3：从会话事件流采集族信息（provider/model 来自 request/header，预设来自 session 事件）。 */
-function noteRequestHeader(rec, event) {
-  try {
-    const cfg = event && event.data && event.data.header && event.data.header.config
-    if (!cfg) return
-    if (!rec.family) rec.family = { provider: null, model: null, preset: null, at: null }
-    let changed = false
-    if (typeof cfg.provider === 'string' && rec.family.provider !== cfg.provider) { rec.family.provider = cfg.provider; changed = true }
-    if (typeof cfg.model === 'string' && rec.family.model !== cfg.model) { rec.family.model = cfg.model; changed = true }
-    if (changed) {
-      rec.family.at = Date.now()
-      logAudit(rec, 'family', { provider: rec.family.provider, model: rec.family.model, preset: rec.family.preset, key: familyKeyOf(rec).full })
-    }
-  } catch (e) {
-    warnOnce(`family note (request/header) failed (ignored): ${msg(e)}`)
-  }
-}
-function noteSessionEvent(rec, event) {
-  try {
-    const d = event && event.data
-    if (!d || typeof d.agentPreset !== 'string') return
-    if (!rec.family) rec.family = { provider: null, model: null, preset: null, at: null }
-    if (rec.family.preset !== d.agentPreset) {
-      rec.family.preset = d.agentPreset
-      logAudit(rec, 'family', { provider: rec.family.provider, model: rec.family.model, preset: rec.family.preset, key: familyKeyOf(rec).full })
-    }
-  } catch (e) {
-    warnOnce(`family note (session) failed (ignored): ${msg(e)}`)
-  }
-}
 
 /** 收第一条人类消息（= 任务陈述），从中解析任务锚点。读不出范围就 parsed:false——绝不猜。 */
 function noteHumanMessage(rec, event) {
@@ -3215,13 +1691,6 @@ function noteTaskSignal(rec, event) {
     const turn = typeof d.turn === 'number' ? d.turn : null
     const step = typeof d.step === 'number' ? d.step : null
     const args = typeof d.arguments === 'string' ? d.arguments : (d.arguments === undefined ? '' : JSON.stringify(d.arguments))
-    // Q1'''：验证调用自己的工作目录（pwsh 的 workdir 参数）——探针实测 4/8 会话的验证命令
-    // 是纯相对路径（artifacts 为空），只有 workdir/会话 cwd 能指认工件目录（§49.5 探针结论）。
-    const workdirOf = (() => {
-      if (d.arguments && typeof d.arguments === 'object' && typeof d.arguments.workdir === 'string') return d.arguments.workdir
-      const m = args.match(/"workdir"\s*:\s*"([^"]*)"/)
-      return m ? m[1] : null
-    })()
     // 命令文本：优先解码，抽不到就用**原始参数文本**兜底。
     // 为什么必须有兜底（实测踩到，属于"能力其实没在跑"的那一类）：真实会话里的命令常是多行
     // PowerShell 脚本、内含转义引号，此时 `"command"\s*:\s*"([^"]*)"` 只截到一个片段——
@@ -3276,7 +1745,6 @@ function noteTaskSignal(rec, event) {
       // （通过/失败都要记：F5 要的是"验证过哪些工件、什么时候验证的"，与过没过无关）。
       rec.lastVerifyCmd = String(cmdDecoded || args).slice(0, 300)
       rec.lastVerifyKind = observedKind || (fromPrompt ? 'prompt-token' : null)
-      rec.lastVerifyWorkdir = workdirOf || null
       if (rec.codeEditsAfterVerify.length > 0) {
         logAudit(rec, 'verify-run', { turn, step, clearedEdits: rec.codeEditsAfterVerify.length, cmd: String(cmdDecoded || args).slice(0, 160) })
       }
@@ -3303,50 +1771,6 @@ function noteTaskSignal(rec, event) {
       rec.edits.push({ turn, step, tool: name, path, invalidates: changeInvalidatesVerification(path), at: Date.now() })
       if (rec.edits.length > 100) rec.edits.shift()
       arm.editCount += 1
-      // P2/Q4 共用"落地代码改动"口径：arm 先记 invalidatingCount（供成功门撤回），
-      // 两个预算各自独立计数（P2 按间隔注入、Q4 按会话上限）。
-      if (changeInvalidatesVerification(path)) {
-        arm.invalidatingCount = (arm.invalidatingCount || 0) + 1
-      }
-      // P2 改后必验预算（phase 2）：每 verifyBudgetEvery 次落地代码改动 ⇒ 组装期注入一次强制重验
-      if (CONFIG.verifyAfterEditBudget === true && changeInvalidatesVerification(path)) {
-        rec.verifyBudget.count += 1
-        if (rec.verifyBudget.count >= CONFIG.verifyBudgetEvery && !rec.verifyBudget.armed) {
-          rec.verifyBudget.armed = true
-          logAudit(rec, 'verify-budget-armed', { count: rec.verifyBudget.count, turn, step })
-        }
-      }
-      // Q4 会话内编辑预算（process-front-loaded）：落地代码改动计入上限，耗尽即挂"评分并交付"
-      if (CONFIG.editBudgetCap > 0 && changeInvalidatesVerification(path)) {
-        rec.editBudget.count += 1
-        if (rec.editBudget.count >= CONFIG.editBudgetCap && !rec.editBudget.exhausted) {
-          rec.editBudget.exhausted = true
-          logAudit(rec, 'edit-budget-exhausted', { count: rec.editBudget.count, cap: CONFIG.editBudgetCap, turn, step })
-        }
-      }
-      // Q2 带保持的编辑预算：落地代码改动计入"自上次验证以来的编辑数"；
-      // 保持态下的再编辑记 hold-violations（允许但不静默）。
-      if (CONFIG.editHoldEvery > 0 && changeInvalidatesVerification(path)) {
-        rec.editHold.editsSinceVerify += 1
-        if (rec.editHold.holding) {
-          rec.editHold.violations += 1
-          logAudit(rec, 'edit-hold-violation', { turn, step, path, violations: rec.editHold.violations })
-        } else if (rec.editHold.editsSinceVerify >= CONFIG.editHoldEvery) {
-          rec.editHold.holding = true
-          rec.editHold.served = false
-          logAudit(rec, 'edit-hold-armed', { editsSinceVerify: rec.editHold.editsSinceVerify, turn, step })
-        }
-      }
-      // Q1 交付工件门（process-front-loaded）：写交付工件（PR 模板）时，若最后一次隐藏
-      // 评测仍带失败/早于最近代码编辑 ⇒ 拒绝接收该工件。写入发生在最后一条消息**之前**，
-      // 代理还有回合可重跑（P1 重跑率 0/7 的结构性修法，§45）。工件重写可重新武装。
-      if (CONFIG.deliveryArtifactGate === true && /pull_request_template(\.md|\.txt)?$/i.test(String(path))) {
-        const g = artifactDeliveryFacts({ verifyEvidence: rec.verifyEvidence, edits: rec.edits, at: { turn, step } })
-        if (g.refuse === true) {
-          rec.deliveryArtifactGate = { served: false, via: 'artifact-write', reason: g.reason, evidence: g.evidence }
-          logAudit(rec, 'delivery-artifact-gate', { via: 'artifact-write', reason: g.reason, ...g.evidence })
-        }
-      }
       if (scopeKnown && !inScope(path, anchors)) {
         const v = { turn, step, tool: name, path, at: Date.now() }
         rec.scopeViolations.push(v)
@@ -3430,15 +1854,6 @@ function retractArm(rec, event) {
         const lastE = rec.edits[rec.edits.length - 1]
         if (lastE && lastE.turn === a.turn && lastE.step === a.step) rec.edits.pop()
       }
-    }
-    // P2 预算计数同口径撤回（没落地的写不算"改过"）。
-    if ((a.invalidatingCount || 0) > 0) {
-      rec.verifyBudget.count = Math.max(0, rec.verifyBudget.count - a.invalidatingCount)
-      if (rec.verifyBudget.count < CONFIG.verifyBudgetEvery) rec.verifyBudget.armed = false
-      // Q4 同口径：被拒的写不占编辑预算（耗尽态不回溯——一旦耗尽就保持"评分并交付"）。
-      if (CONFIG.editBudgetCap > 0) rec.editBudget.count = Math.max(0, rec.editBudget.count - a.invalidatingCount)
-      // Q2 同口径：被拒的写不占"自上次验证以来的编辑数"（保持态不因撤回解除）。
-      if (CONFIG.editHoldEvery > 0) rec.editHold.editsSinceVerify = Math.max(0, rec.editHold.editsSinceVerify - a.invalidatingCount)
     }
     if (a.addedEdit) {
       const last = rec.codeEditsAfterVerify[rec.codeEditsAfterVerify.length - 1]
@@ -3536,17 +1951,6 @@ function pullbackDecision(rec, turn) {
 }
 
 function summaryOf(rec) {
-  // 行为通道的**实时**窗口（与判定走同一套 channelTest；`channels` 是上次判定时的快照，
-  // 而台账在 turn/end 之后还会被定稿，所以两者会短暂不同——这里把"现在"也暴露出来）。
-  let channelWindows = null
-  try {
-    const live = channelSeries(rec)
-    channelWindows = {}
-    for (const nm of ['inaction', 'repetition', 'failure']) {
-      const t = channelTest(nm, live[nm] || [])
-      channelWindows[nm] = { observed: t.observed ?? null, window: t.window ?? null, refLen: t.refLen, p: roundP(t.p) }
-    }
-  } catch (e) { channelWindows = { error: msg(e) } }
   return {
     sessionId: rec.sessionId,
     self: rec.adoptedSelf,
@@ -3569,51 +1973,11 @@ function summaryOf(rec) {
     personaRatio: round2(rec.personaRatio),
     percentile: rec.percentile,
     history: rec.ratioHistory.length,
-    machineState: rec.machineState,
-    driftSteps: rec.driftSteps,
-    rollbackDeny: rec.rollbackDeny,
-    surfacePhase: rec.surfacePhase,
-    narrowedNow: rec.surfacePhase === 'narrowed',
-    narrowedSteps: rec.narrowedSteps,
-    didNarrow: rec.didNarrow === true,
-    capabilityBudgetExhausted: rec.capabilityBudgetExhausted,
-    // 本会话的资格是否由**人工试运行**授予（null = 本会话没走到那条路径）
-    trialReleaseArmed: rec.trialReleaseArmed || null,
-    trialReleaseUnavailable: rec.trialReleaseUnavailable || null,
-    contractReanchor: rec.contractReanchor ? { atTurn: rec.contractReanchor.atTurn ?? null, atStep: rec.contractReanchor.atStep ?? null, served: rec.contractReanchor.served === true } : null,
-    doneGapMirror: rec.doneGapMirror ? { atTurn: rec.doneGapMirror.atTurn ?? null, atStep: rec.doneGapMirror.atStep ?? null, served: rec.doneGapMirror.served === true, failCount: rec.doneGapMirror.failCount ?? null } : null,
-    // F3/F5 事实与证据捕获（criteria 层重构 phase 1）：触发、证据、台账计数全部可见
-    scopeBreachMirror: rec.scopeBreachMirror ? { served: rec.scopeBreachMirror.served === true, via: rec.scopeBreachMirror.via || null, paths: rec.scopeBreachMirror.paths || [] } : null,
-    verifyStalenessMirror: rec.verifyStalenessMirror ? { served: rec.verifyStalenessMirror.served === true, via: rec.verifyStalenessMirror.via || null, verifyCmd: rec.verifyStalenessMirror.verifyCmd || null, editPath: rec.verifyStalenessMirror.editPath || null, verifyTurn: rec.verifyStalenessMirror.verifyTurn ?? null, verifyStep: rec.verifyStalenessMirror.verifyStep ?? null, editTurn: rec.verifyStalenessMirror.editTurn ?? null, editStep: rec.verifyStalenessMirror.editStep ?? null } : null,
-    // phase-2 协议约束状态
-    deliveryGate: rec.deliveryGate ? { served: rec.deliveryGate.served === true, via: rec.deliveryGate.via || null, reason: rec.deliveryGate.reason || null } : null,
-    verifyBudget: { count: rec.verifyBudget.count, armed: rec.verifyBudget.armed === true },
-    claimFormat: rec.claimFormat ? { served: rec.claimFormat.served === true, via: rec.claimFormat.via || null } : null,
-    unsupportedClaimMirror: rec.unsupportedClaimMirror ? { served: rec.unsupportedClaimMirror.served === true, via: rec.unsupportedClaimMirror.via || null, reason: rec.unsupportedClaimMirror.reason || null } : null,
-    evidenceContradictionMirror: rec.evidenceContradictionMirror ? { served: rec.evidenceContradictionMirror.served === true, via: rec.evidenceContradictionMirror.via || null, reason: rec.evidenceContradictionMirror.reason || null } : null,
-    itemizedClaimMirror: rec.itemizedClaimMirror ? { served: rec.itemizedClaimMirror.served === true, via: rec.itemizedClaimMirror.via || null, reason: rec.itemizedClaimMirror.reason || null, unsupportedCount: Array.isArray(rec.itemizedClaimMirror.unsupported) ? rec.itemizedClaimMirror.unsupported.length : null, unsupported: Array.isArray(rec.itemizedClaimMirror.unsupported) ? rec.itemizedClaimMirror.unsupported.slice(0, 8) : [] } : null,
-    editBudget: { count: rec.editBudget.count, exhausted: rec.editBudget.exhausted === true, served: rec.editBudget.served === true },
-    editHold: { editsSinceVerify: rec.editHold.editsSinceVerify, holding: rec.editHold.holding === true, violations: rec.editHold.violations, released: rec.editHold.released, served: rec.editHold.served === true },
-    deliveryArtifactGate: rec.deliveryArtifactGate ? { served: rec.deliveryArtifactGate.served === true, via: rec.deliveryArtifactGate.via || null, reason: rec.deliveryArtifactGate.reason || null } : null,
-    artifactBinding: rec.artifactBinding ? { path: rec.artifactBinding.path || null, boundTurn: rec.artifactBinding.turn ?? null, boundStep: rec.artifactBinding.step ?? null, sha: rec.artifactBinding.sha ? rec.artifactBinding.sha.slice(0, 12) : null, verifyFailed: rec.artifactBinding.failed === true, served: rec.artifactBinding.served === true } : null,
-    fileStateBinding: rec.fileStateBinding ? { boundFiles: rec.fileStateBinding.files ? rec.fileStateBinding.files.length : 0, boundTurn: rec.fileStateBinding.turn ?? null, boundStep: rec.fileStateBinding.step ?? null, served: rec.fileStateBinding.served === true } : null,
     evidence: {
       verifyEvidence: rec.verifyEvidence.length,
       edits: rec.edits.length,
       claims: rec.claims.length,
     },
-    policy: rec.lastPolicy,
-    policyAction: rec.lastPolicyAction,
-    policyChannel: rec.lastPolicyChannel,
-    policyP: rec.lastPolicyP,
-    policyReason: rec.lastPolicyReason,
-    channels: rec.channels,
-    channelWindows,
-    ledgerSize: rec.ledger.length,
-    // L3 族信息（模型/预设/任务范围 + 实际匹配到的族键）
-    family: rec.family
-      ? { provider: rec.family.provider, model: rec.family.model, preset: rec.family.preset, key: familyKeyOf(rec).full }
-      : null,
     // L1 任务锚定拉回：状态与留痕全部可见（"为什么没说/说了几次/依据是什么"）。
     taskAnchors: rec.taskAnchors
       ? {
@@ -3655,15 +2019,12 @@ function summaryOf(rec) {
       // 否则"这一项为什么是 true"只能靠翻日志。
       sawUnknownTool: rec.sawUnknownTool === true,
     },
-    // L2 重锚定：状态、门与在线证据
+    // L2'（确认即恢复）：开关、是否被允许、当前确认信号、对照比例 —— 全部可见
     reanchor: {
-      enabled: effectiveReanchor(),
-      gate: reanchorGateReason(),
+      onConfirm: CONFIG.reanchorOnConfirm === true,
       count: rec.reanchor.count,
       lastTurn: rec.reanchor.lastTurn,
       suppressed: { ...rec.reanchor.suppressed },
-      // L2'（确认即恢复）：开关、是否被允许、当前确认信号、对照比例 —— 全部可见
-      onConfirm: CONFIG.reanchorOnConfirm === true,
       confirmAllowed: confirmReanchorAllowed(rec),
       confirm: rec.confirm ? { reason: rec.confirm.reason, turn: rec.confirm.turn, step: rec.confirm.step, handled: rec.confirm.handled === true, detail: rec.confirm.detail || null } : null,
       confirmDeclined: rec.confirmDeclined || 0,
@@ -3675,7 +2036,6 @@ function summaryOf(rec) {
     stepsScored: rec.stepsScored,
     positiveHitSteps: rec.positiveHitSteps,
     negativeHitSteps: rec.negativeHitSteps,
-    hasCounterfactual: rec.counterfactual !== null,
     // 最近审计种类摘要：让"判定为何没启动"这类问题不必翻日志就能看见
     // （也是 policy-skipped 两档留痕的可测面）。
     auditTail: rec.events.slice(-8).map(e => e.kind),
@@ -3704,12 +2064,10 @@ function buildSummary(filter) {
   const rows = []
   let anchoredCount = 0
   let liftedCount = 0
-  let rollbackCount = 0
   for (const rec of recs.values()) {
     if (filter && rec.sessionId !== filter) continue
     if (rec.anchored) anchoredCount += 1
     if (rec.lifted) liftedCount += 1
-    if (rec.rollbackDeny.length > 0) rollbackCount += 1
     rows.push(summaryOf(rec))
   }
   const topNames = {}
@@ -3720,98 +2078,33 @@ function buildSummary(filter) {
     plugin: 'dsh-trajectory-anchor',
     initiatorSessionId,
     baseDir: baseDir || null,
-    sessionCwd: sessionCwd || null,
     lexicon: {
       source: CONFIG.lexiconPath ? String(CONFIG.lexiconPath) : 'default',
       positive: Object.keys(CONFIG.lexicon.positive).length,
       negative: Object.keys(CONFIG.lexicon.negative).length,
       neutral: Object.keys(CONFIG.lexicon.neutral).length,
-      ratioWeights: { ...CONFIG.ratioWeights },
+      ratioWeights: { ...RATIO_WEIGHTS },
     },
     config: {
       gateEnabled: CONFIG.gateEnabled,
-      maxBootstrapSteps: CONFIG.maxBootstrapSteps,
       suppressContextOnBootstrap: CONFIG.suppressContextOnBootstrap,
       // 抑制清单必须可见：否则"到底摘掉了什么"只能翻源码
       suppressedSources: CONFIG.suppressedSources.slice(),
       bootstrapPersona: CONFIG.bootstrapPersona,
       bootstrapMaxTokens: CONFIG.bootstrapMaxTokens,
-      specMax: CONFIG.specMax,
-      reactMin: CONFIG.reactMin,
-      // P3 响应策略（会话内自参考偏离检验）
-      refMinSteps: CONFIG.refMinSteps,
-      testWindow: CONFIG.testWindow,
-      notifyAlpha: CONFIG.notifyAlpha,
-      actAlpha: CONFIG.actAlpha,
-      maxDriftSteps: CONFIG.maxDriftSteps,
-      rollbackEnabled: CONFIG.rollbackEnabled,
-      notifyEnabled: CONFIG.notifyEnabled,
-      responsePolicyPath: CONFIG.responsePolicyPath || null,
-      measurementSafe: CONFIG.measurementSafe === true,
-      effectiveRollback: effectiveRollback(),
-      effectiveNotify: effectiveNotify(),
       suppressSkillCatalog: CONFIG.suppressSkillCatalog,
       pullbackEnabled: CONFIG.pullbackEnabled === true,
       pullbackMaxPerSession: CONFIG.pullbackMaxPerSession,
       pullbackControlRate: CONFIG.pullbackControlRate,
-      // 事实镜像四个开关必须可见：A/B 换臂前后要能直接核实"臂上的是什么配置"，
-      // 而不是事后从审计反推（配置不可见 = 能力其实没在跑的同类风险）。
-      contractReanchor: CONFIG.contractReanchor === true,
-      doneGapMirror: CONFIG.doneGapMirror === true,
-      scopeBreachMirror: CONFIG.scopeBreachMirror === true,
-      verifyStalenessMirror: CONFIG.verifyStalenessMirror === true,
-      deliveryGate: CONFIG.deliveryGate === true,
-      verifyAfterEditBudget: CONFIG.verifyAfterEditBudget === true,
-      verifyBudgetEvery: CONFIG.verifyBudgetEvery,
-      claimFormatContract: CONFIG.claimFormatContract === true,
-      unsupportedClaimMirror: CONFIG.unsupportedClaimMirror === true,
-      evidenceContradictionMirror: CONFIG.evidenceContradictionMirror === true,
-      itemizedClaimMirror: CONFIG.itemizedClaimMirror === true,
-      editBudgetCap: CONFIG.editBudgetCap,
-      editHoldEvery: CONFIG.editHoldEvery,
-      deliveryArtifactGate: CONFIG.deliveryArtifactGate === true,
-      deliveryArtifactStateGate: CONFIG.deliveryArtifactStateGate === true,
-      fileStateHoldEvery: CONFIG.fileStateHoldEvery,
-      reanchorEnabled: CONFIG.reanchorEnabled === true,
-      reanchorEvidencePath: CONFIG.reanchorEvidencePath || null,
+      reanchorOnConfirm: CONFIG.reanchorOnConfirm === true,
+      reanchorConfirmControlRate: CONFIG.reanchorConfirmControlRate,
       pullbackOutcomePath: CONFIG.pullbackOutcomePath || null,
-      familyPriorPath: CONFIG.familyPriorPath || null,
-      priorStrength: CONFIG.priorStrength,
-      adaptiveStateEnabled: CONFIG.adaptiveStateEnabled === true,
-      adaptiveStatePath: CONFIG.adaptiveStatePath || null,
-      adaptiveStateWindow: CONFIG.adaptiveStateWindow,
-      outcomeFeedbackEnabled: CONFIG.outcomeFeedbackEnabled === true,
-      feedbackMinSessions: CONFIG.feedbackMinSessions,
-      feedbackMinProductiveRate: CONFIG.feedbackMinProductiveRate,
-      feedbackExploreAfterSessions: CONFIG.feedbackExploreAfterSessions,
-      rewardAnnotator: CONFIG.rewardAnnotator,
     },
     configWarnings: configWarnings.slice(),
-    policyArtifact,
-    autoDemote,
-    capabilityGate: capabilityGateReason(),
-    // 人工试运行放行：通道 / 显式工作点 α / 到期时间 / 剩余时长 / 放行理由。
-    // 它必须**一眼可见**，否则"为什么能力层在动手"会变成只有翻源码才知道的事。
-    trialRelease: (() => {
-      const t = trialReleaseActive()
-      const raw = CONFIG.trialRelease
-      if (!t) return raw ? { active: false, configured: true, reason: 'expired-or-invalid', until: (raw && raw.until) || null, channels: (raw && raw.channels) || [] } : null
-      return { active: true, configured: true, channels: t.channels, alpha: t.alpha, until: t.until, remainingMs: Math.max(0, t.untilMs - Date.now()), note: t.note }   // time-ok: 纯展示剩余时长
-    })(),
-    reanchorGate: reanchorGateReason(),
-    reanchorEvidence,
-    familyPriors: familyPriors ? { source: familyPriors.source, families: Object.keys(familyPriors.byKey || {}).length } : null,
-    adaptiveState,
-    feedbackEpoch,
-    channelFeedback: Object.fromEntries(Object.entries(channelFeedback).map(([k, v]) => [k, { sessions: v.sessions, fires: v.fires, productive: v.productive, rate: v.lastRate, multiplier: v.multiplier, revoked: v.revoked, explores: v.explores }])),
-    feedbackEpoch,
-    effectiveSwitches: { rollback: effectiveRollback(), notify: effectiveNotify() },
-    sessionOutcomes: { window: sessionOutcomes.length, narrowed: sessionOutcomes.filter((o) => o.narrowed).length, budget: CONFIG.autoDemoteBudget },
     listAtApply,
     tracked: recs.size,
     anchored: anchoredCount,
     lifted: liftedCount,
-    rollbackCount,
     channelStats,
     waterfallAgentRequest,
     waterfallPreStep,
@@ -3849,29 +2142,6 @@ function mergeConfig(config) {
       CONFIG[key] = v
       continue
     }
-    if (key === 'trialRelease') {
-      // 人工试运行放行：形状必须精确，否则**整条路径作废**（fail-safe 回到只观察）。
-      // 为什么这么严：它是唯一能绕过"标定件不合格"的动作路径，写法含糊就等于放行了一个
-      // 说不清边界的执行器 —— 那正是本插件最重那次事故的形态。
-      const t = config[key]
-      if (!t || typeof t !== 'object' || Array.isArray(t)) {
-        noteConfigWarning('invalid trialRelease (needs an object {channels, alpha, until, note}); keeping observe-only')
-        continue
-      }
-      const channels = Array.isArray(t.channels) ? t.channels.filter((c) => typeof c === 'string' && c.length > 0) : []
-      const alpha = Number(t.alpha)
-      const untilMs = typeof t.until === 'string' ? Date.parse(t.until) : NaN
-      if (channels.length === 0) { noteConfigWarning('trialRelease.channels is empty; keeping observe-only'); continue }
-      if (!Number.isFinite(alpha) || alpha <= 0 || alpha >= 1) { noteConfigWarning('trialRelease.alpha must be in (0,1); keeping observe-only'); continue }
-      if (!Number.isFinite(untilMs)) { noteConfigWarning('trialRelease.until must be an ISO timestamp (a trial without an expiry is unbounded); keeping observe-only'); continue }
-      const known = channels.filter((c) => Object.prototype.hasOwnProperty.call(CONFIG.responseChannels, c))
-      if (known.length !== channels.length) {
-        noteConfigWarning(`trialRelease.channels has unknown channel(s): ${channels.filter((c) => !known.includes(c)).join(',')}; keeping observe-only`)
-        continue
-      }
-      CONFIG[key] = { channels: known, alpha, until: t.until, note: typeof t.note === 'string' ? t.note : null }
-      continue
-    }
     if (key === 'lexicon') {
       const l = config[key]
       if (!l || typeof l !== 'object' ||
@@ -3880,26 +2150,6 @@ function mergeConfig(config) {
         continue
       }
     }
-    if (key === 'responseChannels') {
-      // 嵌套对象**逐通道合并**：只覆盖你写的那条通道，兄弟通道保持默认。
-      // （否则 `responseChannels: {lexicon: {...}}` 会把 inaction/repetition/failure 抹掉，
-      //   表现为"看不见的降级"——这类静默失效正是本项目反复栽的坑。）
-      const incoming = config[key]
-      if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) {
-        noteConfigWarning('invalid responseChannels (needs an object of channel overrides); keeping current channels')
-        continue
-      }
-      const merged = { ...CONFIG.responseChannels }
-      for (const [chName, chCfg] of Object.entries(incoming)) {
-        if (!chCfg || typeof chCfg !== 'object' || Array.isArray(chCfg)) {
-          noteConfigWarning(`invalid responseChannels.${chName} (needs an object); keeping defaults for that channel`)
-          continue
-        }
-        merged[chName] = { ...(CONFIG.responseChannels[chName] || {}), ...chCfg }
-      }
-      CONFIG[key] = merged
-      continue
-    }
     CONFIG[key] = config[key]
   }
 }
@@ -3907,28 +2157,19 @@ function mergeConfig(config) {
 /**
  * 从 DEFAULTS 深拷贝一份运行时配置。
  *
- * 为什么必须深拷贝 + 每次挂载重播种（实测踩到的静默降级）：
- *   ① `{ ...DEFAULTS }` 是浅拷贝 ⇒ `CONFIG.responseChannels` 与
- *      `DEFAULTS.responseChannels` 是**同一个对象**；标定件装载时执行
- *      `CONFIG.responseChannels[ch] = {...}` 会就地改掉 DEFAULTS，
- *      于是"默认值"在第一次装标定件后就不再是默认值了。
- *   ② `apply` 可能在同一个进程内被**再次调用**（热重载 / 改配置后重挂载）。
- *      若沿用上一轮的 CONFIG，标定件写入的 `measurementSafe=true`、
- *      `capabilityEligible=true`、反解出来的 `actAlpha` 会**粘住**：表现为
- *      "明明删了标定件/改了配置，行为却不变"，且找不到原因。
- * 因此每次挂载都从 DEFAULTS 重新播种，并把本插件自己的运行期门禁状态一并清空。
+ * 为什么必须深拷贝 + 每次挂载重播种：
+ *   · `{ ...DEFAULTS }` 是浅拷贝 ⇒ 嵌套对象会与 DEFAULTS 共享同一引用；
+ *   · `apply` 可能在同一个进程内被**再次调用**（热重载），沿用上一轮的 CONFIG
+ *     会让旧配置值粘住（"改了配置行为却不变"）。
+ * 因此每次挂载都从 DEFAULTS 重新播种。
  */
 function cloneDefaults() {
   return JSON.parse(JSON.stringify(DEFAULTS))
 }
 
 export function apply(ctx, config) {
-  // ① **派生状态**：每次挂载重算（配置 + 产物算出来的东西）——必须清空，
-  //    否则出现"标定件状态跨挂载粘住"（修过的事故）。
+  // 派生状态：每次挂载重算（配置 + 产物算出来的东西）——必须清空。
   CONFIG = cloneDefaults()
-  policyArtifact = null
-  reanchorEvidence = null
-  familyPriors = null
   configWarnings.length = 0
   warned.clear()
   try {
@@ -3937,12 +2178,6 @@ export function apply(ctx, config) {
     PLUGIN_VERSION = 'unknown'
   }
   mergeConfig(config)
-  // ② **累积状态**（记忆）：降档窗口 / 通道回灌计数 / 倍率 / 纪元——按会话落盘、挂载时装载。
-  //   为什么与派生状态分开：清掉它等于"每次重启都把最近 N 个会话抹平"，
-  //   跨天自适应永远从零开始（回灌与降档都攒不满）。
-  //   注意 baseDir 在下面才解析出来，所以这里先用默认（进程 cwd），稍后若拿到 workspaceRoot
-  //   会以同一路径规则重算；装载失败一律 fail-safe（空记忆 + 响亮告警，不阻断挂载）。
-  loadAdaptiveState()
   // 词典文件加载（在 mergeConfig 之后：lexiconPath 优先于内联 lexicon——
   // 这样"仅加 lexiconPath"即可换词典，无需删除 patch 行里内联的默认词表）
   const envLex = typeof process !== 'undefined' && process.env && process.env.TRAJECTORY_ANCHOR_LEXICON_PATH
@@ -3952,152 +2187,18 @@ export function apply(ctx, config) {
       const p = isAbsolute(lexiconPath) ? lexiconPath : resolvePath(process.cwd(), lexiconPath)
       const loaded = parseLexiconJson(readFileSync(p, 'utf8'))
       CONFIG.lexicon = { positive: loaded.positive, negative: loaded.negative, neutral: loaded.neutral }
-      if (loaded.ratioWeights) CONFIG.ratioWeights = loaded.ratioWeights
       const n = (x) => Object.keys(x).length
       console.log(`[${name}] lexicon loaded from ${p} (${n(loaded.positive)}p/${n(loaded.negative)}n/${n(loaded.neutral)}u)`)
     } catch (e) {
       console.error(`[${name}] failed to load lexicon from "${lexiconPath}": ${e && e.message}; keeping default lexicon`)
     }
   }
-  // ⚠ 顺序很重要：先验必须在**标定件之前**加载——标定件要按"先验是否真的在用"
-  // 在两套 α（derived / derivedWithFamilyPrior）之间选一套。反过来就会出现
-  // "装了先验却用了无先验的 α"（实测踩到：门禁用例 ⑫ 抓出来的）。
-  // L3 族先验加载（tools/family-priors.mjs 的产物）。fail-safe：任何一步不通过 ⇒ **不收缩**
-  // （退回固定 Jeffreys 伪计数，即本轮之前的行为），并留响亮告警。
-  const envPriors = typeof process !== 'undefined' && process.env && process.env.TRAJECTORY_ANCHOR_FAMILY_PRIORS
-  const priorPath = (config && typeof config.familyPriorPath === 'string' && config.familyPriorPath) || envPriors || ''
-  if (priorPath) {
-    try {
-      const p = isAbsolute(priorPath) ? priorPath : resolvePath(process.cwd(), priorPath)
-      const art = JSON.parse(readFileSync(p, 'utf8'))
-      const byKey = {}
-      for (const fam of (Array.isArray(art && art.families) ? art.families : [])) {
-        if (!fam || typeof fam.key !== 'string' || !fam.baseRates) continue
-        const rates = {}
-        for (const ch of ['inaction', 'repetition', 'failure']) {
-          const v = fam.baseRates[ch]
-          if (Number.isFinite(v)) rates[ch] = v
-        }
-        if (Object.keys(rates).length > 0) byKey[fam.key] = { key: fam.key, sessions: fam.sessions ?? null, steps: fam.steps ?? null, baseRates: rates }
-      }
-      if (Object.keys(byKey).length === 0) {
-        familyPriors = null
-  for (const k of Object.keys(channelFeedback)) delete channelFeedback[k]
-        noteConfigWarning(`family priors at "${p}" contained no usable families; shrinkage disabled`)
-      } else {
-        familyPriors = { source: p, byKey, generatedAtUtc: art.generatedAtUtc ?? null, corpus: art.corpus ?? null }
-        console.log(`[${name}] family priors loaded from ${p} (${Object.keys(byKey).length} families)`)
-      }
-    } catch (e) {
-      familyPriors = null
-  for (const k of Object.keys(channelFeedback)) delete channelFeedback[k]
-      noteConfigWarning(`failed to load family priors from "${priorPath}": ${msg(e)}; shrinkage disabled (fixed Jeffreys)`)
-    }
-  }
-
-  // 标定件加载（B3 门禁）：给了路径就按它决定"哪些通道有资格动能力面"。
-  // 任何一步不通过都**只观察**——fail-safe 而不是 fail-open（能力面不同于工具面：
-  // 工具面出错要暴露全量，能力面出错必须不动手）。
-  const envPolicy = typeof process !== 'undefined' && process.env && process.env.TRAJECTORY_ANCHOR_POLICY_PATH
-  const policyPath = (config && typeof config.responsePolicyPath === 'string' && config.responsePolicyPath) || envPolicy || ''
-  if (policyPath) {
-    try {
-      const p = isAbsolute(policyPath) ? policyPath : resolvePath(process.cwd(), policyPath)
-      const art = JSON.parse(readFileSync(p, 'utf8'))
-      const reject = (why) => {
-        policyArtifact = { source: p, verdict: 'REJECTED', rejectReason: why, eligibleChannels: [] }
-        noteConfigWarning(`response policy rejected (${why}); capability layer stays off (observe-only)`)
-      }
-      if (!art || typeof art !== 'object') reject('not an object')
-      else if (art.measurementSafe === true) {
-        policyArtifact = { source: p, verdict: art.verdict ?? 'UNKNOWN', eligibleChannels: [], measurementSafe: true }
-        CONFIG.measurementSafe = true
-        noteConfigWarning('response policy declares measurementSafe; forcing observe-only')
-      } else if (typeof art.expiresAtUtc === 'string' && Date.parse(art.expiresAtUtc) < Date.now()) { // time-ok: artifact-expiry
-        reject(`expired at ${art.expiresAtUtc}`)
-      } else if (art.verdict !== 'PASS' && art.verdict !== 'PARTIAL-PASS') {
-        reject(`verdict=${art.verdict}`)
-      } else {
-        const eligible = Array.isArray(art.capabilityEligibleChannels) ? art.capabilityEligibleChannels : []
-        const applied = []
-        const derivedSource = {}
-        for (const chName of eligible) {
-          if (!CONFIG.responseChannels[chName]) continue
-          const chArt = (art.channels && art.channels[chName]) || {}
-          // **两套 α，按估计器选**：先验真的装载了才用"带先验反解"的那一套。
-          // 为什么必须分开：收缩会改变 null 率（实测让判定更敏感），带先验反解出的 α 严得多
-          // （A′ 0.001 → 0.0001，10 倍）。只写一套的话，无论哪边错配都等于**悄悄改了预算**。
-          const usePrior = Boolean(familyPriors) && Boolean(chArt.derivedWithFamilyPrior)
-          const derived = (usePrior ? chArt.derivedWithFamilyPrior : chArt.derived) || null
-          CONFIG.responseChannels[chName] = {
-            ...CONFIG.responseChannels[chName],
-            capabilityEligible: true,
-            ...(derived && Number.isFinite(derived.consecutive) ? { consecutive: derived.consecutive } : {}),
-            ...(derived && Number.isFinite(derived.alpha) ? { actAlpha: derived.alpha } : {}),
-          }
-          applied.push(chName)
-          derivedSource[chName] = usePrior ? 'derivedWithFamilyPrior' : 'derived'
-        }
-        policyArtifact = {
-          source: p, verdict: art.verdict, eligibleChannels: applied, derivedSource,
-          corpusFingerprint: art.corpusFingerprint ?? null, generatedAtUtc: art.generatedAtUtc ?? null,
-        }
-        console.log(`[${name}] response policy loaded from ${p} (verdict=${art.verdict}; eligible: ${applied.join(', ') || '(none)'}; α 来源: ${Object.values(derivedSource).join(',') || '-'})`)
-      }
-    } catch (e) {
-      policyArtifact = { source: policyPath, verdict: 'REJECTED', rejectReason: msg(e), eligibleChannels: [] }
-      noteConfigWarning(`failed to load response policy from "${policyPath}": ${msg(e)}; capability layer stays off`)
-    }
-  }
-
-  // L2：在线证据件加载（重锚定的前置门）。与标定件同样的 fail-safe 姿态：
-  // 缺/坏/过期/verdict≠PASS-online ⇒ 一律不开。
-  const envEvidence = typeof process !== 'undefined' && process.env && process.env.TRAJECTORY_ANCHOR_EVIDENCE_PATH
-  const evidencePath = (config && typeof config.reanchorEvidencePath === 'string' && config.reanchorEvidencePath) || envEvidence || ''
-  if (evidencePath) {
-    try {
-      const p = isAbsolute(evidencePath) ? evidencePath : resolvePath(process.cwd(), evidencePath)
-      const ev = JSON.parse(readFileSync(p, 'utf8'))
-      const reject = (why) => {
-        reanchorEvidence = { source: p, verdict: 'REJECTED', rejectReason: why }
-        noteConfigWarning(`re-anchor evidence rejected (${why}); re-anchor stays off`)
-      }
-      if (!ev || typeof ev !== 'object') reject('not an object')
-      // 合成/演示数据不得当证据（analyze-pullback-outcomes.mjs --synthesize 会标 synthetic:true）。
-      // 这条是实测出来的：第一版链路上，合成证据喂进去门**照样开了**。
-      else if (ev.synthetic === true) reject('synthetic-evidence')
-      else if (ev.verdict !== 'PASS-online') reject(`verdict=${ev.verdict}`)
-      else if (typeof ev.expiresAtUtc === 'string' && Date.parse(ev.expiresAtUtc) < Date.now()) reject(`expired at ${ev.expiresAtUtc}`) // time-ok: artifact-expiry
-      else {
-        reanchorEvidence = {
-          source: p, verdict: 'PASS-online',
-          pullbacksObserved: ev.pullbacksObserved ?? null,
-          effectiveness: ev.effectiveness ?? null,
-          generatedAtUtc: ev.generatedAtUtc ?? null,
-        }
-        console.log(`[${name}] re-anchor evidence loaded from ${p} (${reanchorEvidence.pullbacksObserved ?? '?'} pull-backs observed)`)
-      }
-    } catch (e) {
-      reanchorEvidence = { source: evidencePath, verdict: 'REJECTED', rejectReason: msg(e) }
-      noteConfigWarning(`failed to load re-anchor evidence from "${evidencePath}": ${msg(e)}; re-anchor stays off`)
-    }
-  }
-
 
   agentsSvc = ctx.get('agents')
   fsSvc = ctx.get('fs')
   spSvc = ctx.get('sandboxPolicy')
 
   if (spSvc && typeof spSvc.workspaceRoot === 'string' && spSvc.workspaceRoot.length > 0) baseDir = spSvc.workspaceRoot
-  // baseDir 变化会改变累积状态的默认路径 ⇒ 重新装载一次。
-  // **只有路径真的变了才重装**：否则每次挂载都会重复装载一遍（日志重复、且白做一次 I/O）。
-  if (CONFIG.adaptiveStateEnabled === true && adaptiveStateFile() !== (adaptiveState && adaptiveState.source)) {
-    for (const k of Object.keys(channelFeedback)) delete channelFeedback[k]
-    sessionOutcomes.length = 0
-    autoDemote = null
-    feedbackEpoch = 0
-    loadAdaptiveState()
-  }
 
   // ---- guaranteed perception channel ----
   disposers.push(ctx.on('internal/dispatch', (type, name, args, thisArg) => {
@@ -4128,7 +2229,7 @@ export function apply(ctx, config) {
           if (rec) {
             rec.requests += 1
             if (rec.firstRequestAt === null) rec.firstRequestAt = Date.now()
-            if (rec.anchored && !rec.lifted && CONFIG.promoteAfterFirstResponse
+            if (rec.anchored && !rec.lifted
               && rec.requests >= 2 && rec.toolCalls === 0 && rec.messages >= 1) {
               lift(rec, 'first-response-no-tool')
             }
@@ -4151,410 +2252,18 @@ export function apply(ctx, config) {
     try {
       const agent = context && context.agent
       const rec = agent && typeof agent.id === 'string' ? recs.get(agent.id) : undefined
-      if (!rec || rec.surfacePhase !== 'narrowed') {
-        if (rec && rec.noticePhase === 'narrowed') {
-          rec.noticePhase = 'stable'
-          logAudit(rec, 'notice', { phase: 'stable', text: 'tool surface restored to full catalog' })
-        }
-        return out
+      if (!rec) return out
+      // 瘦身重构（§61）：bootstrap 工具面在组装期**派生**——unpromoted ⇒ 只发 anchorAllow
+      // 里的工具；无 disposer、无相交、无归还（旧 restrict 分裂 bug 结构性消灭）。
+      if (rec.anchored === true && rec.lifted !== true && Array.isArray(rec.anchorAllow) && rec.anchorAllow.length > 0 && Array.isArray(out.tools)) {
+        const boot = out.tools.filter((t) => t && rec.anchorAllow.includes(t.name))
+        if (boot.length > 0) return { ...out, tools: boot }
+        // 清单与可见面零交集 ⇒ fail-open 全量（能力永远优先）。
       }
-      if (!effectiveRollback()) return out
-      const before = Array.isArray(out.tools) ? out.tools : []
-      const after = surfaceForPhase('narrowed', before, CONFIG.leanDenyPatterns)
-      const denied = before.length - after.length
-      if (rec.surfaceDeniedCount !== denied) {
-        rec.surfaceDeniedCount = denied
-        logAudit(rec, 'surface-applied', { kept: after.length, denied })
-      }
-      // P4：阶段变化时给模型一条**可见**说明（也是它不再调用已消失工具的原因）。
-      if (rec.noticePhase !== 'narrowed') {
-        rec.noticePhase = 'narrowed'
-        logAudit(rec, 'notice', { phase: 'narrowed', kept: after.length, denied })
-      }
-      const notice = {
-        name: 'trajectory-anchor:notice',
-        text: '[trajectory-anchor] Trajectory deviation detected (session-local reference test). '
-          + `The tool catalog for this turn is narrowed to ${after.length} tools (${denied} hidden). `
-          + 'Continue the task from where you left off, in plan-first style ("we will …"). '
-          + 'The full catalog returns automatically once the trajectory recovers; '
-          + 'do not call the hidden tools — they are absent this turn.',
-      }
-      return {
-        ...out,
-        tools: Array.isArray(after) ? after : out.tools,
-        sections: Array.isArray(out.sections) ? [...out.sections, notice] : out.sections,
-      }
+      return out
     } catch (e) {
       warnOnce(`surface filter failed, exposing full catalog: ${msg(e)}`)
       return out
-    }
-  }))
-
-  // ---- 契约重锚定（只读、一次性）：宣告完成后的第一次组装注入首轮契约摘要 ----
-  // 通道与 P4 相同（trajectory-anchor:* 段），不改工具面、不删信息，信息型。
-  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
-    try {
-      const id = payload && payload.agent && payload.agent.id
-      const rec = id ? recs.get(id) : null
-      if (!rec || !rec.contractReanchor || rec.contractReanchor.served === true) return next(out)
-      rec.contractReanchor.served = true
-      const summary = rec.anchorsFromMessage.slice(0, 700)
-      const section = {
-        name: 'trajectory-anchor:contract',
-        text: '[trajectory-anchor] You are about to declare this task done. Re-check your work against the '
-          + 'ORIGINAL contract from the first instruction:\n\n'
-          + summary
-          + '\n\nIf a later instruction appeared to change or cancel part of this contract, verify which one '
-          + 'governs before finishing — and say so explicitly if they conflict.',
-      }
-      // 注入后**继续链**（next(modified)）：同名监听器是瀑布链——直接 return 会短路，
-      // 把链上更后面的镜像（done-gap/越界/过期）全部堵死（回放门 §8 门 2 实测：
-      // 越界开火后过期镜像在同一会话 served=false）。每个事实各自注入、互不堵链。
-      return next({
-        ...out,
-        sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections,
-      })
-    } catch (e) {
-      warnOnce(`contract re-anchor failed, skipping: ${msg(e)}`)
-      return next(out)
-    }
-  }))
-
-  // ---- 交付缺口回放（只读、一次性）：失败验证之后的下一次组装即回放"你自己还有 N 个失败" ----
-  // 触发改成**惰性**：不再要求"宣告完成"或 turn/end（实测这两个边界都可能缺失——a5 那次
-  // 会话在失败验证后没有 turn/end ⇒ 4/5 开火未达预注册门槛）。现在只要"最近一次验证仍带
-  // 失败证据 + 出现下一次提示组装"，就注入一次。宣告/turn-end 路径保留（它们只是提前挂标记）。
-  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
-    try {
-      const id = payload && payload.agent && payload.agent.id
-      const rec = id ? recs.get(id) : null
-      if (!rec) return next(out)
-      if (rec.doneGapMirror && rec.doneGapMirror.served === true) return next(out)
-      if (!rec.doneGapMirror) {
-        if (CONFIG.doneGapMirror !== true) return next(out)
-        if (typeof rec.lastVerifyFailureTail !== 'string' || !rec.lastVerifyFailureTail.trim()) return next(out)
-        rec.doneGapMirror = { atTurn: null, atStep: null, served: false, failCount: rec.lastVerifyFailCount }
-        logAudit(rec, 'done-gap-mirror', { via: 'post-failure-assemble', failCount: rec.lastVerifyFailCount })
-      }
-      rec.doneGapMirror.served = true
-      const fail = rec.lastVerifyFailCount === null ? 'failures' : `${rec.lastVerifyFailCount} failures`
-      const section = {
-        name: 'trajectory-anchor:done-gap',
-        text: `[trajectory-anchor] Your most recent verification still reported ${fail}. Evidence:\n\n${rec.lastVerifyFailureTail}\n\nMap each failure to its module and keep fixing; if you believe some of them do not count, say so explicitly before finishing.`,
-      }
-      // 注入后**继续链**（next(modified)），不短路后面的镜像（见契约处理器同处注释）。
-      return next({
-        ...out,
-        sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections,
-      })
-    } catch (e) {
-      warnOnce(`done-gap mirror failed, skipping: ${msg(e)}`)
-      return next(out)
-    }
-  }))
-
-  // ---- 越界回放（只读、一次性）：写到了声明范围之外 ⇒ 回放路径清单 + 原始范围条款 ----
-  // F3 事实：判据是转录事实（路径 vs 范围子句），不是统计分数。触发同样**惰性**：turn/end
-  // 只提前挂标记；下一次组装即注入一次（与 done-gap v3 同一惰性模式，两个边界都可能缺失）。
-  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
-    try {
-      const id = payload && payload.agent && payload.agent.id
-      const rec = id ? recs.get(id) : null
-      if (!rec) return next(out)
-      if (rec.scopeBreachMirror && rec.scopeBreachMirror.served === true) return next(out)
-      if (!rec.scopeBreachMirror) {
-        if (CONFIG.scopeBreachMirror !== true) return next(out)
-        if (!Array.isArray(rec.scopeViolations) || rec.scopeViolations.length === 0) return next(out)
-        rec.scopeBreachMirror = { served: false, via: 'post-fact-assemble', paths: rec.scopeViolations.slice(-10).map((v) => v.path) }
-        logAudit(rec, 'scope-breach-mirror', { via: rec.scopeBreachMirror.via, paths: rec.scopeBreachMirror.paths })
-      }
-      rec.scopeBreachMirror.served = true
-      const scopeClause = (rec.taskAnchors && rec.taskAnchors.evidence && rec.taskAnchors.evidence.scopeClause) || null
-      const section = {
-        name: 'trajectory-anchor:scope-breach',
-        text: '[trajectory-anchor] You wrote outside the declared scope:\n\n'
-          + (rec.scopeBreachMirror.paths || []).join('\n')
-          + `\n\nDeclared scope: ${scopeClause || '(parsed from the first instruction)'}`
-          + '\n\nRevert these writes or justify explicitly why they belong to the task before finishing.',
-      }
-      // 注入后**继续链**（next(modified)），不短路后面的镜像（见契约处理器同处注释）。
-      return next({
-        ...out,
-        sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections,
-      })
-    } catch (e) {
-      warnOnce(`scope-breach mirror failed, skipping: ${msg(e)}`)
-      return next(out)
-    }
-  }))
-
-  // ---- 验证过期回放（只读、一次性）：宣告完成，但验证**之后**又改过同一文件 ----
-  // F5 事实："验证早于这次改动"。宣告路径先挂标记；若宣告事件缺失（实测交付报告形态
-  // 可能对不上宣告正则），组装期按最近一条声明记录**惰性**补判一次——两条路径共用 served。
-  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
-    try {
-      const id = payload && payload.agent && payload.agent.id
-      const rec = id ? recs.get(id) : null
-      if (!rec) return next(out)
-      if (rec.verifyStalenessMirror && rec.verifyStalenessMirror.served === true) return next(out)
-      if (!rec.verifyStalenessMirror) {
-        if (CONFIG.verifyStalenessMirror !== true) return next(out)
-        const lastClaim = Array.isArray(rec.claims) ? rec.claims[rec.claims.length - 1] : null
-        if (!lastClaim) return next(out)
-        const stale = verifyStaleness({
-          claim: lastClaim,
-          verifyEvidence: rec.verifyEvidence,
-          edits: rec.edits,
-          scopeDirs: (rec.taskAnchors && rec.taskAnchors.scopeDirs) || [],
-        })
-        if (stale.stale !== true) return next(out)
-        rec.verifyStalenessMirror = { ...stale.evidence, served: false, via: 'post-claim-assemble' }
-        logAudit(rec, 'verify-staleness-mirror', { via: 'post-claim-assemble', ...stale.evidence })
-      }
-      rec.verifyStalenessMirror.served = true
-      const e = rec.verifyStalenessMirror
-      const section = {
-        name: 'trajectory-anchor:verify-staleness',
-        text: '[trajectory-anchor] You are declaring done, but your most recent verification ran BEFORE a later edit of the same file:\n\n'
-          + `Verification: ${e.verifyCmd || '(unrecognized)'} (turn ${e.verifyTurn ?? '?'}#${e.verifyStep ?? '?'})\n`
-          + `Edit after it: ${e.editPath} (turn ${e.editTurn ?? '?'}#${e.editStep ?? '?'})\n\n`
-          + 'Re-run the verification now and report the fresh result before finishing.',
-      }
-      // 注入后**继续链**（next(modified)），不短路后面的镜像（见契约处理器同处注释）。
-      return next({
-        ...out,
-        sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections,
-      })
-    } catch (e) {
-      warnOnce(`verify-staleness mirror failed, skipping: ${msg(e)}`)
-      return next(out)
-    }
-  }))
-
-  // ---- P1 交付门（phase 2，协议约束）：宣告交付但隐藏评测带失败/早于最近编辑 ⇒ 拒绝接收 ----
-  // 与镜像的区别：这条**不收**交付（"你的交付不被接受，直到…"），而不是"给你证据你自己决定"。
-  // 触发仍用事实层（deliveryGate 纯函数）；一次性；只在有隐藏评测证据时才设门（保守）。
-  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
-    try {
-      const id = payload && payload.agent && payload.agent.id
-      const rec = id ? recs.get(id) : null
-      if (!rec) return next(out)
-      if (rec.deliveryGate && rec.deliveryGate.served === true) return next(out)
-      if (!rec.deliveryGate) {
-        if (CONFIG.deliveryGate !== true) return next(out)
-        const lastClaim = Array.isArray(rec.claims) ? rec.claims[rec.claims.length - 1] : null
-        if (!lastClaim) return next(out)
-        const g = deliveryGate({ claim: lastClaim, verifyEvidence: rec.verifyEvidence, edits: rec.edits })
-        if (g.refuse !== true) return next(out)
-        rec.deliveryGate = { served: false, via: 'post-claim-assemble', reason: g.reason, evidence: g.evidence }
-        logAudit(rec, 'delivery-gate', { via: 'post-claim-assemble', reason: g.reason, ...g.evidence })
-      }
-      rec.deliveryGate.served = true
-      const reason = rec.deliveryGate.reason
-      const e = rec.deliveryGate.evidence || {}
-      const text = reason === 'edited-after-hidden-verify'
-        ? '[trajectory-anchor] DELIVERY NOT ACCEPTED. Your last hidden-grader run predates a later code edit:\n\n'
-          + `Grader run: ${e.verifyCmd || '(unrecognized)'} (turn ${e.verifyTurn ?? '?'}#${e.verifyStep ?? '?'})\n`
-          + `Edit after it: ${e.editPath} (turn ${e.editTurn ?? '?'}#${e.editStep ?? '?'})\n\n`
-          + 'Re-run the grader NOW, then quote its `[hidden]` line verbatim in your delivery. Until then the delivery is not accepted.'
-        : '[trajectory-anchor] DELIVERY NOT ACCEPTED. Your last hidden-grader run still reports failures:\n\n'
-          + `${e.outputTail || ''}\n\n`
-          + 'Map each failure to its module and fix it, re-run the grader, and quote its `[hidden]` line verbatim in your delivery. Until then the delivery is not accepted.'
-      const section = { name: 'trajectory-anchor:delivery-gate', text }
-      return next({ ...out, sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections })
-    } catch (e) {
-      warnOnce(`delivery gate failed, skipping: ${msg(e)}`)
-      return next(out)
-    }
-  }))
-
-  // ---- P2 改后必验预算（phase 2）：每 K 次落地代码改动注入一步强制重验 ----
-  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
-    try {
-      const id = payload && payload.agent && payload.agent.id
-      const rec = id ? recs.get(id) : null
-      if (!rec) return next(out)
-      if (CONFIG.verifyAfterEditBudget !== true || !rec.verifyBudget.armed) return next(out)
-      rec.verifyBudget.armed = false
-      rec.verifyBudget.count = 0
-      const lastCmd = rec.lastVerifyCmd || '(no verification seen this session)'
-      const section = {
-        name: 'trajectory-anchor:verify-budget',
-        text: '[trajectory-anchor] You have made code edits since your last verification. '
-          + `Before any further edits, re-run the verification (last seen: ${lastCmd.slice(0, 200)}) and quote its output.`,
-      }
-      logAudit(rec, 'verify-budget', { atTurn: payload.turn ?? null })
-      return next({ ...out, sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections })
-    } catch (e) {
-      warnOnce(`verify budget failed, skipping: ${msg(e)}`)
-      return next(out)
-    }
-  }))
-
-  // ---- P3 交付格式契约（phase 2）：声明过 PASS=n/m 就必须按格式交付 ----
-  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
-    try {
-      const id = payload && payload.agent && payload.agent.id
-      const rec = id ? recs.get(id) : null
-      if (!rec) return next(out)
-      if (rec.claimFormat && rec.claimFormat.served === true) return next(out)
-      if (!rec.claimFormat) {
-        if (CONFIG.claimFormatContract !== true) return next(out)
-        const lastClaim = Array.isArray(rec.claims) ? rec.claims[rec.claims.length - 1] : null
-        const fmt = rec.taskAnchors && rec.taskAnchors.reportFormat
-        if (!lastClaim || !fmt) return next(out)
-        if (claimFormatOk(lastClaim.text || '', fmt)) return next(out)
-        rec.claimFormat = { served: false, via: 'post-claim-assemble' }
-        logAudit(rec, 'claim-format', { via: 'post-claim-assemble', total: fmt.total })
-      }
-      rec.claimFormat.served = true
-      const fmt = rec.taskAnchors && rec.taskAnchors.reportFormat
-      const section = {
-        name: 'trajectory-anchor:claim-format',
-        text: '[trajectory-anchor] The task contract requires the report format '
-          + `PASS=<n>/${fmt.total}. Your delivery does not contain that line. `
-          + 'Add the exact line to your delivery.',
-      }
-      return next({ ...out, sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections })
-    } catch (e) {
-      warnOnce(`claim format gate failed, skipping: ${msg(e)}`)
-      return next(out)
-    }
-  }))
-
-  // ---- F6 无出处结果断言（criteria 第二波）：交付声称结局但全会话零验证证据 ----
-  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
-    try {
-      const id = payload && payload.agent && payload.agent.id
-      const rec = id ? recs.get(id) : null
-      if (!rec) return next(out)
-      if (rec.unsupportedClaimMirror && rec.unsupportedClaimMirror.served === true) return next(out)
-      if (!rec.unsupportedClaimMirror) {
-        if (CONFIG.unsupportedClaimMirror !== true) return next(out)
-        const lastClaim = Array.isArray(rec.claims) ? rec.claims[rec.claims.length - 1] : null
-        if (!lastClaim) return next(out)
-        const u = unsupportedClaim({ claim: lastClaim, verifyEvidence: rec.verifyEvidence })
-        if (u.unsupported !== true) return next(out)
-        rec.unsupportedClaimMirror = { served: false, via: 'post-claim-assemble', reason: u.reason }
-        logAudit(rec, 'unsupported-claim', { via: 'post-claim-assemble', reason: u.reason })
-      }
-      rec.unsupportedClaimMirror.served = true
-      const section = {
-        name: 'trajectory-anchor:unsupported-claim',
-        text: '[trajectory-anchor] Your delivery asserts an outcome, but this session contains NO verification evidence '
-          + 'to support it. Run the task\'s grading command and quote its output before finishing.',
-      }
-      return next({ ...out, sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections })
-    } catch (e) {
-      warnOnce(`unsupported-claim mirror failed, skipping: ${msg(e)}`)
-      return next(out)
-    }
-  }))
-
-  // ---- F7 证据矛盾（criteria 第二波）：声称全过但最后一次验证仍带失败 ----
-  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
-    try {
-      const id = payload && payload.agent && payload.agent.id
-      const rec = id ? recs.get(id) : null
-      if (!rec) return next(out)
-      if (rec.evidenceContradictionMirror && rec.evidenceContradictionMirror.served === true) return next(out)
-      if (!rec.evidenceContradictionMirror) {
-        if (CONFIG.evidenceContradictionMirror !== true) return next(out)
-        const lastClaim = Array.isArray(rec.claims) ? rec.claims[rec.claims.length - 1] : null
-        if (!lastClaim) return next(out)
-        const x = evidenceContradiction({ claim: lastClaim, verifyEvidence: rec.verifyEvidence })
-        if (x.contradiction !== true) return next(out)
-        rec.evidenceContradictionMirror = { served: false, via: 'post-claim-assemble', reason: x.reason, evidence: x.evidence }
-        logAudit(rec, 'evidence-contradiction', { via: 'post-claim-assemble', reason: x.reason, ...x.evidence })
-      }
-      rec.evidenceContradictionMirror.served = true
-      const e = rec.evidenceContradictionMirror.evidence || {}
-      const section = {
-        name: 'trajectory-anchor:evidence-contradiction',
-        text: '[trajectory-anchor] Your delivery claims a full pass, but your last verification still shows failures:\n\n'
-          + `${e.outputTail || ''}\n\n`
-          + 'Re-run the verification and quote its result, or say explicitly which failures you believe do not count.',
-      }
-      return next({ ...out, sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections })
-    } catch (e) {
-      warnOnce(`evidence-contradiction mirror failed, skipping: ${msg(e)}`)
-      return next(out)
-    }
-  }))
-
-  // ---- F2 分项声明-证据对照（criteria 第三波）：清单式声明逐项对证，缺证据的条目回放 ----
-  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
-    try {
-      const id = payload && payload.agent && payload.agent.id
-      const rec = id ? recs.get(id) : null
-      if (!rec) return next(out)
-      if (rec.itemizedClaimMirror && rec.itemizedClaimMirror.served === true) return next(out)
-      if (!rec.itemizedClaimMirror) {
-        if (CONFIG.itemizedClaimMirror !== true) return next(out)
-        const lastClaim = Array.isArray(rec.claims) ? rec.claims[rec.claims.length - 1] : null
-        if (!lastClaim) return next(out)
-        const f = itemizedClaimFacts({ claimText: lastClaim.text || '', edits: rec.edits, verifyEvidence: rec.verifyEvidence })
-        if (f.fired !== true) return next(out)
-        rec.itemizedClaimMirror = { served: false, via: 'post-claim-assemble', reason: f.reason, unsupported: f.unsupported }
-        logAudit(rec, 'itemized-claim-gap', { via: 'post-claim-assemble', reason: f.reason, ...f.evidence, unsupported: f.unsupported.slice(0, 8) })
-      }
-      rec.itemizedClaimMirror.served = true
-      const list = (rec.itemizedClaimMirror.unsupported || []).map((u) => `- ${u}`).join('\n')
-      const section = {
-        name: 'trajectory-anchor:itemized-claim-gap',
-        text: '[trajectory-anchor] These items in your delivery have no evidence in this session\'s own trajectory (no matching edit, no verification output):\n\n'
-          + `${list}\n\n`
-          + 'Back each item with an edit you made or a grading output you produced, or drop the item.',
-      }
-      return next({ ...out, sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections })
-    } catch (e) {
-      warnOnce(`itemized-claim mirror failed, skipping: ${msg(e)}`)
-      return next(out)
-    }
-  }))
-
-  // ---- Q4 会话内编辑预算（process-front-loaded）：耗尽后注入"现在评分并交付" ----
-  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
-    try {
-      const id = payload && payload.agent && payload.agent.id
-      const rec = id ? recs.get(id) : null
-      if (!rec) return next(out)
-      if (CONFIG.editBudgetCap <= 0 || !rec.editBudget.exhausted || rec.editBudget.served === true) return next(out)
-      rec.editBudget.served = true
-      const section = {
-        name: 'trajectory-anchor:edit-budget',
-        text: `[trajectory-anchor] Edit budget exhausted (${rec.editBudget.count}/${CONFIG.editBudgetCap} landed code edits). `
-          + 'Stop editing. Run the grading command now, quote its output, and deliver.',
-      }
-      return next({ ...out, sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections })
-    } catch (e) {
-      warnOnce(`edit budget failed, skipping: ${msg(e)}`)
-      return next(out)
-    }
-  }))
-
-  // ---- Q1 交付工件门（process-front-loaded）：工件写入时挂的拒绝，组装期回放 ----
-  disposers.push(ctx.on('system-prompt/assemble', (out, payload, next) => {
-    try {
-      const id = payload && payload.agent && payload.agent.id
-      const rec = id ? recs.get(id) : null
-      if (!rec) return next(out)
-      if (!rec.deliveryArtifactGate || rec.deliveryArtifactGate.served === true) return next(out)
-      rec.deliveryArtifactGate.served = true
-      const e = rec.deliveryArtifactGate.evidence || {}
-      const text = rec.deliveryArtifactGate.reason === 'edited-after-hidden-verify'
-        ? '[trajectory-anchor] DELIVERY ARTIFACT NOT ACCEPTED. Your last hidden-grader run predates a later code edit:\n\n'
-          + `Grader run: ${e.verifyCmd || '(unrecognized)'} (turn ${e.verifyTurn ?? '?'}#${e.verifyStep ?? '?'})\n`
-          + `Edit after it: ${e.editPath} (turn ${e.editTurn ?? '?'}#${e.editStep ?? '?'})\n\n`
-          + 'Re-run the grader NOW, then rewrite the artifact with its verbatim `[hidden]` line. Until then the artifact is not accepted.'
-        : '[trajectory-anchor] DELIVERY ARTIFACT NOT ACCEPTED. Your last hidden-grader run still reports failures:\n\n'
-          + `${e.outputTail || ''}\n\n`
-          + 'Re-run the grader and rewrite the artifact with its verbatim `[hidden]` line. Until then the artifact is not accepted.'
-      const section = { name: 'trajectory-anchor:delivery-artifact-gate', text }
-      return next({ ...out, sections: Array.isArray(out.sections) ? [...out.sections, section] : out.sections })
-    } catch (e) {
-      warnOnce(`delivery artifact gate failed, skipping: ${msg(e)}`)
-      return next(out)
     }
   }))
 
@@ -4604,56 +2313,6 @@ export function apply(ctx, config) {
       }
       const decision = await next()
       if (decision && decision.kind === 'reject') return decision
-      // ── Q2 带保持的编辑预算：保持态 ⇒ 本步注入"不许再改，先重验"（每次保持期一次，
-      //    注入后立即返回——保持消息在该步优先于 L1/L2）。解除只靠验证证据落地。──
-      if (CONFIG.editHoldEvery > 0 && rec.editHold.holding && !rec.editHold.served && decision && Array.isArray(decision.messages)) {
-        rec.editHold.served = true
-        logAudit(rec, 'edit-hold-injected', { editsSinceVerify: rec.editHold.editsSinceVerify, violations: rec.editHold.violations, turn: payload.turn, step: payload.step })
-        const holdMsg = {
-          source: { kind: 'trajectory-anchor-edit-hold' },
-          content: [{ type: 'text', text: '[trajectory-anchor] EDIT HOLD: you have made code edits since your last verification. '
-            + `No further edits until you re-run the verification (last seen: ${String(rec.lastVerifyCmd || '(none)').slice(0, 200)}) and quote its output.` }],
-        }
-        return { ...decision, messages: [...decision.messages, holdMsg] }
-      }
-      // ── Q2' 文件状态编辑计数（process-gate §6b）：本步边界处，"自最近一次验证以来
-      //    变过的代码文件数 ≥K" ⇒ 注入"不许再改，先重验"保持（每次快照期一次；重验重新快照=解除）。
-      if (CONFIG.fileStateHoldEvery > 0 && rec.fileStateBinding && !rec.fileStateBinding.served && decision && Array.isArray(decision.messages)) {
-        const changed = fileStateChangedCount(rec.fileStateBinding)
-        if (changed >= CONFIG.fileStateHoldEvery) {
-          rec.fileStateBinding.served = true
-          logAudit(rec, 'file-state-hold-injected', { changed, k: CONFIG.fileStateHoldEvery, boundFiles: rec.fileStateBinding.files.length, turn: payload.turn, step: payload.step })
-          const lastGrader = String((rec.fileStateBinding && rec.fileStateBinding.verifyCmd) || '(none)').slice(0, 200)
-          const holdMsg = {
-            source: { kind: 'trajectory-anchor-file-state-hold' },
-            content: [{ type: 'text', text: `[trajectory-anchor] EDIT HOLD: ${changed} code file(s) changed since your last verification. No further edits until you re-run the verification (last seen: ${lastGrader}) and quote its output.` }],
-          }
-          return { ...decision, messages: [...decision.messages, holdMsg] }
-        }
-      }
-      // ── Q1' 工件状态绑定门（process-gate §6）：交付工件自最近一次验证后被动过/被删
-      //    ⇒ 注入"先重验再交付"保持（每次绑定期一次；重验刷新绑定=解除）。注入点在
-      //    pre-step：回合还开着（P1 的"最后一条消息"结构缺陷不在这个位置）。
-      if (CONFIG.deliveryArtifactStateGate === true && rec.artifactBinding && !rec.artifactBinding.served && decision && Array.isArray(decision.messages)) {
-        const cur = artifactStateNow(rec.artifactBinding.path)
-        const facts = artifactStateFacts({ binding: rec.artifactBinding, current: cur })
-        if (facts.refuse === true) {
-          rec.artifactBinding.served = true
-          logAudit(rec, 'artifact-stale-gate', { reason: facts.reason, ...(facts.evidence || {}), turn: payload.turn, step: payload.step })
-          const why = facts.reason === 'artifact-removed'
-            ? 'the delivery artifact is missing since your last verification — restore it, then re-run the grader and quote its output'
-            : 'the delivery artifact was modified since your last verification — re-run the grader and quote its output in the artifact before delivering'
-          const lastGrader = String((rec.artifactBinding && rec.artifactBinding.verifyCmd) || '(none)').slice(0, 200)
-          const failedNote = rec.artifactBinding.failed === true
-            ? `; that last run still showed failures (failed=${rec.artifactBinding.failCount ?? '?'})`
-            : ''
-          const gateMsg = {
-            source: { kind: 'trajectory-anchor-artifact-gate' },
-            content: [{ type: 'text', text: `[trajectory-anchor] DELIVERY ARTIFACT HOLD: ${why}${failedNote}. Last grader: ${lastGrader}` }],
-          }
-          return { ...decision, messages: [...decision.messages, gateMsg] }
-        }
-      }
       // ── L1 任务锚定拉回：在**近因位置**追加一条独立消息 ───────────────────────
       // 为什么挂 pre-step 而不是 system prompt 前缀（社区 allostasis 的原文理由）：
       // 固定前缀离输出最远，长会话里纠偏信号会被近因压过去；这条必须落在近因位置。
@@ -4732,7 +2391,7 @@ export function apply(ctx, config) {
         const trig = markTrigger(rec, 'intervened', re.reason, payload.turn, payload.step, 'reanchor')
         logAudit(rec, 'reanchor', {
           turn: payload.turn, step: payload.step, count: rec.reanchor.count, n: trig.n, via: re.via,
-          afterPullbacks: rec.pullback.count, evidence: reanchorEvidence ? reanchorEvidence.source : null,
+          afterPullbacks: rec.pullback.count,
           confirm: re.info && re.info.confirm ? re.info.confirm : null,
           personaBytes: CONFIG.bootstrapPersona.length,
         })
@@ -4774,10 +2433,9 @@ export function apply(ctx, config) {
   try {
     const tool = {
       name: 'anchor_status',
-      description: 'Read the live audit state of the dsh-trajectory-anchor plugin: adopted/anchored agents, '
+      description: 'Read the live audit state of the trajectory-anchor plugin: anchored agents, '
         + 'bootstrap tool allow-lists, promotion-gate state, bootstrap context suppression, lexicon-weighted trajectory '
-        + 'scores (ratio / persona-ratio bands / baseline percentile), drift-rollback state, counterfactual candidates, '
-        + 'reward annotations, and event-channel reachability.',
+        + 'scores (ratio / persona-ratio bands / baseline percentile), evidence capture, and pullback/reanchor state.',
       parameters: {
         type: 'object',
         properties: {
