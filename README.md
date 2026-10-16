@@ -1,6 +1,6 @@
 # dsh-trajectory-anchor
 
-Self-contained DeepSeek Harness bundle (v0.5.1). It observes one agent's
+Self-contained DeepSeek Harness bundle (v0.5.2). It observes one agent's
 trajectory, anchors the first round, and speaks exactly two kinds of
 behavioral reminders. It deliberately does **not** promise effects: every
 mechanism that was ever measured and found null / low-precision /
@@ -75,6 +75,45 @@ keys are loudly warned and ignored.
 - `anchor_status` — read-only live audit (anchored/lifted state, bootstrap
   allow-list, scores, evidence counts, pullback/reanchor state, audit tail).
 
+## Install / enable
+
+DSH STORE installs the Bundle Patch pinned to a full Commit. Manual or
+development install into a throwaway profile:
+
+```powershell
+$env:DSH_HOME = "<scratch-dir>"
+dsh plugin --profile anchor-e3 add --ignore-scripts <path-or-fixed-commit-spec>
+dsh --profile anchor-e3 --dump-config     # expect one row: id: trajectory-anchor
+```
+
+The patch inserts exactly one host-plane row (`trajectory-anchor`); there are
+no lifecycle scripts and nothing `@deepseek-ai/*` is disabled, replaced or
+installed twice.
+
+## Compatibility
+
+- **DSH**: `>=0.2.0-rc.2 <0.3.0`, declared in `engines.dsh`; per-release
+  records live in `dsh.compatibility.dshReleases` and the evidence behind them
+  in `docs/store-compatibility.md`.
+- **Node.js**: `>=22.19` (`engines.node`).
+- **Systems**: the runtime is pure JavaScript; no native build step.
+- Fresh install needs zero configuration; all 21 keys are optional.
+
+## Permissions and known risks
+
+- Files: writes only its own append-only audit log under
+  `<workspaceRoot>/.dsh-trajectory-logs/` and, when configured, the
+  `pullbackOutcomePath`; reads its own `package.json` (version report) and an
+  optional `lexiconPath`.
+- Network / credentials: none. No subprocesses, no dynamic code loading.
+- Host surface: public `ctx.get('agents' | 'fs' | 'sandboxPolicy')` services,
+  `ctx.on(...)` events, and one read-only model tool (`anchor_status`).
+- Known risk: the two behavioral reminders are informational, **off by
+  default**, and when enabled inject one extra user message per trigger by
+  design. Their effect was measured null or low-precision on this harness
+  family (kept only as opt-in); the audit log contains prompt excerpts and must
+  be treated as session data when sharing.
+
 ## Repository layout
 
 - `index.js` — the whole runtime (pure predicates in `tools/task-anchor-core.mjs`)
@@ -82,3 +121,5 @@ keys are loudly warned and ignored.
 - `ablation-log.md` — the historical ledger of every mechanism, measurement and
   verdict (kept in the development workspace, not shipped with the bundle)
 - `docs/` — historical design documents (kept for reference)
+- `docs/store-compatibility.md` — declared DSH release compatibility plus the
+  disposable-Profile install/start/uninstall evidence behind it

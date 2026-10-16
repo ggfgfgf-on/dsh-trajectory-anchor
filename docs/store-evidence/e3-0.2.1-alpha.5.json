@@ -1,0 +1,119 @@
+{
+  "label": "0.2.1-alpha.5",
+  "status": "passed",
+  "cli": "<dsh-prefix>\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js",
+  "pluginDir": "<fixed-checkout>",
+  "cliVersion": "0.2.1-alpha.5",
+  "artifacts": {
+    "package.json": "a39151edf2a5b6f039c7b0e8ff26efab47ca6e8180da759e7ba00ff96d9fa920",
+    "cordis.patch.yml": "5f3ff9f847bf99dfdf3da0a2c18b3916a12bf9551a738df75d1f0e67052e9374",
+    "index.js": "5086d85bbf41f375654cd64a31a9c0e1c677c5aa3e2b2117aee82b06ad33fdad"
+  },
+  "pluginVersion": "0.5.2",
+  "baselineLines": 1224,
+  "installListed": true,
+  "profilePackageAfterInstall": {
+    "name": "dsh-profile-web",
+    "private": true,
+    "dependencies": {
+      "@dsh-ext/trajectory-anchor": "file:<fixed-checkout>"
+    },
+    "dsh": {
+      "profile": {
+        "bundles": [
+          "@deepseek-ai/dsh-base",
+          "@deepseek-ai/dsh-web-app",
+          "@dsh-ext/trajectory-anchor"
+        ]
+      }
+    }
+  },
+  "startUrl": "http://127.0.0.1:63512/?token=<redacted>",
+  "startMs": 2450,
+  "startHttpStatus": 303,
+  "uninstallRestoresBaseline": true,
+  "log": [
+    {
+      "step": "cli-version",
+      "at": "2026-10-16T19:29:47.812Z",
+      "argv": [
+        "--version"
+      ],
+      "exitCode": 0,
+      "ms": 85,
+      "stdoutTail": "0.2.1-alpha.5\n",
+      "stderrTail": ""
+    },
+    {
+      "step": "baseline-dump-config",
+      "at": "2026-10-16T19:29:47.924Z",
+      "argv": [
+        "--profile",
+        "web",
+        "--dump-config"
+      ],
+      "exitCode": 0,
+      "ms": 109,
+      "stdoutTail": "'\n      - id: tool-ask-user\n        name: '@deepseek-ai/dsh-tool-ask-user'\n      - id: tool-todo\n        name: '@deepseek-ai/dsh-tool-todo'\n        config:\n          allowParallelInProgress: true\n      - id: tool-web\n        name: '@deepseek-ai/dsh-tool-web'\n        config:\n          fetch: true\n          searchTimeoutMs: 60000\n      - id: tool-cordis\n        name: '@deepseek-ai/dsh-tool-cordis'\n      - id: skill-filesystem\n        name: '@deepseek-ai/dsh-skill-filesystem'\n        config:\n          customSkillDirs:\n            - !!js >-\n              process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')),\n              'skills')\n      - id: tool-skill\n        name: '@deepseek-ai/dsh-tool-skill'\n      - id: present\n        name: '@deepseek-ai/dsh-tool-present'\n      - id: tool-plugin-manager\n        name: '@deepseek-ai/dsh-plugin-manager/tools'\n        disabled: !!js '!ctx.get(''profileContext'')'\n      - id: tool-plugin-market\n        name: '@deepseek-ai/dsh-plugin-market/tools'\n        disabled: !!js '!ctx.get(''profileContext'')'\n",
+      "stderrTail": ""
+    },
+    {
+      "step": "install",
+      "at": "2026-10-16T19:29:48.538Z",
+      "argv": [
+        "plugin",
+        "--profile",
+        "web",
+        "add",
+        "--ignore-scripts",
+        "--config.auto-install-peers=false",
+        "file:<fixed-checkout>"
+      ],
+      "exitCode": 0,
+      "ms": 614,
+      "stdoutTail": "Progress: resolved 1, reused 0, downloaded 0, added 0\n[WARN] Issues with peer dependencies found. Run \"pnpm peers check\" to list them.\n\ndependencies:\n+ @dsh-ext/trajectory-anchor file:<fixed-checkout>\n\nPackages: +1\n+\nPackages are hard linked from the content-addressable store to the virtual store.\n  Content-addressable store is at: D:\\.pnpm-store\\v11\n  Virtual store is at:             node_modules/.pnpm\nProgress: resolved 1, reused 1, downloaded 0, added 1, done\nDone in 375ms using pnpm v11.23.0\n",
+      "stderrTail": ""
+    },
+    {
+      "step": "installed-dump-config",
+      "at": "2026-10-16T19:29:48.647Z",
+      "argv": [
+        "--profile",
+        "web",
+        "--dump-config"
+      ],
+      "exitCode": 0,
+      "ms": 109,
+      "stdoutTail": "odo\n        name: '@deepseek-ai/dsh-tool-todo'\n        config:\n          allowParallelInProgress: true\n      - id: tool-web\n        name: '@deepseek-ai/dsh-tool-web'\n        config:\n          fetch: true\n          searchTimeoutMs: 60000\n      - id: tool-cordis\n        name: '@deepseek-ai/dsh-tool-cordis'\n      - id: skill-filesystem\n        name: '@deepseek-ai/dsh-skill-filesystem'\n        config:\n          customSkillDirs:\n            - !!js >-\n              process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')),\n              'skills')\n      - id: tool-skill\n        name: '@deepseek-ai/dsh-tool-skill'\n      - id: present\n        name: '@deepseek-ai/dsh-tool-present'\n      - id: tool-plugin-manager\n        name: '@deepseek-ai/dsh-plugin-manager/tools'\n        disabled: !!js '!ctx.get(''profileContext'')'\n      - id: tool-plugin-market\n        name: '@deepseek-ai/dsh-plugin-market/tools'\n        disabled: !!js '!ctx.get(''profileContext'')'\n# == @dsh-ext/trajectory-anchor\n- id: trajectory-anchor\n  name: '@dsh-ext/trajectory-anchor'\n",
+      "stderrTail": ""
+    },
+    {
+      "step": "uninstall",
+      "at": "2026-10-16T19:29:51.830Z",
+      "argv": [
+        "plugin",
+        "--profile",
+        "web",
+        "remove",
+        "@dsh-ext/trajectory-anchor"
+      ],
+      "exitCode": 0,
+      "ms": 504,
+      "stdoutTail": "✓ Lockfile passes supply-chain policies (verified 3s ago)\n\ndependencies:\n- @dsh-ext/trajectory-anchor file:<fixed-checkout>\n\nAlready up to date\nDone in 263ms using pnpm v11.23.0\n",
+      "stderrTail": ""
+    },
+    {
+      "step": "after-dump-config",
+      "at": "2026-10-16T19:29:51.932Z",
+      "argv": [
+        "--profile",
+        "web",
+        "--dump-config"
+      ],
+      "exitCode": 0,
+      "ms": 102,
+      "stdoutTail": "'\n      - id: tool-ask-user\n        name: '@deepseek-ai/dsh-tool-ask-user'\n      - id: tool-todo\n        name: '@deepseek-ai/dsh-tool-todo'\n        config:\n          allowParallelInProgress: true\n      - id: tool-web\n        name: '@deepseek-ai/dsh-tool-web'\n        config:\n          fetch: true\n          searchTimeoutMs: 60000\n      - id: tool-cordis\n        name: '@deepseek-ai/dsh-tool-cordis'\n      - id: skill-filesystem\n        name: '@deepseek-ai/dsh-skill-filesystem'\n        config:\n          customSkillDirs:\n            - !!js >-\n              process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')),\n              'skills')\n      - id: tool-skill\n        name: '@deepseek-ai/dsh-tool-skill'\n      - id: present\n        name: '@deepseek-ai/dsh-tool-present'\n      - id: tool-plugin-manager\n        name: '@deepseek-ai/dsh-plugin-manager/tools'\n        disabled: !!js '!ctx.get(''profileContext'')'\n      - id: tool-plugin-market\n        name: '@deepseek-ai/dsh-plugin-market/tools'\n        disabled: !!js '!ctx.get(''profileContext'')'\n",
+      "stderrTail": ""
+    }
+  ]
+}

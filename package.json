@@ -1,6 +1,6 @@
 {
   "name": "@dsh-ext/trajectory-anchor",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Self-contained DeepSeek Harness bundle: first-round trajectory anchoring (assembly-derived bootstrap tool surface + Minimal persona + context suppression), per-step trajectory scoring with an append-only audit log, and two informational behavioral reminders (L1 pullback, L2' confirm-reanchor). Zero community-plugin dependencies.",
   "type": "module",
   "main": "index.js",
@@ -11,13 +11,69 @@
     "tools",
     "docs"
   ],
+  "engines": {
+    "node": ">=22.19",
+    "dsh": ">=0.2.0-rc.2 <0.3.0"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "compatibility": {
+      "dshReleases": {
+        "0.2.0-rc.2": "compatible",
+        "0.2.1-alpha.1": "compatible",
+        "0.2.1-alpha.2": "compatible",
+        "0.2.1-alpha.3": "compatible",
+        "0.2.1-alpha.4": "compatible",
+        "0.2.1-alpha.5": "compatible"
+      },
+      "dshOperations": {
+        "0.2.0-rc.2": {
+          "install": "passed",
+          "start": "passed",
+          "uninstall": "passed",
+          "rollback": "unknown"
+        },
+        "0.2.1-alpha.1": {
+          "install": "passed",
+          "start": "passed",
+          "uninstall": "passed",
+          "rollback": "unknown"
+        },
+        "0.2.1-alpha.2": {
+          "install": "passed",
+          "start": "passed",
+          "uninstall": "passed",
+          "rollback": "unknown"
+        },
+        "0.2.1-alpha.3": {
+          "install": "passed",
+          "start": "passed",
+          "uninstall": "passed",
+          "rollback": "unknown"
+        },
+        "0.2.1-alpha.4": {
+          "install": "passed",
+          "start": "passed",
+          "uninstall": "passed",
+          "rollback": "unknown"
+        },
+        "0.2.1-alpha.5": {
+          "install": "passed",
+          "start": "passed",
+          "uninstall": "passed",
+          "rollback": "unknown"
+        }
+      }
     }
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ggfgfgf-on/dsh-trajectory-anchor.git"
   },
   "keywords": [
     "deepseek-harness",
